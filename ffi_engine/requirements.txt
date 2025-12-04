@@ -1,0 +1,6 @@
+streamlit
+pandas
+altair
+supabase
+python-dotenv
+markdown2
