@@ -12,11 +12,22 @@ st.set_page_config(page_title="FFIS – Founder Financial Intelligence", layout=
 
 # ---------- Helpers ----------
 
-def get_demo_clients():
+def get_clients_for_ui():
     """
-    TODO: Replace this with a Supabase query later.
-    For now we just use dummy clients so the UI works.
+    Try to fetch real clients from Supabase.
+    Falls back to a demo list if something goes wrong.
     """
+    try:
+        response = supabase.table("clients").select("name").order("created_at").execute()
+        rows = response.data or []
+        names = [row.get("name", "Unnamed client") for row in rows]
+        if names:
+            return names
+    except Exception as e:
+        # Show a small warning in the sidebar, but don't break the app
+        st.sidebar.warning("Could not load clients from Supabase. Using demo list instead.")
+
+    # Fallback demo list
     return ["Demo Startup", "Client A", "Client B"]
 
 
@@ -34,9 +45,11 @@ def get_month_options(n_months: int = 18):
 
 st.sidebar.title("FFIS")
 
+git push origin main --force
 # Client selector
-clients = get_demo_clients()
+clients = get_clients_for_ui()
 selected_client = st.sidebar.selectbox("Select business", clients)
+
 
 # Month selector
 month_options = get_month_options(18)
