@@ -4,3 +4,4 @@ altair
 supabase
 python-dotenv
 markdown2
+

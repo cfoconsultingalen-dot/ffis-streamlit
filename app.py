@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 from supabase import create_client
 
@@ -570,6 +570,50 @@ def fetch_tasks_for_page(client_id, page_name: str, month_start: date):
     except Exception:
         return []
 
+def fetch_alerts_for_client(client_id, only_active: bool = True, limit: int = 100):
+    """
+    Fetch alerts for this client from alerts table.
+    By default returns only active alerts, most recent first.
+    """
+    if client_id is None:
+        return []
+
+    try:
+        query = (
+            supabase
+            .table("alerts")
+            .select("*")
+            .eq("client_id", str(client_id))
+        )
+        if only_active:
+            query = query.eq("is_active", True)
+
+        res = (
+            query
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def dismiss_alert(alert_id: int):
+    """
+    Mark an alert as dismissed (inactive) in the alerts table.
+    """
+    try:
+        supabase.table("alerts").update(
+            {
+                "is_active": False,
+                "is_dismissed": True,
+                "resolved_at": datetime.utcnow().isoformat(),
+            }
+        ).eq("id", alert_id).execute()
+        return True
+    except Exception:
+        return False
 
 
 def fetch_all_open_tasks(client_id):
@@ -1130,24 +1174,82 @@ def page_cash_bills():
 def page_alerts_todos():
     top_header("Alerts & To-Dos")
 
+    # ---------- Alerts ----------
     st.subheader("🚨 Alerts")
     st.write("Critical things your future self will thank you for noticing early.")
 
-    # Placeholder alerts for now – later from alerts table/engine
-    st.dataframe(
-        pd.DataFrame(
-            {
-                "Type": ["Runway", "AR overdue"],
-                "Severity": ["High", "Medium"],
-                "Message": [
-                    "Runway under 4 months.",
-                    "3 invoices overdue > 14 days.",
-                ],
-            }
-        ),
-        use_container_width=True,
-    )
+    alerts = fetch_alerts_for_client(selected_client_id, only_active=True, limit=100)
 
+    if not alerts:
+        st.info("No active alerts right now for this business.")
+    else:
+        df_alerts = pd.DataFrame(alerts)
+
+        # Build a clean view for the founder
+        cols = []
+        if "page_name" in df_alerts.columns:
+            cols.append("page_name")
+        if "alert_type" in df_alerts.columns:
+            cols.append("alert_type")
+        if "severity" in df_alerts.columns:
+            cols.append("severity")
+        if "message" in df_alerts.columns:
+            cols.append("message")
+        if "month_date" in df_alerts.columns:
+            cols.append("month_date")
+        if "created_at" in df_alerts.columns:
+            cols.append("created_at")
+
+        df_view = df_alerts[cols].rename(
+            columns={
+                "page_name": "Page",
+                "alert_type": "Type",
+                "severity": "Severity",
+                "message": "Message",
+                "month_date": "Month",
+                "created_at": "Created at",
+            }
+        )
+
+        # Optional: shorten message in the table but keep full in hover
+        if "Message" in df_view.columns:
+            df_view["Message"] = df_view["Message"].astype(str).str.slice(0, 160)
+
+        st.dataframe(df_view, use_container_width=True)
+
+        # Simple dismiss UI
+        st.markdown("#### Dismiss an alert")
+
+        # Build labels for active alerts
+        label_map = {}
+        for a in alerts:
+            aid = a.get("id")
+            msg = a.get("message", "")
+            sev = a.get("severity", "medium")
+            atype = a.get("alert_type", "alert")
+            label = f"[{sev}] {atype} – {msg[:60]}..."
+            label_map[label] = aid
+
+        alert_labels = list(label_map.keys())
+
+        selected_label = st.selectbox(
+            "Pick an alert to dismiss",
+            ["-- Select --"] + alert_labels,
+            key="alert_to_dismiss",
+        )
+        if selected_label != "-- Select --":
+            if st.button("Dismiss selected alert", key="dismiss_alert_btn"):
+                alert_id = label_map[selected_label]
+                ok = dismiss_alert(alert_id)
+                if ok:
+                    st.success("Alert dismissed.")
+                    st.rerun()
+                else:
+                    st.error("Could not dismiss alert. Please try again.")
+
+    st.markdown("---")
+
+    # ---------- Tasks ----------
     st.subheader("✅ Tasks for this business")
     st.write("All open tasks across all pages and months.")
 
@@ -1331,3 +1433,17 @@ def page_issues_notes():
     # Page-specific notes & tasks (still useful here)
     comments_block("issues_notes")
     tasks_block("issues_notes")
+# ---------- Main router ----------
+
+if page == "Business at a Glance":
+    page_business_overview()
+elif page == "Sales & Deals":
+    page_sales_deals()
+elif page == "Team & Spending":
+    page_team_spending()
+elif page == "Cash & Bills":
+    page_cash_bills()
+elif page == "Alerts & To-Dos":
+    page_alerts_todos()
+elif page == "Issues & Notes":
+    page_issues_notes()
