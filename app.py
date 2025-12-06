@@ -40,6 +40,183 @@ def load_clients():
     # Fallback demo client (no id)
     return [{"id": None, "name": "Demo Startup"}]
 
+# ---------- Payroll helpers ----------
+
+# ---------- Payroll helpers ----------
+
+@st.cache_data(ttl=60)
+def fetch_payroll_positions_for_client(client_id):
+    """
+    Return payroll positions for a client as a DataFrame.
+
+    Matches Supabase schema:
+
+        base_salary_annual  -- annual base at 1.0 FTE
+        super_rate_pct      -- e.g. 11.0
+        payroll_tax_pct     -- e.g. 3.0
+        fte                 -- FTE fraction
+        start_date / end_date
+
+    Handles missing columns defensively.
+    """
+    if client_id is None:
+        return pd.DataFrame()
+
+    try:
+        res = (
+            supabase
+            .table("payroll_positions")
+            .select("*")
+            .eq("client_id", str(client_id))
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as e:
+        print("Error fetching payroll positions:", e)
+        rows = []
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Numeric fields
+    for col in ["base_salary_annual", "super_rate_pct", "payroll_tax_pct", "fte"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            # Fallback defaults
+            if col == "base_salary_annual":
+                df[col] = 0.0
+            elif col == "super_rate_pct":
+                df[col] = 0.0
+            elif col == "payroll_tax_pct":
+                df[col] = 0.0
+            elif col == "fte":
+                df[col] = 1.0
+
+    # Dates
+    for col in ["start_date", "end_date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+        else:
+            df[col] = None
+
+    # Optional contractor flag – not in your schema, so default False
+    if "is_contractor" not in df.columns:
+        df["is_contractor"] = False
+    else:
+        df["is_contractor"] = df["is_contractor"].fillna(False).astype(bool)
+
+    return df
+
+def upsert_payroll_position(
+    client_id,
+    position_id,
+    role_name,
+    employee_name,
+    fte,
+    base_salary_annual,
+    super_rate_pct,
+    payroll_tax_pct,
+    start_date,
+    end_date,
+    notes,
+) -> bool:
+    """
+    Insert or update a payroll position row.
+    """
+    if client_id is None:
+        return False
+
+    payload = {
+        "client_id": str(client_id),
+        "role_name": role_name or None,
+        "employee_name": employee_name or None,
+        "fte": float(fte) if fte is not None else 1.0,
+        "base_salary_annual": float(base_salary_annual or 0),
+        "super_rate_pct": float(super_rate_pct or 0),
+        "payroll_tax_pct": float(payroll_tax_pct or 0),
+        "start_date": start_date.isoformat() if start_date else None,
+        "end_date": end_date.isoformat() if end_date else None,
+        "notes": notes or None,
+    }
+
+    try:
+        if position_id is None:
+            supabase.table("payroll_positions").insert(payload).execute()
+        else:
+            supabase.table("payroll_positions").update(payload).eq("id", position_id).execute()
+        return True
+    except Exception as e:
+        print("Error upserting payroll position:", e)
+        return False
+
+
+def delete_payroll_position(position_id) -> bool:
+    if not position_id:
+        return False
+    try:
+        supabase.table("payroll_positions").delete().eq("id", position_id).execute()
+        return True
+    except Exception as e:
+        print("Error deleting payroll position:", e)
+        return False
+
+
+def upsert_payroll_position(
+    client_id,
+    position_id,
+    role_name,
+    employee_name,
+    fte,
+    base_salary_annual,
+    super_rate_pct,
+    payroll_tax_pct,
+    start_date,
+    end_date,
+    notes,
+) -> bool:
+    """
+    Insert or update a payroll position row.
+    If position_id is None -> insert; otherwise update that row.
+    """
+    if client_id is None:
+        return False
+
+    payload = {
+        "client_id": str(client_id),
+        "role_name": role_name or None,
+        "employee_name": employee_name or None,
+        "fte": float(fte) if fte is not None else 1.0,
+        "base_salary_annual": float(base_salary_annual or 0),
+        "super_rate_pct": float(super_rate_pct or 0),
+        "payroll_tax_pct": float(payroll_tax_pct or 0),
+        "start_date": start_date.isoformat() if start_date else None,
+        "end_date": end_date.isoformat() if end_date else None,
+        "notes": notes or None,
+    }
+
+    try:
+        if position_id is None:
+            supabase.table("payroll_positions").insert(payload).execute()
+        else:
+            supabase.table("payroll_positions").update(payload).eq("id", position_id).execute()
+        return True
+    except Exception as e:
+        print("Error upserting payroll position:", e)
+        return False
+
+
+def delete_payroll_position(position_id) -> bool:
+    if not position_id:
+        return False
+    try:
+        supabase.table("payroll_positions").delete().eq("id", position_id).execute()
+        return True
+    except Exception as e:
+        print("Error deleting payroll position:", e)
+        return False
 
 
 def get_month_options(n_months: int = 18):
@@ -138,134 +315,79 @@ def fetch_hiring_monthly_for_client(client_id):
     return df
 
 @st.cache_data(ttl=60)
-def compute_payroll_by_month(client_id, _month_index):
-    """
-    Compute monthly payroll cash OUT for the given client, aligned to _month_index.
-
-    Uses hiring_monthly as the source:
-      - month_date (or month) as the period
-      - prefers 'payroll_cash_total' if present
-      - else 'cumulative_payroll'
-      - else 'new_payroll'
-      - if none exist -> treats payroll as 0
-
-    Returns: dict { Timestamp_month_start -> payroll_amount_float }
-    """
-    if client_id is None or _month_index is None or len(_month_index) == 0:
-        return {}
-
-    df_hiring = fetch_hiring_monthly_for_client(client_id)
-    if df_hiring is None or df_hiring.empty:
-        return {}
-
-    df = df_hiring.copy()
-
-    # Normalise month column
-    month_col = None
-    for cand in ["month_date", "month", "period"]:
-        if cand in df.columns:
-            month_col = cand
-            break
-
-    if month_col is None:
-        return {}
-
-    df[month_col] = pd.to_datetime(df[month_col], errors="coerce")
-    df = df[df[month_col].notna()]
-    if df.empty:
-        return {}
-
-    # Pick a payroll column
-    payroll_col = None
-    for cand in ["payroll_cash_total", "cumulative_payroll", "new_payroll"]:
-        if cand in df.columns:
-            payroll_col = cand
-            break
-
-    if payroll_col is None:
-        # No recognizable payroll column – nothing to do
-        return {}
-
-    df[payroll_col] = pd.to_numeric(df[payroll_col], errors="coerce").fillna(0.0)
-
-    # Bucket by month start
-    df["bucket_month"] = df[month_col].dt.to_period("M").dt.to_timestamp()
-
-    payroll_agg = (
-        df.groupby("bucket_month", as_index=True)[payroll_col]
-          .sum()
-    )
-
-    # Align to requested month_index
-    payroll_by_month = {}
-    for m in _month_index:
-        # m is a Timestamp at month start (freq="MS")
-        val = float(payroll_agg.get(m, 0.0))
-        payroll_by_month[m] = val
-
-    return payroll_by_month
-
-
-@st.cache_data(ttl=60)
 def compute_payroll_by_month(client_id, _month_index) -> dict:
     """
-    Build a monthly payroll cash series from hiring_monthly for the given months.
+    Compute monthly payroll cash-out for each month in _month_index.
 
-    Priority for payroll column:
-      1) 'cash_payroll'      (if you later add a dedicated cash column)
-      2) 'cumulative_payroll'
-      3) 'new_payroll'
-      4) fallback: 0
+    Uses payroll_positions schema:
 
-    Returns: {Timestamp('2025-12-01'): 45000.0, ...}
+      - base_salary_annual is the base salary at 1.0 FTE
+      - fte scales salary (0.5, 1.0, 1.2 etc.)
+      - super_rate_pct and payroll_tax_pct are on top (if not contractor)
+      - start_date / end_date control when the role is active
+
+    Assumptions:
+      - Payroll is spread evenly over 12 months (base_salary_annual / 12)
     """
-    df_hiring = fetch_hiring_monthly_for_client(client_id)
-    if df_hiring is None or df_hiring.empty:
-        return {m: 0.0 for m in _month_index}
+    if client_id is None or _month_index is None:
+        return {}
 
-    df = df_hiring.copy()
+    df = fetch_payroll_positions_for_client(client_id)
+    if df is None or df.empty:
+        return {}
 
-    # Normalise month column to proper month_start timestamps
-    if "month_date" in df.columns:
-        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    elif "month" in df.columns:
-        df["month_date"] = pd.to_datetime(df["month"], errors="coerce")
-    else:
-        # No usable month column
-        return {m: 0.0 for m in _month_index}
+    # Normalise month index to first-of-month timestamps
+    month_index = pd.to_datetime(_month_index).to_period("M").to_timestamp()
+    payroll_by_month: dict = {m: 0.0 for m in month_index}
 
-    df = df[df["month_date"].notna()]
-    if df.empty:
-        return {m: 0.0 for m in _month_index}
+    for _, row in df.iterrows():
+        base_annual = float(row.get("base_salary_annual") or 0.0)
+        if base_annual <= 0:
+            continue
 
-    # Pick the best available payroll column
-    payroll_col = None
-    for cand in ["cash_payroll", "cumulative_payroll", "new_payroll"]:
-        if cand in df.columns:
-            payroll_col = cand
-            break
+        fte = float(row.get("fte") or 1.0)
+        is_contractor = bool(row.get("is_contractor", False))
 
-    if payroll_col is None:
-        # No payroll column yet
-        return {m: 0.0 for m in _month_index}
+        super_pct = float(row.get("super_rate_pct") or 0.0) / 100.0
+        tax_pct = float(row.get("payroll_tax_pct") or 0.0) / 100.0
 
-    df[payroll_col] = pd.to_numeric(df[payroll_col], errors="coerce").fillna(0.0)
+        start = row.get("start_date")
+        end = row.get("end_date")
 
-    # Aggregate payroll by month (sum across departments/roles)
-    df["bucket_month"] = df["month_date"].dt.to_period("M").dt.to_timestamp()
-    payroll_agg = (
-        df.groupby("bucket_month", as_index=True)[payroll_col]
-        .sum()
-        .to_dict()
-    )
+        # 🔒 Normalise start/end: convert Timestamp -> date, NaT/NaN -> None
+        if isinstance(start, pd.Timestamp):
+            start = start.date()
+        if isinstance(end, pd.Timestamp):
+            end = end.date()
 
-    # Build final dict aligned to _month_index
-    result = {}
-    for m in _month_index:
-        result[m] = float(payroll_agg.get(m, 0.0))
+        if pd.isna(start):
+            start = None
+        if pd.isna(end):
+            end = None
 
-    return result
+        # Monthly base salary at given FTE
+        base_monthly = (base_annual / 12.0) * fte
 
+        for m in month_index:
+            month_start = m.date()
+            month_end = (m + pd.offsets.MonthEnd(0)).date()
+
+            # Active only if role overlaps this month
+            if start is not None and start > month_end:
+                continue
+            if end is not None and end < month_start:
+                continue
+
+            if is_contractor:
+                monthly_cash = base_monthly
+            else:
+                super_amt = base_monthly * super_pct
+                tax_amt = base_monthly * tax_pct
+                monthly_cash = base_monthly + super_amt + tax_amt
+
+            payroll_by_month[m] = payroll_by_month.get(m, 0.0) + monthly_cash
+
+    return payroll_by_month
 
 
 @st.cache_data(ttl=60)
@@ -341,7 +463,6 @@ def upload_csv_to_table_for_client(client_id, csv_file, table_name: str):
     except Exception as e:
         return False, f"Upload failed: {e}"
 
-@st.cache_data(ttl=60)
 def fetch_cashflow_summary_for_client(client_id):
     if client_id is None:
         return pd.DataFrame()
@@ -356,17 +477,20 @@ def fetch_cashflow_summary_for_client(client_id):
             .execute()
         )
         rows = res.data or []
-    except Exception:
+    except Exception as e:
+        print("Error fetching cashflow_summary:", e)
         rows = []
 
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
+
     if "month_date" in df.columns:
         df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    return df
+        df = df[df["month_date"].notna()].sort_values("month_date")
 
+    return df
 
 
 @st.cache_data(ttl=60)
@@ -425,6 +549,172 @@ def fetch_pipeline_for_client(client_id):
 
     return df
 
+#POC Revenue Recongition
+@st.cache_data(ttl=60)
+def fetch_poc_progress_for_client(client_id) -> pd.DataFrame:
+    """
+    Fetch all percentage-of-completion rows for this client.
+    Each row is cumulative pct_complete for a given deal + month_date.
+    """
+    if client_id is None:
+        return pd.DataFrame()
+
+    try:
+        res = (
+            supabase
+            .table("deal_poc_progress")
+            .select("*")
+            .eq("client_id", str(client_id))
+            .order("deal_id")
+            .order("month_date")
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as e:
+        print("Error fetching POC progress:", e)
+        rows = []
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if "month_date" in df.columns:
+        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+    if "pct_complete" in df.columns:
+        df["pct_complete"] = pd.to_numeric(df["pct_complete"], errors="coerce").fillna(0.0)
+    return df
+
+def upsert_poc_progress_row(
+    client_id,
+    deal_id: int,
+    month_date: date,
+    pct_complete: float,
+    notes: str | None = None,
+) -> bool:
+    """
+    Upsert a single POC row for (deal_id, month_date).
+    pct_complete is cumulative 0–100.
+    """
+    if client_id is None or deal_id is None or month_date is None:
+        return False
+
+    try:
+        payload = {
+            "client_id": str(client_id),
+            "deal_id": int(deal_id),
+            "month_date": month_date.isoformat(),
+            "pct_complete": float(pct_complete),
+            "notes": notes or None,
+        }
+
+        (
+            supabase
+            .table("deal_poc_progress")
+            .upsert(payload, on_conflict="deal_id,month_date")
+            .execute()
+        )
+
+        # Clear cache so engine picks up new % immediately
+        st.cache_data.clear()
+        return True
+    except Exception as e:
+        print("Error upserting POC progress:", e)
+        return False
+
+#Milstone Revenue Recongition
+@st.cache_data(ttl=60)
+def fetch_milestones_for_deal(client_id, deal_id) -> pd.DataFrame:
+    """
+    Load all milestone rows for a single deal.
+    """
+    if client_id is None or deal_id is None:
+        return pd.DataFrame()
+
+    try:
+        res = (
+            supabase
+            .table("deal_milestones")
+            .select("*")
+            .eq("client_id", str(client_id))
+            .eq("deal_id", int(deal_id))
+            .order("month_date")
+            .execute()
+        )
+        rows = res.data or []
+    except Exception:
+        rows = []
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    if "month_date" in df.columns:
+        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce").dt.date
+    df["percent_of_contract"] = pd.to_numeric(
+        df.get("percent_of_contract"), errors="coerce"
+    ).fillna(0.0)
+
+    return df
+
+
+def save_milestones_for_deal(client_id, deal_id, milestones_df: pd.DataFrame) -> bool:
+    """
+    Replace milestones for this deal with the rows from milestones_df.
+    Expected columns in milestones_df:
+      - month_date (date or string)
+      - percent_of_contract (float, 0–100)
+      - milestone_name (optional)
+    """
+    if client_id is None or deal_id is None:
+        return False
+
+    if milestones_df is None or milestones_df.empty:
+        # nothing to save
+        return False
+
+    df = milestones_df.copy()
+
+    # Normalise and clean
+    df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce").dt.date
+    df["percent_of_contract"] = pd.to_numeric(
+        df.get("percent_of_contract"), errors="coerce"
+    ).fillna(0.0)
+
+    df = df[df["month_date"].notna() & (df["percent_of_contract"] > 0)]
+    if df.empty:
+        return False
+
+    # Build payload
+    payload = []
+    for _, row in df.iterrows():
+        payload.append(
+            {
+                "client_id": str(client_id),
+                "deal_id": int(deal_id),
+                "month_date": row["month_date"].isoformat(),
+                "percent_of_contract": float(row["percent_of_contract"]),
+                "milestone_name": row.get("milestone_name") or None,
+            }
+        )
+
+    try:
+        # Delete existing milestones for this deal
+        supabase.table("deal_milestones").delete().eq(
+            "client_id", str(client_id)
+        ).eq("deal_id", int(deal_id)).execute()
+
+        # Insert new ones
+        supabase.table("deal_milestones").insert(payload).execute()
+
+        # Clear cache so fetch_milestones_for_deal + revenue schedule recompute
+        st.cache_data.clear()
+
+        return True
+    except Exception as e:
+        print("Error saving milestones:", e)
+        return False
+
+
 def build_expected_revenue_curve(
     df_pipeline: pd.DataFrame,
     base_month: date,
@@ -476,6 +766,284 @@ def build_expected_revenue_curve(
             "expected_revenue": [months[m] for m in month_index],
         }
     )
+    return out_df
+
+@st.cache_data(ttl=60)
+def build_revenue_schedule_for_client(
+    client_id,
+    base_month: date,
+    n_months: int = 12,
+) -> pd.DataFrame:
+    """
+    Build recognised revenue *by deal + month* for this client.
+
+    - Uses a single revenue_recognition_method from client_settings
+      (saas, milestone, poc, straight_line, usage, point_in_time)
+    - Ignores deals with effective probability below `min_revenue_prob_pct`
+    - Ignores stage = 'closed_lost'
+    - If stage = 'closed_won' → probability = 100%
+    - For milestone method, uses deal_milestones table to phase revenue
+    - For SaaS / straight_line / point_in_time, uses pipeline dates + (optional) contract_months
+    """
+
+    if client_id is None or base_month is None:
+        return pd.DataFrame()
+
+    settings = get_client_settings(client_id)
+    method = (settings.get("revenue_recognition_method") or "saas").lower()
+    min_prob_pct = float(settings.get("min_revenue_prob_pct", 20))  # default 20%
+
+    # Pipeline deals
+    df = fetch_pipeline_for_client(client_id)
+    # POC progress table (may be empty) – we keep this ready for future true-up logic
+    df_poc_all = fetch_poc_progress_for_client(client_id)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["value_total"] = pd.to_numeric(df.get("value_total"), errors="coerce").fillna(0.0)
+    df["probability_pct"] = pd.to_numeric(df.get("probability_pct"), errors="coerce").fillna(0.0)
+
+    # Normalise dates
+    for col in ["start_month", "end_month", "created_at"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Effective probability based on stage
+    def _effective_prob(row):
+        stage = str(row.get("stage", "")).lower()
+        if stage == "closed_lost":
+            return 0.0
+        if stage == "closed_won":
+            return 1.0
+        p = float(row.get("probability_pct", 0.0)) / 100.0
+        return max(0.0, min(p, 1.0))
+
+    df["effective_prob"] = df.apply(_effective_prob, axis=1)
+    df["effective_prob_pct"] = df["effective_prob"] * 100.0
+
+    # Drop low-probability deals
+    df = df[df["effective_prob_pct"] >= min_prob_pct]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Month buckets we care about
+    month_index = pd.date_range(
+        start=pd.to_datetime(base_month),
+        periods=n_months,
+        freq="MS",
+    )
+    month_set = set(month_index)
+
+    # Helper: figure out per-deal spreading for the simple methods
+    def _spread_evenly(start_ts, end_ts, total_amount, months_to_spread):
+        """
+        Returns list of (month_bucket, amount) for this deal.
+        """
+        if total_amount == 0 or pd.isna(start_ts) or months_to_spread <= 0:
+            return []
+
+        start_bucket = pd.to_datetime(start_ts).to_period("M").to_timestamp()
+
+        local_months: list[pd.Timestamp] = []
+        for m in month_index:
+            if m < start_bucket:
+                continue
+            if end_ts is not None and not pd.isna(end_ts):
+                end_bucket = pd.to_datetime(end_ts).to_period("M").to_timestamp()
+                if m > end_bucket:
+                    continue
+            local_months.append(m)
+            if len(local_months) >= months_to_spread:
+                break
+
+        if not local_months:
+            return []
+
+        per_month = float(total_amount) / len(local_months)
+        return [(m, per_month) for m in local_months]
+
+    # ------------- MAIN LOOP: build schedule rows -------------
+    rows: list[dict] = []
+
+    for _, row in df.iterrows():
+        deal_id = row.get("id")
+        gross_val = float(row.get("value_total", 0.0))
+        eff_prob = float(row.get("effective_prob", 0.0))
+        effective_val = gross_val * eff_prob
+
+        if effective_val == 0:
+            continue
+
+        start_ts = row.get("start_month")
+        end_ts = row.get("end_month")
+        created_ts = row.get("created_at")
+
+        if pd.isna(start_ts):
+            start_ts = created_ts
+        if pd.isna(start_ts):
+            # No usable timing → skip
+            continue
+
+        # Revenue type label (for charts)
+        revenue_type = method  # e.g. 'saas', 'milestone', 'poc', 'straight_line', etc.
+
+        # ---------- CASE 1: Milestone method ----------
+        if method == "milestone":
+            ms_df = fetch_milestones_for_deal(client_id, deal_id)
+            used_any = False
+
+            if ms_df is not None and not ms_df.empty:
+                for _, ms in ms_df.iterrows():
+                    md = ms.get("month_date")
+                    pct = float(ms.get("percent_of_contract") or 0.0)
+
+                    if pd.isna(md) or pct <= 0:
+                        continue
+
+                    bucket = pd.to_datetime(md).to_period("M").to_timestamp()
+                    if bucket not in month_set:
+                        continue
+
+                    allocated = effective_val * (pct / 100.0)
+                    if allocated == 0:
+                        continue
+
+                    rows.append(
+                        {
+                            "client_id": str(client_id),
+                            "deal_id": deal_id,
+                            "month_date": bucket,
+                            "revenue_amount": round(allocated, 2),
+                            "revenue_type": revenue_type,
+                        }
+                    )
+                    used_any = True
+
+            # If we used milestones, skip fallback
+            if used_any:
+                continue
+
+            # Fallback: no milestones → recognise all in the start month
+            start_bucket = pd.to_datetime(start_ts).to_period("M").to_timestamp()
+            if start_bucket in month_set:
+                rows.append(
+                    {
+                        "client_id": str(client_id),
+                        "deal_id": deal_id,
+                        "month_date": start_bucket,
+                        "revenue_amount": round(effective_val, 2),
+                        "revenue_type": revenue_type,
+                    }
+                )
+            continue
+
+        # ---------- CASE 2: SaaS subscription ----------
+        if method == "saas":
+            # Optional per-deal contract length
+            contract_months = None
+            if "contract_months" in df.columns:
+                try:
+                    contract_months = int(row.get("contract_months") or 0)
+                except Exception:
+                    contract_months = None
+
+            if not contract_months or contract_months <= 0:
+                contract_months = int(settings.get("saas_default_months", 12) or 12)
+
+            allocations = _spread_evenly(
+                start_ts,
+                None,  # no fixed end date needed for SaaS
+                effective_val,
+                months_to_spread=contract_months,
+            )
+
+        # ---------- CASE 3: Straight-line service / simple POC baseline ----------
+        elif method in ["straight_line", "poc"]:
+            # If we have an explicit end date, use the actual duration
+            if not pd.isna(end_ts):
+                start_bucket = pd.to_datetime(start_ts).to_period("M").to_timestamp()
+                end_bucket = pd.to_datetime(end_ts).to_period("M").to_timestamp()
+                # number of months inclusive
+                n = max(
+                    1,
+                    (end_bucket.to_period("M") - start_bucket.to_period("M")).n + 1,
+                )
+                months_to_spread = n
+            else:
+                # No end date: try contract_months, else fallback to project_default_months (e.g. 6)
+                contract_months = None
+                if "contract_months" in df.columns:
+                    try:
+                        contract_months = int(row.get("contract_months") or 0)
+                    except Exception:
+                        contract_months = None
+
+                if not contract_months or contract_months <= 0:
+                    contract_months = int(settings.get("project_default_months", 6) or 6)
+
+                months_to_spread = contract_months
+
+            allocations = _spread_evenly(
+                start_ts,
+                end_ts,
+                effective_val,
+                months_to_spread=months_to_spread,
+            )
+
+            # NOTE: Right now POC uses this straight-line baseline.
+            # The POC true-up logic using df_poc_all can be layered on top later.
+
+        # ---------- CASE 4: Point-in-time goods delivery ----------
+        elif method == "point_in_time":
+            start_bucket = pd.to_datetime(start_ts).to_period("M").to_timestamp()
+            allocations = []
+            if start_bucket in month_set:
+                allocations.append((start_bucket, effective_val))
+
+        # ---------- CASE 5: Usage-based (temporary rule) ----------
+        elif method == "usage":
+            allocations = _spread_evenly(
+                start_ts,
+                None,
+                effective_val,
+                months_to_spread=3,  # short-term spreading as placeholder
+            )
+
+        # ---------- CASE 6: Fallback ----------
+        else:
+            allocations = _spread_evenly(
+                start_ts,
+                None,
+                effective_val,
+                months_to_spread=6,
+            )
+
+        # Add rows for all non-milestone methods
+        for bucket, amt in allocations:
+            if bucket not in month_set or amt == 0:
+                continue
+
+            rows.append(
+                {
+                    "client_id": str(client_id),
+                    "deal_id": deal_id,
+                    "month_date": bucket,
+                    "revenue_amount": round(amt, 2),
+                    "revenue_type": revenue_type,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out_df = pd.DataFrame(rows)
+    out_df["month_date"] = pd.to_datetime(out_df["month_date"], errors="coerce")
+    out_df = out_df[out_df["month_date"].notna()]
+    out_df = out_df.sort_values("month_date")
+    out_df["month_label"] = out_df["month_date"].dt.strftime("%b %Y")
+
     return out_df
 
 # ---------- Revenue recognition engine (6 modes) ----------
@@ -775,138 +1343,6 @@ def _schedule_point_in_time(deal: pd.Series, window_start, window_end, rows: lis
     )
 
 
-@st.cache_data(ttl=60)
-def build_revenue_schedule_for_client(
-    client_id,
-    base_month: date,
-    n_months: int = 12,
-) -> pd.DataFrame:
-    """
-    Build recognised revenue by month for this client, applying
-    a SINGLE revenue recognition method per client.
-    """
-    if client_id is None or base_month is None:
-        return pd.DataFrame()
-
-    # Load deals
-    df = fetch_pipeline_for_client(client_id)
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-    # Ensure start_month is usable
-    if "start_month" in df.columns:
-        df["start_month"] = pd.to_datetime(df["start_month"], errors="coerce")
-    else:
-        df["start_month"] = pd.to_datetime(df.get("created_at"), errors="coerce")
-
-    df = df[df["start_month"].notna()]
-    if df.empty:
-        return pd.DataFrame()
-
-    # Client-level settings
-    settings = get_client_settings(client_id)
-    method = settings["revenue_recognition_method"]
-    min_prob = settings["min_revenue_prob_pct"]
-
-    # Month buckets
-    month_index = pd.date_range(
-        start=pd.to_datetime(base_month),
-        periods=n_months,
-        freq="MS",
-    )
-
-    rows = []
-
-    for _, row in df.iterrows():
-        # Effective prob
-        eff_prob = get_effective_probability(row, min_prob=min_prob)
-        if eff_prob <= 0:
-            continue  # skip this deal in revenue
-
-        total_val_raw = row.get("value_total", 0) or 0
-        try:
-            total_val = float(total_val_raw)
-        except Exception:
-            total_val = 0.0
-
-        if total_val <= 0:
-            continue
-
-        start_dt = row["start_month"].to_period("M").to_timestamp()
-
-        # Map method name normalised
-        mname = str(method).lower()
-
-        if "point" in mname:
-            # Point-in-time: recognise in start month
-            amount = total_val * eff_prob / 100.0
-            if start_dt in month_index:
-                rows.append(
-                    {
-                        "month_date": start_dt,
-                        "revenue_amount": amount,
-                        "revenue_type": method,
-                        "deal_id": row.get("id"),
-                    }
-                )
-
-        elif "straight" in mname or "saas" in mname:
-            # Simple straight-line: spread over a term (e.g. 12 months) from start_dt
-            term_months = 12  # later: make this configurable / from row
-            monthly = (total_val * eff_prob / 100.0) / term_months
-
-            for i in range(term_months):
-                m = start_dt + pd.DateOffset(months=i)
-                if m not in month_index:
-                    continue
-                rows.append(
-                    {
-                        "month_date": m,
-                        "revenue_amount": monthly,
-                        "revenue_type": method,
-                        "deal_id": row.get("id"),
-                    }
-                )
-
-        elif "milestone" in mname or "percentage" in mname or "usage" in mname:
-            # v1: treat as point-in-time at start month (safer until we model details)
-            amount = total_val * eff_prob / 100.0
-            if start_dt in month_index:
-                rows.append(
-                    {
-                        "month_date": start_dt,
-                        "revenue_amount": amount,
-                        "revenue_type": method,
-                        "deal_id": row.get("id"),
-                    }
-                )
-
-        else:
-            # Fallback behaviour: straight-line over 12 months
-            term_months = 12
-            monthly = (total_val * eff_prob / 100.0) / term_months
-            for i in range(term_months):
-                m = start_dt + pd.DateOffset(months=i)
-                if m not in month_index:
-                    continue
-                rows.append(
-                    {
-                        "month_date": m,
-                        "revenue_amount": monthly,
-                        "revenue_type": method,
-                        "deal_id": row.get("id"),
-                    }
-                )
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    out["month_date"] = pd.to_datetime(out["month_date"], errors="coerce")
-    out = out[out["month_date"].notna()]
-    return out
-
 
 def get_effective_probability(row: dict, min_prob: float) -> float:
     """
@@ -1012,7 +1448,67 @@ def compute_revenue_schedule(client_id, base_month: date, n_months: int = 12) ->
 def page_sales_deals():
     top_header("Sales & Deals")
 
-    # Load pipeline with spinner
+    # ---------- Revenue recognition settings for this business ----------
+    settings = get_client_settings(selected_client_id)
+    current_method = (settings.get("revenue_recognition_method") or "saas").lower()
+
+    method_labels = {
+        "saas": "SaaS subscription (spread over 12 months)",
+        "milestone": "Milestone / project (milestones by month)",
+        "poc": "Percentage-of-completion (spread between start & end)",
+        "straight_line": "Straight-line service (start–end months)",
+        "usage": "Usage-based (placeholder spreading)",
+        "point_in_time": "Point-in-time goods delivery (lump on delivery month)",
+    }
+
+    # Human-facing label for storing in the pipeline `method` column
+    method_display_map = {
+        "saas": "SaaS subscription",
+        "milestone": "Milestone project",
+        "poc": "Percentage-of-completion",
+        "straight_line": "Straight-line service",
+        "usage": "Usage-based",
+        "point_in_time": "Point-in-time goods",
+    }
+
+    method_options = list(method_labels.keys())
+    default_index = (
+        method_options.index(current_method)
+        if current_method in method_options
+        else 0
+    )
+
+    selected_method_label = st.selectbox(
+        "Revenue recognition method for this business",
+        options=[method_labels[m] for m in method_options],
+        index=default_index,
+        help=(
+            "One method per client. All deals in the pipeline use this method "
+            "for recognised revenue in your dashboards."
+        ),
+    )
+
+    # Map label back to code
+    reverse_map = {v: k for k, v in method_labels.items()}
+    selected_method_code = reverse_map[selected_method_label]
+
+    # Label stored on each deal
+    current_method_display = method_display_map.get(
+        selected_method_code,
+        "Straight-line service",
+    )
+
+    if st.button("Save revenue recognition method"):
+        ok = save_revenue_method(selected_client_id, selected_method_code)
+        if ok:
+            st.success("Revenue recognition method updated for this business.")
+            st.rerun()
+        else:
+            st.error("Could not update method. Please try again.")
+
+    st.markdown("---")
+
+    # ---------- Pipeline overview ----------
     with st.spinner("Loading your pipeline..."):
         df_pipeline = fetch_pipeline_for_client(selected_client_id)
 
@@ -1021,7 +1517,6 @@ def page_sales_deals():
     if df_pipeline.empty:
         st.info("No deals in the pipeline yet for this business.")
     else:
-        # Nice compact view for founders
         display_cols = []
         for col in [
             "deal_name",
@@ -1051,7 +1546,6 @@ def page_sales_deals():
         )
         st.dataframe(view, use_container_width=True)
 
-        # Some quick stats for the founder
         total_pipeline = df_pipeline["value_total"].fillna(0).sum()
         weighted_pipeline = (
             df_pipeline["value_total"].fillna(0)
@@ -1068,11 +1562,10 @@ def page_sales_deals():
         with k3:
             st.metric("Open deals", open_deals)
 
-        # ---------- Edit deal status / probability ----------
+        # ---------- Edit deal status / probability + milestones ----------
         st.markdown("---")
         st.subheader("✏️ Update deal status / probability")
 
-        # Build a friendly selector
         deal_options = []
         deal_id_map = {}
         for _, r in df_pipeline.iterrows():
@@ -1096,8 +1589,6 @@ def page_sales_deals():
 
             if selected_label != "-- Select --":
                 deal_id = deal_id_map[selected_label]
-
-                # Extract existing data for defaults
                 current_row = df_pipeline[df_pipeline["id"] == deal_id].iloc[0]
                 current_stage = str(current_row.get("stage", "proposal"))
                 current_prob = float(current_row.get("probability_pct") or 0.0)
@@ -1107,15 +1598,22 @@ def page_sales_deals():
                     new_stage = st.selectbox(
                         "New stage",
                         ["idea", "proposal", "demo", "contract", "closed_won", "closed_lost"],
-                        index=["idea", "proposal", "demo", "contract", "closed_won", "closed_lost"].index(
-                            current_stage if current_stage in
-                            ["idea", "proposal", "demo", "contract", "closed_won", "closed_lost"]
+                        index=[
+                            "idea",
+                            "proposal",
+                            "demo",
+                            "contract",
+                            "closed_won",
+                            "closed_lost",
+                        ].index(
+                            current_stage
+                            if current_stage
+                            in ["idea", "proposal", "demo", "contract", "closed_won", "closed_lost"]
                             else "proposal"
                         ),
                         key="pipeline_new_stage",
                     )
                 with col_ed2:
-                    # If user sets stage to closed_won/lost, we'll override prob in backend
                     new_prob = st.slider(
                         "Probability (%)",
                         min_value=0,
@@ -1132,10 +1630,224 @@ def page_sales_deals():
                     else:
                         st.error("Could not update deal. Please try again.")
 
+                # ---------- Milestone editor (only if client uses milestone recognition) ----------
+                if selected_method_code == "milestone":
+                    st.markdown("#### 🧱 Milestones for this deal")
+
+                    ms_df = fetch_milestones_for_deal(selected_client_id, deal_id)
+
+                    if ms_df.empty:
+                        ms_df = pd.DataFrame(
+                            {
+                                "month_date": [selected_month_start],
+                                "percent_of_contract": [100.0],
+                                "milestone_name": ["Initial milestone"],
+                            }
+                        )
+
+                    editable = ms_df[["month_date", "percent_of_contract", "milestone_name"]].copy()
+
+                    edited = st.data_editor(
+                        editable,
+                        num_rows="dynamic",
+                        key=f"milestones_editor_{deal_id}",
+                        use_container_width=True,
+                    )
+
+                    st.caption(
+                        "Add a row per milestone. "
+                        "Percent of contract can total 100%, or we’ll normalise it automatically."
+                    )
+
+                    if st.button("Save milestones", key=f"save_milestones_{deal_id}"):
+                        ok_ms = save_milestones_for_deal(
+                            selected_client_id, deal_id, edited
+                        )
+                        if ok_ms:
+                            st.success(
+                                "Milestones saved. Revenue schedule will update automatically."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Could not save milestones. "
+                                "Check dates and percentages and try again."
+                            )
+
     st.markdown("---")
+        # ---------- POC progress editor (only if method == 'poc') ----------
+    if selected_method_code == "poc":
+        st.markdown("---")
+        st.subheader("🏗 Percentage-of-completion (projects)")
 
-    st.subheader("📆 Expected revenue over time (simple model)")
+        if df_pipeline.empty:
+            st.caption("No deals yet. Add a project deal to track % complete.")
+        else:
+            # Limit to non-lost deals
+            poc_deals = df_pipeline[
+                df_pipeline["stage"].str.lower() != "closed_lost"
+            ].copy()
 
+            if poc_deals.empty:
+                st.caption("No active POC projects to update.")
+            else:
+                options = []
+                id_map = {}
+                for _, r in poc_deals.iterrows():
+                    d_id = r.get("id")
+                    name = r.get("deal_name", "Unnamed")
+                    cust = r.get("customer_name") or ""
+                    label = f"{name} – {cust} (id={d_id})"
+                    options.append(label)
+                    id_map[label] = d_id
+
+                selected_poc_label = st.selectbox(
+                    "Pick a project to update % complete (cumulative)",
+                    ["-- Select --"] + options,
+                    key="poc_deal_select",
+                )
+
+                if selected_poc_label != "-- Select --":
+                    deal_id = id_map[selected_poc_label]
+
+                    # 🔹 Let the user choose which month they are updating
+                    selected_month_for_poc = st.date_input(
+                        "Which month is this % complete for?",
+                        value=selected_month_start,
+                        help="We treat this as the month-end / reporting month.",
+                        key="poc_month_picker",
+                    )
+
+                    # Convert chosen date to first of that month for storage
+                    month_bucket = (
+                        pd.to_datetime(selected_month_for_poc)
+                        .to_period("M")
+                        .to_timestamp()
+                        .date()
+                    )
+
+                    # Load existing % for this deal + month (if any)
+                    df_poc_all = fetch_poc_progress_for_client(selected_client_id)
+                    existing_pct = 0.0
+                    existing_notes = ""
+
+                    if df_poc_all is not None and not df_poc_all.empty:
+                        df_match = df_poc_all[
+                            (df_poc_all["deal_id"] == deal_id)
+                            & (df_poc_all["month_date"].dt.date == month_bucket)
+                        ]
+                        if not df_match.empty:
+                            existing_pct = float(df_match["pct_complete"].iloc[0] or 0.0)
+                            existing_notes = str(df_match["notes"].iloc[0] or "")
+
+                    col_p1, col_p2 = st.columns([1, 2])
+                    with col_p1:
+                        pct_input = st.number_input(
+                            "Cumulative % complete (0–100)",
+                            min_value=0.0,
+                            max_value=100.0,
+                            step=1.0,
+                            value=existing_pct,
+                            key="poc_pct_input",
+                        )
+                    with col_p2:
+                        poc_notes = st.text_area(
+                            f"Notes for {month_bucket.strftime('%b %Y')} (optional)",
+                            value=existing_notes,
+                            key="poc_notes_input",
+                        )
+
+                    if st.button("Save % complete for this month", key="poc_save_btn"):
+                        ok = upsert_poc_progress_row(
+                            selected_client_id,
+                            deal_id=deal_id,
+                            month_date=month_bucket,
+                            pct_complete=pct_input,
+                            notes=poc_notes,
+                        )
+                        if ok:
+                            st.success(
+                                f"Saved {pct_input:.1f}% complete for this project "
+                                f"({month_bucket.strftime('%b %Y')}). "
+                                "Revenue true-up will be reflected in the schedule."
+                            )
+                            st.rerun()
+                        else:
+                            st.error("Could not save % complete. Please try again.")
+
+
+    # ---------- Revenue snapshot (this month + next 3 months) ----------
+    st.subheader("📌 Revenue snapshot (this + next 3 months)")
+
+    snap_df = build_revenue_schedule_for_client(
+        selected_client_id,
+        base_month=selected_month_start,
+        n_months=12,
+    )
+
+    if snap_df is None or snap_df.empty:
+        st.caption(
+            "No recognised revenue schedule yet. "
+            "Add deals with a revenue type + start month to see this view."
+        )
+    else:
+        snap_df = snap_df.copy()
+        snap_df["month_date"] = pd.to_datetime(snap_df["month_date"], errors="coerce")
+        snap_df = snap_df[snap_df["month_date"].notna()]
+
+        # Decide which column holds the recognised revenue
+        value_col = None
+        for cand in ["recognised_revenue", "revenue_amount", "amount"]:
+            if cand in snap_df.columns:
+                value_col = cand
+                break
+
+        if value_col is None:
+            st.caption("Revenue schedule is missing a recognised revenue column.")
+        else:
+            focus_start = pd.to_datetime(selected_month_start).replace(day=1)
+            future_end = focus_start + pd.DateOffset(months=4)
+
+            window = snap_df[
+                (snap_df["month_date"] >= focus_start)
+                & (snap_df["month_date"] < future_end)
+            ].copy()
+
+            if window.empty:
+                st.caption("No recognised revenue in this 4-month window yet.")
+            else:
+                monthly = (
+                    window.groupby("month_date", as_index=False)[value_col]
+                    .sum()
+                    .sort_values("month_date")
+                )
+                monthly["Month"] = monthly["month_date"].dt.strftime("%b %Y")
+
+                this_row = monthly[monthly["month_date"] == focus_start]
+                this_rev = float(this_row[value_col].iloc[0]) if not this_row.empty else 0.0
+
+                next_3_rev = float(
+                    monthly[monthly["month_date"] > focus_start][value_col].sum()
+                )
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.metric(
+                        "This month (recognised revenue)",
+                        f"${this_rev:,.0f}",
+                    )
+                with c2:
+                    st.metric(
+                        "Next 3 months (total recognised)",
+                        f"${next_3_rev:,.0f}",
+                    )
+
+                table_view = monthly[["Month", value_col]].rename(
+                    columns={value_col: "Recognised revenue"}
+                )
+                st.dataframe(table_view, use_container_width=True)
+
+    st.markdown("---")
 
     # ---------- Revenue recognition engine output ----------
     st.subheader("📆 Revenue recognition over time (by method)")
@@ -1159,93 +1871,102 @@ def page_sales_deals():
         rev_df["Month"] = rev_df["month_date"].dt.strftime("%b %Y")
 
         # 1) Summary by month (total)
-        monthly_total = (
-            rev_df.groupby(["month_date", "Month"], as_index=False)["revenue_amount"]
-            .sum()
-            .rename(columns={"revenue_amount": "Total revenue"})
-        )
+        total_col = None
+        for cand in ["revenue_amount", "recognised_revenue", "amount"]:
+            if cand in rev_df.columns:
+                total_col = cand
+                break
 
-        # 2) Breakdown by revenue_type (pivot table)
-        pivot_by_type = (
-            rev_df.pivot_table(
-                index=["month_date", "Month"],
-                columns="revenue_type",
-                values="revenue_amount",
-                aggfunc="sum",
-                fill_value=0.0,
+        if total_col is None:
+            st.caption("Revenue schedule is missing a recognised revenue column.")
+        else:
+            monthly_total = (
+                rev_df.groupby(["month_date", "Month"], as_index=False)[total_col]
+                .sum()
+                .rename(columns={total_col: "Total revenue"})
             )
-            .reset_index()
-        )
 
-        display_cols = ["Month"]
-        type_cols = [
-            c for c in pivot_by_type.columns
-            if c not in ["month_date", "Month"]
-        ]
-        display_cols.extend(type_cols)
-
-        revenue_table = pivot_by_type[display_cols].copy()
-
-        st.dataframe(revenue_table, use_container_width=True)
-        st.caption(
-            "Recognised revenue by month, split by revenue recognition method. "
-            "Amounts are probability-weighted based on pipeline probability."
-        )
-
-        # 3) Chart – total revenue over time
-        chart = (
-            alt.Chart(monthly_total)
-            .mark_line()
-            .encode(
-                x=alt.X(
-                    "month_date:T",
-                    title="Month",
-                    axis=alt.Axis(format="%b %Y"),
-                ),
-                y=alt.Y("Total revenue:Q", title="Recognised revenue"),
-                tooltip=[
-                    alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                    alt.Tooltip("Total revenue:Q", title="Revenue", format=",.0f"),
-                ],
+            # 2) Breakdown by revenue_type (pivot table)
+            pivot_by_type = (
+                rev_df.pivot_table(
+                    index=["month_date", "Month"],
+                    columns="revenue_type",
+                    values=total_col,
+                    aggfunc="sum",
+                    fill_value=0.0,
+                )
+                .reset_index()
             )
-        )
-        st.altair_chart(chart.interactive(), use_container_width=True)
 
-        # 4) Optional stacked chart by type (nice visual)
-        long_df = rev_df.copy()
-        long_df["revenue_type"] = long_df["revenue_type"].astype(str)
+            display_cols = ["Month"]
+            type_cols = [
+                c for c in pivot_by_type.columns
+                if c not in ["month_date", "Month"]
+            ]
+            display_cols.extend(type_cols)
 
-        stacked = (
-            alt.Chart(long_df)
-            .mark_area()
-            .encode(
-                x=alt.X(
-                    "month_date:T",
-                    title="Month",
-                    axis=alt.Axis(format="%b %Y"),
-                ),
-                y=alt.Y(
-                    "revenue_amount:Q",
-                    stack="zero",
-                    title="Revenue by type",
-                ),
-                color=alt.Color("revenue_type:N", title="Recognition method"),
-                tooltip=[
-                    alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                    "revenue_type:N",
-                    alt.Tooltip(
-                        "revenue_amount:Q",
-                        title="Revenue",
-                        format=",.0f",
+            revenue_table = pivot_by_type[display_cols].copy()
+
+            st.dataframe(revenue_table, use_container_width=True)
+            st.caption(
+                "Recognised revenue by month, split by revenue recognition method. "
+                "Amounts are probability-weighted based on pipeline probability."
+            )
+
+            # 3) Chart – total revenue over time
+            chart = (
+                alt.Chart(monthly_total)
+                .mark_line()
+                .encode(
+                    x=alt.X(
+                        "month_date:T",
+                        title="Month",
+                        axis=alt.Axis(format="%b %Y"),
                     ),
-                ],
+                    y=alt.Y("Total revenue:Q", title="Recognised revenue"),
+                    tooltip=[
+                        alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
+                        alt.Tooltip("Total revenue:Q", title="Revenue", format=",.0f"),
+                    ],
+                )
             )
-        )
-        st.altair_chart(stacked.interactive(), use_container_width=True)
+            st.altair_chart(chart.interactive(), use_container_width=True)
+
+            # 4) Optional stacked chart by type (nice visual)
+            long_df = rev_df.copy()
+            long_df["revenue_type"] = long_df["revenue_type"].astype(str)
+
+            stacked = (
+                alt.Chart(long_df)
+                .mark_area()
+                .encode(
+                    x=alt.X(
+                        "month_date:T",
+                        title="Month",
+                        axis=alt.Axis(format="%b %Y"),
+                    ),
+                    y=alt.Y(
+                        total_col + ":Q",
+                        stack="zero",
+                        title="Revenue by type",
+                    ),
+                    color=alt.Color("revenue_type:N", title="Recognition method"),
+                    tooltip=[
+                        alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
+                        "revenue_type:N",
+                        alt.Tooltip(
+                            total_col + ":Q",
+                            title="Revenue",
+                            format=",.0f",
+                        ),
+                    ],
+                )
+            )
+            st.altair_chart(stacked.interactive(), use_container_width=True)
 
     st.markdown("---")
 
-    # ---------- Add a new deal ----------
+        # ---------- Add a new deal ----------
     st.subheader("➕ Add a new deal")
     with st.form(key="new_deal_form"):
         col1, col2 = st.columns(2)
@@ -1268,22 +1989,40 @@ def page_sales_deals():
                 "Stage",
                 ["idea", "proposal", "demo", "contract", "closed_won", "closed_lost"],
             )
-            method = st.selectbox(
-                "Revenue type",
-                [
-                    "SaaS subscription",
-                    "Milestone project",
-                    "Percentage-of-completion",
-                    "Straight-line service",
-                    "Usage-based",
-                    "Point-in-time goods",
-                ],
-            )
 
+        st.markdown(
+            f"**Revenue type for this business:** {current_method_display}  \n"
+            "To change this, update the revenue recognition method at the top of this page."
+        )
+        method = current_method_display
+
+        # Start month (we don’t ask for end month here)
         start_month_input = st.date_input(
             "Start / expected close month",
             value=selected_month_start,
         )
+
+        # 🔹 Contract length in months (used when there is no end_date)
+        contract_months = None
+        if selected_method_code == "saas":
+            contract_months = st.number_input(
+                "Contract length (months)",
+                min_value=1,
+                max_value=60,
+                value=int(get_client_settings(selected_client_id).get("saas_default_months", 12) or 12),
+                step=1,
+                help="How many months to spread the subscription over.",
+            )
+        elif selected_method_code in ["straight_line", "poc"]:
+            contract_months = st.number_input(
+                "Project duration (months)",
+                min_value=1,
+                max_value=60,
+                value=int(get_client_settings(selected_client_id).get("project_default_months", 6) or 6),
+                step=1,
+                help="How many months to spread the project revenue over if no end date is set.",
+            )
+        # For milestone / point_in_time / usage we don’t need a contract length here.
 
         commentary = st.text_area("Notes (optional)")
 
@@ -1296,11 +2035,12 @@ def page_sales_deals():
                 customer_name=customer_name,
                 value_total=value_total,
                 probability_pct=probability_pct,
-                method=method,
+                method=method,  # fixed per client
                 stage=stage,
                 start_month=start_month_input,
-                end_month=None,
+                end_month=None,  # no end date from the form
                 commentary=commentary,
+                contract_months=contract_months,
             )
             if ok:
                 st.success("Deal added to pipeline.")
@@ -1310,51 +2050,76 @@ def page_sales_deals():
                     "Could not create deal. Please check inputs or try again later."
                 )
 
+
+
     comments_block("sales_deals")
     tasks_block("sales_deals")
 
-
 def create_pipeline_deal(
     client_id,
-    deal_name: str,
-    customer_name: str,
-    value_total: float,
-    probability_pct: float,
-    method: str,
-    stage: str,
-    start_month: date,
-    end_month: date | None = None,
-    commentary: str | None = None,
+    deal_name,
+    customer_name,
+    value_total,
+    probability_pct,
+    method,
+    stage,
+    start_month,
+    end_month,
+    commentary,
+    contract_months=None,
 ):
     """
-    Insert a new deal into revenue_pipeline.
-    """
-    if client_id is None or not deal_name.strip():
-        return False
+    Create a new pipeline deal for this client.
 
-    data = {
+    - start_month / end_month can be date, datetime or string
+    - contract_months (int) is optional, used for SaaS / straight-line / POC spreading
+    """
+
+    # Normalise dates to ISO strings if needed
+    def _to_iso(d):
+        if d is None:
+            return None
+        if hasattr(d, "isoformat"):
+            return d.isoformat()
+        return str(d)
+
+    payload = {
         "client_id": str(client_id),
-        "deal_name": deal_name.strip(),
-        "customer_name": customer_name.strip() if customer_name else None,
-        "value_total": float(value_total) if value_total is not None else None,
-        "currency": "AUD",
-        "probability_pct": float(probability_pct) if probability_pct is not None else None,
-        "method": method or "SaaS",  # default for now
-        "stage": stage or "proposal",
-        "start_month": start_month.isoformat() if start_month else None,
-        "end_month": end_month.isoformat() if end_month else None,
+        "deal_name": deal_name,
+        "customer_name": customer_name,
+        "value_total": float(value_total) if value_total is not None else 0.0,
+        "probability_pct": float(probability_pct) if probability_pct is not None else 0.0,
+        "method": method,
+        "stage": stage,
+        "start_month": _to_iso(start_month),
+        "end_month": _to_iso(end_month),
         "commentary": commentary,
-        "is_won": stage == "closed_won",
-        "is_lost": stage == "closed_lost",
     }
 
+    # 🔹 Optional contract length in months
+    if contract_months is not None:
+        try:
+            payload["contract_months"] = int(contract_months)
+        except Exception:
+            # if user typed something weird, just skip it
+            pass
+
     try:
-        supabase.table("revenue_pipeline").insert(data).execute()
-        # 🔄 Clear cached pipeline & revenue schedule
-        st.cache_data.clear()
+        # 🔴 IMPORTANT: correct table name
+        supabase.table("revenue_pipeline").insert(payload).execute()
+
+        # Clear cache so revenue schedule etc picks up the new deal
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
         return True
-    except Exception:
+    except Exception as e:
+        print("Error creating deal:", e)
         return False
+
+
 
 
 def update_pipeline_deal_status(
@@ -1905,6 +2670,211 @@ def fetch_overdue_ar_for_client(client_id, as_of: date | None = None):
 
     return df
 
+@st.cache_data(ttl=60)
+def build_12m_pnl_and_cash_view(
+    client_id,
+    base_month: date,
+    n_months: int = 12,
+) -> pd.DataFrame:
+    """
+    12-month view combining:
+      - recognised revenue (from revenue engine)
+      - payroll cost (from payroll_positions)
+      - vendor cost (from AP)
+      - cash in (AR receipts)
+      - cash out (AP + payroll)
+      - operating CF + closing cash
+
+    Returns one row per month with:
+      month_date, revenue_pnl, payroll_pnl, vendor_pnl,
+      total_cost_pnl, net_burn_pnl,
+      cash_in_ar, cash_out_ap, cash_out_payroll,
+      operating_cf, closing_cash, cash_danger_flag
+    """
+
+    if client_id is None or base_month is None:
+        return pd.DataFrame()
+
+    # Month index (month starts)
+    month_index = pd.date_range(
+        start=pd.to_datetime(base_month),
+        periods=n_months,
+        freq="MS",
+    )
+    month_set = set(month_index)
+
+    # ------------------------------
+    # 1) Recognised revenue by month
+    # ------------------------------
+    rev_df = build_revenue_schedule_for_client(
+        client_id,
+        base_month=base_month,
+        n_months=n_months,
+    )
+
+    if rev_df is None or rev_df.empty:
+        rev_series = pd.Series(0.0, index=month_index)
+    else:
+        tmp = rev_df.copy()
+        tmp["month_date"] = pd.to_datetime(tmp["month_date"], errors="coerce")
+        tmp = tmp[tmp["month_date"].notna()]
+
+        # pick revenue column
+        value_col = None
+        for cand in ["revenue_amount", "recognised_revenue", "amount"]:
+            if cand in tmp.columns:
+                value_col = cand
+                break
+
+        if value_col is None:
+            rev_series = pd.Series(0.0, index=month_index)
+        else:
+            g = (
+                tmp.groupby("month_date", as_index=True)[value_col]
+                .sum()
+            )
+            # reindex so we have all months
+            rev_series = g.reindex(month_index).fillna(0.0)
+
+    # ------------------------------
+    # 2) AR / AP by month (cash view)
+    # ------------------------------
+    df_ar, df_ap = fetch_ar_ap_for_client(client_id)
+
+    # ---- AR ----
+    if not df_ar.empty:
+        df_ar = df_ar.copy()
+        df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
+
+        if "expected_date" in df_ar.columns:
+            df_ar["expected_date"] = pd.to_datetime(df_ar["expected_date"], errors="coerce")
+        else:
+            if "due_date" in df_ar.columns:
+                df_ar["expected_date"] = pd.to_datetime(df_ar["due_date"], errors="coerce")
+            else:
+                df_ar["expected_date"] = pd.NaT
+
+        df_ar["bucket_month"] = (
+            df_ar["expected_date"]
+            .dt.to_period("M")
+            .dt.to_timestamp()
+        )
+
+        ar_monthly = (
+            df_ar.groupby("bucket_month", as_index=True)["amount"]
+            .sum()
+        )
+        ar_series = ar_monthly.reindex(month_index).fillna(0.0)
+    else:
+        ar_series = pd.Series(0.0, index=month_index)
+
+    # ---- AP ----
+    if not df_ap.empty:
+        df_ap = df_ap.copy()
+        df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
+
+        pay_col = "expected_payment_date"
+        if pay_col not in df_ap.columns:
+            pay_col = "due_date" if "due_date" in df_ap.columns else None
+
+        if pay_col is not None:
+            df_ap[pay_col] = pd.to_datetime(df_ap[pay_col], errors="coerce")
+            df_ap["bucket_month"] = (
+                df_ap[pay_col]
+                .dt.to_period("M")
+                .dt.to_timestamp()
+            )
+        else:
+            df_ap["bucket_month"] = pd.NaT
+
+        ap_monthly = (
+            df_ap.groupby("bucket_month", as_index=True)["amount"]
+            .sum()
+        )
+        ap_series = ap_monthly.reindex(month_index).fillna(0.0)
+    else:
+        ap_series = pd.Series(0.0, index=month_index)
+
+    # For P&L view, treat vendor_pnl = AP amount in that month
+    vendor_pnl_series = ap_series.copy()
+
+    # ------------------------------
+    # 3) Payroll by month
+    # ------------------------------
+    payroll_by_month = compute_payroll_by_month(client_id, month_index)
+    payroll_series = pd.Series(
+        [float(payroll_by_month.get(m, 0.0)) for m in month_index],
+        index=month_index,
+    )
+
+    # ------------------------------
+    # 4) Opening cash and monthly loop
+    # ------------------------------
+    # Opening cash from KPI for base month
+    opening_cash = None
+    kpi_row = fetch_kpis_for_client_month(client_id, base_month)
+    if kpi_row and "cash_balance" in kpi_row:
+        try:
+            opening_cash = float(kpi_row["cash_balance"])
+        except Exception:
+            opening_cash = None
+
+    if opening_cash is None:
+        opening_cash = 120_000.0  # sensible fallback
+
+    current_cash = opening_cash
+    rows = []
+
+    for m in month_index:
+        revenue_pnl = float(rev_series.get(m, 0.0))
+        payroll_pnl = float(payroll_series.get(m, 0.0))
+        vendor_pnl = float(vendor_pnl_series.get(m, 0.0))
+        total_cost_pnl = payroll_pnl + vendor_pnl
+        net_burn_pnl = total_cost_pnl - revenue_pnl  # +ve = burning cash
+
+        cash_in_ar = float(ar_series.get(m, 0.0))
+        cash_out_ap = float(ap_series.get(m, 0.0))
+        cash_out_payroll = payroll_pnl  # assume paid in same month for now
+
+        operating_cf = cash_in_ar - cash_out_ap - cash_out_payroll
+        investing_cf = 0.0
+        financing_cf = 0.0
+
+        closing_cash = current_cash + operating_cf + investing_cf + financing_cf
+        danger = closing_cash <= 0
+
+        rows.append(
+            {
+                "client_id": str(client_id),
+                "month_date": m,
+                "revenue_pnl": round(revenue_pnl, 2),
+                "payroll_pnl": round(payroll_pnl, 2),
+                "vendor_pnl": round(vendor_pnl, 2),
+                "total_cost_pnl": round(total_cost_pnl, 2),
+                "net_burn_pnl": round(net_burn_pnl, 2),
+                "cash_in_ar": round(cash_in_ar, 2),
+                "cash_out_ap": round(cash_out_ap, 2),
+                "cash_out_payroll": round(cash_out_payroll, 2),
+                "operating_cf": round(operating_cf, 2),
+                "investing_cf": round(investing_cf, 2),
+                "financing_cf": round(financing_cf, 2),
+                "closing_cash": round(closing_cash, 2),
+                "cash_danger_flag": danger,
+            }
+        )
+
+        current_cash = closing_cash
+
+    out_df = pd.DataFrame(rows)
+    out_df["month_date"] = pd.to_datetime(out_df["month_date"], errors="coerce")
+    out_df = out_df[out_df["month_date"].notna()]
+    out_df = out_df.sort_values("month_date")
+    out_df["month_label"] = out_df["month_date"].dt.strftime("%b %Y")
+
+    return out_df
+
+
+
 def recompute_cashflow_from_ar_ap(
     client_id,
     base_month: date,
@@ -1926,6 +2896,12 @@ def recompute_cashflow_from_ar_ap(
     if client_id is None or base_month is None:
         return False
 
+    # 🔁 Clear cached data up-front so payroll / AR / AP are always fresh
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
     # 1) Month index (month starts)
     month_index = pd.date_range(
         start=pd.to_datetime(base_month),
@@ -1937,9 +2913,9 @@ def recompute_cashflow_from_ar_ap(
     df_ar, df_ap = fetch_ar_ap_for_client(client_id)
 
     # --- AR: expected receipts by month ---
-    if not df_ar.empty:
+    if df_ar is not None and not df_ar.empty:
         df_ar = df_ar.copy()
-        df_ar["amount"] = pd.to_numeric(df_ar["amount"], errors="coerce").fillna(0.0)
+        df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
 
         # Ensure expected_date exists + is datetime
         if "expected_date" in df_ar.columns:
@@ -1956,9 +2932,9 @@ def recompute_cashflow_from_ar_ap(
         df_ar = pd.DataFrame()
 
     # --- AP: expected payments by month ---
-    if not df_ap.empty:
+    if df_ap is not None and not df_ap.empty:
         df_ap = df_ap.copy()
-        df_ap["amount"] = pd.to_numeric(df_ap["amount"], errors="coerce").fillna(0.0)
+        df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
 
         pay_col = "expected_payment_date"
         if pay_col not in df_ap.columns:
@@ -1972,13 +2948,16 @@ def recompute_cashflow_from_ar_ap(
     else:
         df_ap = pd.DataFrame()
 
-    # 3) Payroll by month (cash out)
+    # 3) Payroll by month (cash out) – MUST NOT be cached with stale data
     payroll_by_month = compute_payroll_by_month(client_id, month_index)
 
     # 4) Opening cash
     opening_cash = None
     if opening_cash_hint is not None:
-        opening_cash = float(opening_cash_hint)
+        try:
+            opening_cash = float(opening_cash_hint)
+        except Exception:
+            opening_cash = None
     else:
         kpi_row = fetch_kpis_for_client_month(client_id, base_month)
         if kpi_row and "cash_balance" in kpi_row:
@@ -1991,7 +2970,7 @@ def recompute_cashflow_from_ar_ap(
         opening_cash = 120_000.0  # fallback
 
     current_cash = opening_cash
-    results = []
+    results: list[dict] = []
 
     # 5) Month-by-month cashflow rows
     for m in month_index:
@@ -2007,11 +2986,13 @@ def recompute_cashflow_from_ar_ap(
         else:
             cash_out_bills = 0.0
 
-        # --- Payroll cash out ---
+            # --- Payroll cash out ---
         payroll_cash = float(payroll_by_month.get(m, 0.0))
 
         # Operating CF = money in - bills - payroll
         operating_cf = cash_in - cash_out_bills - payroll_cash
+
+
 
         # Investing & Financing (placeholder)
         investing_cf = 0.0
@@ -2026,41 +3007,47 @@ def recompute_cashflow_from_ar_ap(
         # Danger flag
         danger = closing_cash <= 0
 
-        # Add row
         results.append(
             {
                 "client_id": str(client_id),
-                "month_date": m.date().isoformat(),  # keep as ISO string for JSON
+                "month_date": m.date().isoformat(),  # ISO string = safe JSON
                 "operating_cf": round(operating_cf, 2),
                 "investing_cf": round(investing_cf, 2),
                 "financing_cf": round(financing_cf, 2),
                 "free_cash_flow": round(free_cf, 2),
                 "closing_cash": round(closing_cash, 2),
                 "cash_danger_flag": danger,
-                # no updated_at here – table only has created_at
+                # no updated_at here – table only has created_at in your schema
             }
         )
 
-
         current_cash = closing_cash  # next month opening = this month closing
 
-        # 6) Replace rows in Supabase for this client
+    # If somehow no rows, bail gracefully
+    if not results:
+        print("recompute_cashflow_from_ar_ap: no rows to write")
+        return False
+
+    # 6) Replace rows in Supabase for this client
     try:
         supabase.table("cashflow_summary").delete().eq("client_id", str(client_id)).execute()
-    except Exception:
-        # If delete fails, we still try to insert new rows – but better to not crash the UI
-        pass
+    except Exception as e:
+        print("Error deleting old cashflow rows:", e)
 
     try:
         supabase.table("cashflow_summary").insert(results).execute()
 
-        # 🔁 IMPORTANT: clear Streamlit data cache so fresh cashflow is picked up
-        st.cache_data.clear()
+        # Clear caches *again* so the next page render uses fresh data
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
 
         return True
     except Exception as e:
         print("Error writing cashflow:", e)
         return False
+
 
 
 def fetch_cash_curve_for_client(client_id, base_month: date | None, n_months: int = 12) -> pd.DataFrame:
@@ -2287,7 +3274,7 @@ def update_task_status(task_id, status: str = "done"):
 @st.cache_data(ttl=60)
 def get_client_settings(client_id):
     """
-    Fetch AR/AP default days, alert thresholds, and revenue settings for this client.
+    Fetch AR/AP default days and alert thresholds for this client.
     Falls back to sensible defaults if no row exists yet.
     """
     defaults = {
@@ -2296,9 +3283,8 @@ def get_client_settings(client_id):
         "runway_min_months": 4.0,
         "overspend_warn_pct": 10.0,
         "overspend_high_pct": 20.0,
-        # NEW:
-        "revenue_recognition_method": "Straight-line service",
-        "min_revenue_prob_pct": 20.0,
+        # NEW: default revenue recognition method
+        "revenue_recognition_method": "saas",  # 'saas', 'milestone', 'straight_line', etc.
     }
     if client_id is None:
         return defaults
@@ -2319,13 +3305,10 @@ def get_client_settings(client_id):
             "runway_min_months": float(data.get("runway_min_months", defaults["runway_min_months"])),
             "overspend_warn_pct": float(data.get("overspend_warn_pct", defaults["overspend_warn_pct"])),
             "overspend_high_pct": float(data.get("overspend_high_pct", defaults["overspend_high_pct"])),
-            # NEW:
+            # NEW
             "revenue_recognition_method": data.get(
                 "revenue_recognition_method",
                 defaults["revenue_recognition_method"],
-            ),
-            "min_revenue_prob_pct": float(
-                data.get("min_revenue_prob_pct", defaults["min_revenue_prob_pct"])
             ),
         }
     except Exception:
@@ -2361,6 +3344,43 @@ def save_alert_thresholds(client_id, runway_min_months: float,
     except Exception:
         return False
 
+def save_revenue_method(client_id, method: str):
+    """
+    Save the default revenue recognition method for this client.
+    Method is one of: 'saas', 'milestone', 'poc', 'straight_line', 'usage', 'point_in_time'.
+    """
+    if client_id is None:
+        return False
+
+    valid_methods = {
+        "saas",
+        "milestone",
+        "poc",
+        "straight_line",
+        "usage",
+        "point_in_time",
+    }
+    if method not in valid_methods:
+        method = "saas"
+
+    try:
+        current = get_client_settings(client_id)
+        payload = {
+            "client_id": str(client_id),
+            "ar_default_days": int(current["ar_default_days"]),
+            "ap_default_days": int(current["ap_default_days"]),
+            "runway_min_months": float(current["runway_min_months"]),
+            "overspend_warn_pct": float(current["overspend_warn_pct"]),
+            "overspend_high_pct": float(current["overspend_high_pct"]),
+            # NEW
+            "revenue_recognition_method": method,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
+        st.cache_data.clear()
+        return True
+    except Exception:
+        return False
 
 
 def save_client_settings(client_id, ar_days: int, ap_days: int):
@@ -2945,7 +3965,7 @@ def top_header(title: str):
 def page_business_overview():
     top_header("Business at a Glance")
 
-    # Pull KPIs from Supabase
+    # Pull KPIs (still used as fallback + for other logic)
     kpis = fetch_kpis_for_client_month(selected_client_id, selected_month_start)
 
     # Auto-generate / clean up runway alerts for this month (now reads client settings)
@@ -2954,28 +3974,97 @@ def page_business_overview():
     # Auto-generate / clean up cash danger alert based on cashflow_summary
     ensure_cash_danger_alert_for_month(selected_client_id, selected_month_start)
 
-    money_in = "—"
-    money_out = "—"
-    cash_in_bank = "—"
-    runway_months = "—"
+    # -------------------------------------------------
+    # 12-month P&L + cash view (CORE founder metrics)
+    # -------------------------------------------------
+    pnl_df = build_12m_pnl_and_cash_view(
+        selected_client_id,
+        base_month=selected_month_start,
+        n_months=12,
+    )
 
-    if kpis:
-        # Adapt these keys to match your kpi_monthly columns
-        money_in = kpis.get("revenue", "—")
-        money_out = kpis.get("burn", "—")
-        cash_in_bank = kpis.get("cash_balance", "—")
-        runway_months = kpis.get("runway_months", "—")
+    # Defaults for display
+    cash_on_hand_label = "—"
+    net_burn_label = "—"
+    runway_label = "—"
+    revenue_label = "—"
 
-    # ---------- Top KPI row ----------
+    if pnl_df is not None and not pnl_df.empty:
+        pnl_df = pnl_df.copy()
+        pnl_df["month_date"] = pd.to_datetime(pnl_df["month_date"], errors="coerce")
+        pnl_df = pnl_df[pnl_df["month_date"].notna()].sort_values("month_date")
+
+        # Focus bucket = selected month (1st of that month)
+        focus_bucket = (
+            pd.to_datetime(selected_month_start)
+            .to_period("M")
+            .to_timestamp()
+        )
+
+        focus_row = pnl_df[pnl_df["month_date"] == focus_bucket]
+        if focus_row.empty:
+            # fallback to first row if focus month not in window
+            focus_row = pnl_df.iloc[[0]]
+
+        focus = focus_row.iloc[0]
+
+        cash_on_hand = float(focus.get("closing_cash", 0.0))
+        net_burn_pnl = float(focus.get("net_burn_pnl", 0.0))
+        focus_revenue = float(focus.get("revenue_pnl", 0.0))
+
+        # Average monthly cash burn from operating CF (only negative months)
+        op_cf = pnl_df["operating_cf"].astype(float)
+        burn_months = op_cf[op_cf < 0]
+        avg_cash_burn = float(burn_months.mean()) if not burn_months.empty else 0.0
+
+        if avg_cash_burn < 0:
+            runway_months = cash_on_hand / abs(avg_cash_burn)
+        else:
+            runway_months = None
+
+        cash_on_hand_label = f"${cash_on_hand:,.0f}"
+        net_burn_label = f"${net_burn_pnl:,.0f}"
+        revenue_label = f"${focus_revenue:,.0f}"
+        runway_label = "N/A" if runway_months is None else f"{runway_months:,.1f}"
+
+    else:
+        # Fallback to KPI table values if 12m engine view isn't available yet
+        if kpis:
+            try:
+                rev = float(kpis.get("revenue", 0) or 0)
+                burn = float(kpis.get("burn", 0) or 0)
+                cash_bal = float(kpis.get("cash_balance", 0) or 0)
+                rw = kpis.get("runway_months", None)
+
+                cash_on_hand_label = f"${cash_bal:,.0f}"
+                net_burn_label = f"${burn:,.0f}"
+                revenue_label = f"${rev:,.0f}"
+                runway_label = "N/A" if rw is None else str(rw)
+            except Exception:
+                pass
+
+    # ---------- Top KPI row (founder control tower) ----------
     kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
     with kpi_col1:
-        st.metric("💰 Money in", money_in, help="Total cash in for the month")
+        st.metric(
+            "💰 Cash on hand",
+            cash_on_hand_label,
+            help="Projected cash at end of this month"
+        )
     with kpi_col2:
-        st.metric("💸 Money out", money_out, help="Total cash out for the month")
+        st.metric(
+            "🔥 Net burn (P&L)",
+            net_burn_label,
+            help="Monthly costs minus revenue (P&L view)"
+        )
     with kpi_col3:
-        st.metric("🏦 Cash in bank", cash_in_bank)
+        st.metric("🛟 Runway (months)", runway_label)
     with kpi_col4:
-        st.metric("🧯 Runway (months)", runway_months)
+        st.metric(
+            "📈 Monthly revenue",
+            revenue_label,
+            help="Recognised revenue for this month"
+        )
 
     # ---------- Key alerts ----------
     st.markdown("---")
@@ -3089,10 +4178,7 @@ def page_business_overview():
             )
             charts.append(danger_point)
 
-        # ⬇️ render the combined chart
         st.altair_chart(alt.layer(*charts).interactive(), use_container_width=True)
-
-    
 
     # ------------------------------------------------------------------
     # Payroll vs bills vs Net operating cash (6-month view)
@@ -3100,26 +4186,19 @@ def page_business_overview():
     st.markdown("---")
     st.subheader("💼 Payroll vs bills vs Net operating cash")
 
-    # 6-month window starting from the focus month
     window_months = pd.date_range(
         start=pd.to_datetime(selected_month_start),
         periods=6,
         freq="MS",
     )
 
-    # Full engine output
     engine_df_all = fetch_cashflow_summary_for_client(selected_client_id)
-
-    # AR/AP (for AP cash-out)
     df_ar, df_ap = fetch_ar_ap_for_client(selected_client_id)
-
-    # Payroll per month (cash out)
     payroll_by_month = compute_payroll_by_month(selected_client_id, window_months)
 
     if engine_df_all.empty:
         st.caption("No cashflow engine data yet – rebuild cashflow first.")
     else:
-        # Normalise and filter engine data to window
         engine_df_all = engine_df_all.copy()
         engine_df_all["month_date"] = pd.to_datetime(
             engine_df_all["month_date"], errors="coerce"
@@ -3129,7 +4208,7 @@ def page_business_overview():
             engine_df_all["month_date"].isin(window_months)
         ][["month_date", "operating_cf"]].copy()
 
-             # ---------- AP: monthly cash-out ----------
+        # ---------- AP: monthly cash-out ----------
         ap_monthly = pd.DataFrame({"month_date": window_months})
 
         if not df_ap.empty:
@@ -3152,7 +4231,6 @@ def page_business_overview():
 
                 ap_monthly = ap_monthly.merge(ap_agg, on="month_date", how="left")
 
-        # Ensure the column always exists
         if "ap_cash_out" not in ap_monthly.columns:
             ap_monthly["ap_cash_out"] = 0.0
 
@@ -3178,7 +4256,6 @@ def page_business_overview():
         merged["month_date"] = pd.to_datetime(merged["month_date"], errors="coerce")
         merged = merged.sort_values("month_date")
 
-        # Long format for Altair
         plot_df = merged.melt(
             id_vars="month_date",
             value_vars=["operating_cf", "payroll_cash", "ap_cash_out"],
@@ -3186,7 +4263,6 @@ def page_business_overview():
             value_name="Amount",
         )
 
-        # Friendly labels
         series_labels = {
             "operating_cf": "Net operating CF",
             "payroll_cash": "Payroll (cash out)",
@@ -3219,13 +4295,13 @@ def page_business_overview():
             "compared to net operating cashflow."
         )
 
-
-
     # ---------- Cashflow engine breakdown table ----------
     st.markdown("---")
     st.subheader("🔍 Cashflow engine – 12-month breakdown")
 
     engine_df = fetch_cashflow_summary_for_client(selected_client_id)
+    print("DEBUG loaded engine rows:", len(engine_df))
+    print(engine_df.head())
 
     if engine_df is None or engine_df.empty:
         st.caption(
@@ -3285,69 +4361,293 @@ def page_business_overview():
 
 
 
-
 # ---------- Page: Team & Spending ----------
 
 def page_team_spending():
     top_header("Team & Spending")
 
-    # Auto-generate / clean up dept overspend alerts for this month
+    # Dept overspend alerts
     ensure_dept_overspend_alert(selected_client_id, selected_month_start)
-  # Load data with a spinner
+# Load data with a spinner
     with st.spinner("Loading team and department data..."):
         df_hiring = fetch_hiring_monthly_for_client(selected_client_id)
         df_dept = fetch_dept_monthly_for_client(selected_client_id)
 
-    # ---------- Team & payroll ----------
-    st.subheader("👥 Team & payroll")
+        # ---------- Payroll summary for selected month ----------
+    st.subheader("👥 Payroll snapshot for this month")
 
-    if df_hiring.empty:
-        st.info("No hiring / headcount data yet for this business.")
+    # Build a one-month index for the selected month
+    month_index = pd.date_range(
+        start=pd.to_datetime(selected_month_start),
+        periods=1,
+        freq="MS",
+    )
+    payroll_by_month = compute_payroll_by_month(selected_client_id, month_index)
+    month_ts = month_index[0]
+    month_payroll = float(payroll_by_month.get(month_ts, 0.0))
+
+    # Approximate "other operating cash out" from AP (bills) for the same month
+    df_ar_ap = fetch_ar_ap_for_client(selected_client_id)
+    if isinstance(df_ar_ap, tuple):
+        df_ar, df_ap = df_ar_ap
     else:
-        # Build headcount + payroll by month (all departments)
-        hiring_agg = (
-            df_hiring
-            .groupby("month_date", as_index=False)
-            .agg(
-                {
-                    # fall back safely if some columns are missing
-                    "cumulative_roles": "max" if "cumulative_roles" in df_hiring.columns else "sum",
-                    "cumulative_payroll": "max" if "cumulative_payroll" in df_hiring.columns else "sum",
-                }
+        df_ar, df_ap = None, None
+
+    month_ap = 0.0
+    if df_ap is not None and not df_ap.empty:
+        df_ap = df_ap.copy()
+        df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
+
+        pay_col = "expected_payment_date"
+        if pay_col not in df_ap.columns:
+            pay_col = "due_date" if "due_date" in df_ap.columns else None
+
+        if pay_col is not None:
+            df_ap[pay_col] = pd.to_datetime(df_ap[pay_col], errors="coerce")
+            df_ap["bucket_month"] = df_ap[pay_col].dt.to_period("M").dt.to_timestamp()
+
+            month_ap = float(
+                df_ap.loc[df_ap["bucket_month"] == month_ts, "amount"].sum()
             )
+
+    total_cash_out = month_payroll + month_ap
+    payroll_share = (month_payroll / total_cash_out * 100.0) if total_cash_out else 0.0
+
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        st.metric(
+            "Payroll cash this month",
+            f"${month_payroll:,.0f}",
+            help="Total payroll cash out for this month from the payroll engine.",
         )
-
-        # Clean column names
-        if "cumulative_roles" in hiring_agg.columns:
-            hiring_agg = hiring_agg.rename(columns={"cumulative_roles": "Headcount"})
-        else:
-            hiring_agg["Headcount"] = 0
-
-        if "cumulative_payroll" in hiring_agg.columns:
-            hiring_agg = hiring_agg.rename(columns={"cumulative_payroll": "Payroll"})
-        else:
-            hiring_agg["Payroll"] = 0
-
-        hiring_agg = hiring_agg.sort_values("month_date")
-        hiring_agg["Month"] = hiring_agg["month_date"].dt.strftime("%b %Y")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("Total headcount over time")
-            st.bar_chart(hiring_agg.set_index("Month")[["Headcount"]])
-        with col2:
-            st.caption("Total payroll over time")
-            st.line_chart(hiring_agg.set_index("Month")[["Payroll"]])
+    with col_p2:
+        st.metric(
+            "Bills (AP) this month",
+            f"${month_ap:,.0f}",
+            help="Supplier bills expected to be paid this month.",
+        )
+    with col_p3:
+        st.metric(
+            "Payroll as % of total cash out",
+            f"{payroll_share:.0f}%",
+            help="Payroll divided by (payroll + supplier bills) for this month.",
+        )
 
     st.markdown("---")
 
-    # ---------- Department spend vs plan ----------
+    # --------------------------------------------------
+    # 1) Team & payroll – roles that drive the engine
+    # --------------------------------------------------
+    st.subheader("👥 Team & payroll (drives cashflow engine)")
+
+    df_positions = fetch_payroll_positions_for_client(selected_client_id)
+
+    if df_positions.empty:
+        st.info("No roles added yet. Add your team below to drive payroll in the cashflow engine.")
+    else:
+        view = df_positions.copy()
+        rename_map = {
+            "role_name": "Role",
+            "employee_name": "Employee",
+            "fte": "FTE",
+            "base_salary_annual": "Base salary (annual)",
+            "super_rate_pct": "Super (%)",
+            "payroll_tax_pct": "Payroll tax (%)",
+            "start_date": "Start date",
+            "end_date": "End date",
+            "notes": "Notes",
+        }
+        cols = [c for c in rename_map.keys() if c in view.columns]
+        view = view[cols].rename(columns=rename_map)
+
+        st.dataframe(view, use_container_width=True)
+        st.caption(
+            "These roles feed your payroll cash-out in the core cashflow engine "
+            "and the 'Payroll vs bills vs Net operating cash' chart."
+        )
+
+    # Small payroll forecast (next 6 months) using the same engine function
+    st.markdown("")
+    st.caption("Payroll cash-out (next 6 months)")
+
+    month_index = pd.date_range(
+        start=pd.to_datetime(selected_month_start),
+        periods=6,
+        freq="MS",
+    )
+    payroll_by_month = compute_payroll_by_month(selected_client_id, month_index)
+
+    if payroll_by_month:
+        pay_df = pd.DataFrame(
+            {
+                "month_date": month_index,
+                "Payroll_cash": [float(payroll_by_month.get(m, 0.0)) for m in month_index],
+            }
+        )
+        pay_df["Month"] = pay_df["month_date"].dt.strftime("%b %Y")
+        st.line_chart(pay_df.set_index("Month")[["Payroll_cash"]])
+    else:
+        st.caption("No payroll yet – add roles below to see the forecast.")
+
+    st.markdown("---")
+
+    # --------------------------------------------------
+    # 2) Add / edit a role
+    # --------------------------------------------------
+    st.subheader("➕ Add or update a role")
+
+    # Build options for edit mode
+    existing_options = []
+    id_map = {}
+    if not df_positions.empty:
+        for _, r in df_positions.iterrows():
+            label = f"{r.get('role_name', 'Role')} – {r.get('employee_name', 'Unassigned')}"
+            existing_options.append(label)
+            id_map[label] = r.get("id")
+
+    edit_mode = st.radio(
+        "What do you want to do?",
+        options=["Add new role", "Edit existing role"],
+        horizontal=True,
+    )
+
+    position_id = None
+    existing_row = None
+    if edit_mode == "Edit existing role" and existing_options:
+        chosen = st.selectbox("Pick a role to edit", ["-- Select --"] + existing_options)
+        if chosen != "-- Select --":
+            position_id = id_map.get(chosen)
+            if position_id:
+                existing_row = df_positions[df_positions["id"] == position_id].iloc[0]
+    elif edit_mode == "Edit existing role" and not existing_options:
+        st.caption("No roles yet – switch to 'Add new role' to create one.")
+
+    def _get(field, default=None):
+        if existing_row is not None:
+            return existing_row.get(field, default)
+        return default
+
+    with st.form(key="payroll_role_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            role_name = st.text_input("Role title", value=_get("role_name", "Finance Manager"))
+            employee_name = st.text_input("Employee name (optional)", value=_get("employee_name", ""))
+            fte = st.number_input(
+                "FTE",
+                min_value=0.1,
+                max_value=2.0,
+                step=0.1,
+                value=float(_get("fte", 1.0) or 1.0),
+            )
+            base_salary_annual = st.number_input(
+                "Base salary (annual, AUD)",
+                min_value=0.0,
+                step=5000.0,
+                value=float(_get("base_salary_annual", 120000.0) or 0.0),
+            )
+        with c2:
+            super_rate_pct = st.number_input(
+                "Super rate (%)",
+                min_value=0.0,
+                max_value=30.0,
+                step=0.5,
+                value=float(_get("super_rate_pct", 11.0) or 0.0),
+            )
+            payroll_tax_pct = st.number_input(
+                "Payroll tax & on-costs (%)",
+                min_value=0.0,
+                max_value=30.0,
+                step=0.5,
+                value=float(_get("payroll_tax_pct", 3.0) or 0.0),
+            )
+
+            start_default = _get("start_date", selected_month_start) or selected_month_start
+            start_date = st.date_input(
+                "Start date",
+                value=start_default,
+            )
+
+            existing_end = _get("end_date", None)
+            has_end_default = existing_end is not None
+            has_end = st.checkbox(
+                "This role has an end date",
+                value=has_end_default,
+            )
+            if has_end:
+                end_default = existing_end or start_default
+                end_date = st.date_input(
+                    "End date",
+                    value=end_default,
+                )
+            else:
+                end_date = None
+
+        notes = st.text_area("Notes (optional)", value=_get("notes", ""))
+
+        submitted = st.form_submit_button("Save role")
+
+        if submitted:
+            ok = upsert_payroll_position(
+                selected_client_id,
+                position_id=position_id if (edit_mode == "Edit existing role" and position_id) else None,
+                role_name=role_name,
+                employee_name=employee_name,
+                fte=fte,
+                base_salary_annual=base_salary_annual,
+                super_rate_pct=super_rate_pct,
+                payroll_tax_pct=payroll_tax_pct,
+                start_date=start_date,
+                end_date=end_date,
+                notes=notes,
+            )
+            if ok:
+                st.success("Role saved. Payroll engine will use this on the next cashflow rebuild.")
+                st.rerun()
+            else:
+                st.error("Could not save role. Please try again.")
+
+    # --------------------------------------------------
+    # 3) Delete a role
+    # --------------------------------------------------
+    if not df_positions.empty:
+        st.markdown("---")
+        st.subheader("🗑️ Delete a role")
+
+        del_options = []
+        del_map = {}
+        for _, r in df_positions.iterrows():
+            label = f"{r.get('role_name', 'Role')} – {r.get('employee_name', 'Unassigned')}"
+            del_options.append(label)
+            del_map[label] = r.get("id")
+
+        chosen_del = st.selectbox(
+            "Pick a role to delete",
+            ["-- Select --"] + del_options,
+            key="payroll_delete_select",
+        )
+
+        if chosen_del != "-- Select --":
+            if st.button("Delete selected role", key="payroll_delete_btn"):
+                ok = delete_payroll_position(del_map[chosen_del])
+                if ok:
+                    st.success("Role deleted.")
+                    st.rerun()
+                else:
+                    st.error("Could not delete that role.")
+
+    st.markdown("---")
+
+    # --------------------------------------------------
+    # 4) Department spend vs plan (your existing logic)
+    # --------------------------------------------------
     st.subheader("🏢 Department spend vs plan")
+
+    with st.spinner("Loading department data..."):
+        df_dept = fetch_dept_monthly_for_client(selected_client_id)
 
     if df_dept.empty:
         st.info("No department budget/actuals yet for this business.")
     else:
-        # Decide which columns represent budget vs actual
         budget_col = None
         actual_col = None
 
@@ -3367,12 +4667,11 @@ def page_team_spending():
                 "Please check the table structure."
             )
         else:
-            # Aggregate latest month (or filter by selected_month_start if you want)
-            # For now, show the selected month only if present
             if "month_date" in df_dept.columns and selected_month_start is not None:
-                df_dept_month = df_dept[df_dept["month_date"] == pd.to_datetime(selected_month_start)]
+                df_dept_month = df_dept[
+                    df_dept["month_date"] == pd.to_datetime(selected_month_start)
+                ]
                 if df_dept_month.empty:
-                    # fallback: latest month available
                     latest = df_dept["month_date"].max()
                     df_dept_month = df_dept[df_dept["month_date"] == latest]
             else:
@@ -3404,13 +4703,13 @@ def page_team_spending():
 
             st.dataframe(dept_view, use_container_width=True)
 
-            # Simple bar chart for plan vs actual
-            st.caption("Plan vs actual by department (selected month)")
+            st.caption("Plan vs actual by department (selected / latest month)")
             chart_df = dept_view.set_index("Department")[["Plan", "Actual"]]
             st.bar_chart(chart_df)
 
-
-    # ---------- Internal: CSV uploads for testing ----------
+    # --------------------------------------------------
+    # 5) Internal CSV uploads (unchanged from your version)
+    # --------------------------------------------------
     with st.expander("🧪 Upload test data (internal only)", expanded=False):
         st.caption(
             "Use this to quickly upload test data for this business. "
@@ -3458,6 +4757,8 @@ def page_team_spending():
     comments_block("team_spending")
     tasks_block("team_spending")
 
+
+
 @st.cache_data(ttl=60)
 def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
     """
@@ -3470,20 +4771,24 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
           * operating_cf      = cash_in_ar - cash_out_ap - cash_out_payroll
           * investing_cf      = 0 for now
           * financing_cf      = 0 for now
-          * closing_cash      = prior closing + operating + investing + financing
+          * net_cash          = operating_cf + investing_cf + financing_cf
+          * closing_cash      = prior closing + net_cash
+          * danger_flag       = closing_cash <= 0
 
     Uses:
       - fetch_ar_ap_for_client
       - add_ar_aging / add_ap_aging
       - compute_payroll_by_month
       - fetch_kpis_for_client_month for starting cash
+      - get_client_settings for AR/AP defaults
     """
     if client_id is None or focus_month is None:
         return pd.DataFrame()
 
-    settings = get_client_settings(client_id)
-    ar_days = settings["ar_default_days"]
-    ap_days = settings["ap_default_days"]
+    # ---- Client settings with safe fallbacks ----
+    settings = get_client_settings(client_id) or {}
+    ar_days = settings.get("ar_default_days", 30)
+    ap_days = settings.get("ap_default_days", 30)
 
     # 1) Base date: first day of the focus month
     start_date = focus_month.replace(day=1)
@@ -3491,26 +4796,34 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
     # 2) AR / AP with proper expected dates
     df_ar, df_ap = fetch_ar_ap_for_client(client_id)
 
-    if not df_ar.empty:
+    # ---------- AR (cash in) ----------
+    if df_ar is not None and not df_ar.empty:
         df_ar = add_ar_aging(df_ar, as_of=start_date, ar_default_days=ar_days)
+
         # Normalise expected_date to plain date
-        df_ar["expected_date"] = pd.to_datetime(df_ar["expected_date"], errors="coerce").dt.date
+        df_ar["expected_date"] = pd.to_datetime(
+            df_ar["expected_date"], errors="coerce"
+        ).dt.date
 
         # Exclude fully paid/closed
         if "status" in df_ar.columns:
+            df_ar["status"] = df_ar["status"].astype(str)
             df_ar = df_ar[~df_ar["status"].str.lower().isin(["paid", "closed", "settled"])]
 
         df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
     else:
         df_ar = pd.DataFrame()
 
-    if not df_ap.empty:
+    # ---------- AP (cash out) ----------
+    if df_ap is not None and not df_ap.empty:
         df_ap = add_ap_aging(df_ap, as_of=start_date, ap_default_days=ap_days)
+
         df_ap["pay_expected_date"] = pd.to_datetime(
             df_ap["pay_expected_date"], errors="coerce"
         ).dt.date
 
         if "status" in df_ap.columns:
+            df_ap["status"] = df_ap["status"].astype(str)
             df_ap = df_ap[~df_ap["status"].str.lower().isin(["paid", "closed", "settled"])]
 
         df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
@@ -3518,10 +4831,9 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
         df_ap = pd.DataFrame()
 
     # 3) Payroll by month (we'll spread monthly payroll evenly across days)
-    #    Build a month index that covers the 14-week window (~4 months is enough)
     month_index = pd.date_range(
         start=pd.to_datetime(start_date),
-        periods=6,
+        periods=6,          # covers the 14-week window comfortably
         freq="MS",
     )
     payroll_by_month = compute_payroll_by_month(client_id, month_index)
@@ -3562,23 +4874,23 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
             cash_out_ap = 0.0
 
         # --- Payroll for this week (approximation) ---
-        # Determine which month this week belongs to (use the week start month)
         month_key = w_start.replace(day=1)
         month_ts = pd.to_datetime(month_key)
 
         month_payroll = float(payroll_by_month.get(month_ts, 0.0))
 
-        # Spread monthly payroll evenly across days in that month
         days_in_month = calendar.monthrange(month_key.year, month_key.month)[1]
         payroll_per_day = month_payroll / days_in_month if days_in_month else 0.0
-        cash_out_payroll = payroll_per_day * 7.0  # 7 days in each week bucket
+        cash_out_payroll = payroll_per_day * 7.0  # 7 days per week bucket
 
         # --- Operating, Investing, Financing ---
         operating_cf = cash_in_ar - cash_out_ap - cash_out_payroll
         investing_cf = 0.0
         financing_cf = 0.0
 
-        closing_cash = current_cash + operating_cf + investing_cf + financing_cf
+        net_cash = operating_cf + investing_cf + financing_cf
+        closing_cash = current_cash + net_cash
+        danger_flag = closing_cash <= 0
 
         rows.append(
             {
@@ -3590,7 +4902,9 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
                 "operating_cf": round(operating_cf, 2),
                 "investing_cf": round(investing_cf, 2),
                 "financing_cf": round(financing_cf, 2),
+                "net_cash": round(net_cash, 2),
                 "closing_cash": round(closing_cash, 2),
+                "danger_flag": danger_flag,
             }
         )
 
@@ -3602,21 +4916,25 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
 
     return df_weeks
 
-# ---------- Page: Cash & Bills ----------
 
+
+# ---------- Page: Cash & Bills ----------
 def page_cash_bills():
     top_header("Cash & Bills")
 
-    # Load current payment term settings for this client
-    settings = get_client_settings(selected_client_id)
-    ar_term = settings["ar_default_days"]
-    ap_term = settings["ap_default_days"]
+    # -------------------------------
+    # Load payment term settings
+    # -------------------------------
+    settings = get_client_settings(selected_client_id) or {}
+    ar_term = int(settings.get("ar_default_days", 30))
+    ap_term = int(settings.get("ap_default_days", 30))
 
+    # -------------------------------
     # Settings UI
+    # -------------------------------
     st.subheader("⚙️ Payment terms for this business")
     col_s1, col_s2 = st.columns(2)
 
-    
     with col_s1:
         ar_input = st.number_input(
             "Default days to get paid (customers / AR)",
@@ -3642,34 +4960,37 @@ def page_cash_bills():
         else:
             st.error("Could not update payment terms. Please try again.")
 
-    # 🔹 Auto-generate / clean up AR overdue alerts based on current date
-    # (uses these defaults inside the helper now)
-    ensure_overdue_ar_alert(selected_client_id, as_of=date.today(), min_days_overdue=0)
-    # Keep these values for captions below
+    # Use the *current* UI values as "active" terms
     ar_days_display = ar_input
     ap_days_display = ap_input
 
+    # Keep AR overdue alerts updated (uses these defaults internally now)
+    ensure_overdue_ar_alert(selected_client_id, as_of=date.today(), min_days_overdue=0)
+
     st.markdown("---")
 
-    # 🔁 Keep your AR overdue alert logic here if you already had it
-    # ensure_overdue_ar_alert(selected_client_id, as_of=date.today(), min_days_overdue=14
-
-   # Use a spinner for the data-heavy part
+    # -------------------------------
+    # Load AR / AP data with spinner
+    # -------------------------------
     with st.spinner("Loading invoices and cash commitments..."):
         df_ar, df_ap = fetch_ar_ap_for_client(selected_client_id)
 
         # Add ageing info to AR using today's date and the current AR term
-    if not df_ar.empty:
-        df_ar = add_ar_aging(df_ar, as_of=date.today(), ar_default_days=ar_term)
+        if df_ar is not None and not df_ar.empty:
+            df_ar = add_ar_aging(df_ar, as_of=date.today(), ar_default_days=ar_days_display)
 
-        
-    # ---------- AR ----------
+        # Add ageing info to AP using today's date and the current AP term
+        if df_ap is not None and not df_ap.empty:
+            df_ap = add_ap_aging(df_ap, as_of=date.today(), ap_default_days=ap_days_display)
+
+    # ------------------------------------------------------------------
+    # 📥 AR – Invoices coming in
+    # ------------------------------------------------------------------
     st.subheader("📥 Invoices coming in (AR)")
-    st.caption(f"Default expectation: customers pay within {ar_input} day(s) of invoice.")
+    st.caption(f"Default expectation: customers pay within {ar_days_display} day(s) of invoice.")
     st.write("Who owes you money and when it's expected in.")
 
-
-    if df_ar.empty:
+    if df_ar is None or df_ar.empty:
         st.info("No AR records yet for this client.")
     else:
         ar_view = df_ar.copy()
@@ -3709,10 +5030,11 @@ def page_cash_bills():
         st.dataframe(ar_view, use_container_width=True)
 
     # Optional: AR ageing summary (only for non-paid invoices)
-    if not df_ar.empty and "aging_bucket" in df_ar.columns and "amount" in df_ar.columns:
+    if df_ar is not None and not df_ar.empty and \
+       "aging_bucket" in df_ar.columns and "amount" in df_ar.columns:
+
         st.markdown("#### AR ageing summary (by overdue bucket)")
 
-        # Treat only invoices that are not fully paid/closed
         def _not_paid(row):
             s = str(row.get("status", "")).lower()
             return s not in ["paid", "closed", "settled"]
@@ -3728,16 +5050,16 @@ def page_cash_bills():
                 .sum()
                 .rename(columns={"aging_bucket": "Bucket", "amount": "Total amount"})
             )
-
             st.dataframe(ageing_summary, use_container_width=True)
 
-
+    # ------------------------------------------------------------------
+    # 📤 AP – Bills to pay
+    # ------------------------------------------------------------------
     st.subheader("📤 Bills to pay (AP)")
-    st.caption(f"Default expectation: you pay suppliers within {ap_input} day(s) of invoice.")
+    st.caption(f"Default expectation: you pay suppliers within {ap_days_display} day(s) of invoice.")
     st.write("Your upcoming bills and payment plans.")
 
-
-    if df_ap.empty:
+    if df_ap is None or df_ap.empty:
         st.info("No AP records yet for this client.")
     else:
         ap_view = df_ap.copy()
@@ -3748,7 +5070,6 @@ def page_cash_bills():
             cols.append("amount")
         if "due_date" in ap_view.columns:
             cols.append("due_date")
-        # we now have pay_expected_date + maybe expected_payment_date
         if "pay_expected_date" in ap_view.columns:
             cols.append("pay_expected_date")
         elif "expected_payment_date" in ap_view.columns:
@@ -3778,7 +5099,9 @@ def page_cash_bills():
         st.dataframe(ap_view, use_container_width=True)
 
     # Optional: AP ageing summary (only for non-paid bills)
-    if not df_ap.empty and "aging_bucket" in df_ap.columns and "amount" in df_ap.columns:
+    if df_ap is not None and not df_ap.empty and \
+       "aging_bucket" in df_ap.columns and "amount" in df_ap.columns:
+
         st.markdown("#### AP ageing summary (by overdue bucket)")
 
         def _not_paid_ap(row):
@@ -3798,7 +5121,9 @@ def page_cash_bills():
             )
             st.dataframe(ap_ageing_summary, use_container_width=True)
 
-
+    # ------------------------------------------------------------------
+    # 🔍 Cash commitments (near-term list)
+    # ------------------------------------------------------------------
     st.subheader("🔍 Cash commitments coming up")
     commitments = build_cash_commitments(df_ar, df_ap, limit=7)
 
@@ -3808,7 +5133,7 @@ def page_cash_bills():
         st.dataframe(commitments, use_container_width=True)
 
     # ------------------------------------------------------------------
-    # 14-week cashflow table (operations view)
+    # 📆 14-week cashflow (operations view)
     # ------------------------------------------------------------------
     st.markdown("---")
     st.subheader("📆 14-week cashflow (operations view)")
@@ -3832,6 +5157,7 @@ def page_cash_bills():
             "operating_cf",
             "investing_cf",
             "financing_cf",
+            "net_cash",
             "closing_cash",
         ]
         cols = [c for c in cols if c in view.columns]
@@ -3844,6 +5170,7 @@ def page_cash_bills():
                 "operating_cf": "Operating CF",
                 "investing_cf": "Investing CF",
                 "financing_cf": "Financing CF",
+                "net_cash": "Net cash",
                 "closing_cash": "Closing cash",
             }
         )
@@ -3853,6 +5180,18 @@ def page_cash_bills():
             "Shows your expected cash in/out by week for the next ~3 months, "
             "based on AR, AP and payroll assumptions."
         )
+
+        # Cash cliff highlight (first week where closing_cash <= 0)
+        if "closing_cash" in week_df.columns:
+            danger_weeks = week_df[week_df["closing_cash"] <= 0]
+            if not danger_weeks.empty:
+                first_danger = danger_weeks.iloc[0]
+                st.error(
+                    f"⚠️ Cash cliff around **week of "
+                    f"{first_danger['week_start'].strftime('%d %b %Y')}** – "
+                    f"closing cash projected at "
+                    f"${first_danger['closing_cash']:,.0f}."
+                )
 
         # Small line chart of weekly closing cash
         chart = (
@@ -3878,7 +5217,6 @@ def page_cash_bills():
     comments_block("cash_bills")
     tasks_block("cash_bills")
 
-    
 
 def _resolve_dept_overspend_alerts_for_month(client_id, month_start: date):
     """
