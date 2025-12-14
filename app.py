@@ -1129,7 +1129,6 @@ def fetch_kpis_for_client_month(
 
 
 
-@st.cache_data(ttl=60)
 def fetch_pipeline_for_client(client_id):
     """
     Fetch all revenue pipeline deals for the given client.
@@ -2059,7 +2058,6 @@ def compute_revenue_schedule(client_id, base_month: date, n_months: int = 12) ->
     ).sort_values("month_date")
 
     return out_df
-
 def page_investing_financing():
     top_header("Funding Strategy")
 
@@ -2077,7 +2075,7 @@ def page_investing_financing():
     currency_code, currency_symbol = get_client_currency(selected_client_id)
     settings = get_client_settings(selected_client_id) or {}
 
-    # ---- Load engine + flows (with connection-aware guards) ----
+    # ---- Load engine + flows ----
     engine_df = fetch_cashflow_summary_for_client(selected_client_id)
     if engine_df is None:
         st.error("Could not load cashflow engine (Supabase disconnected). Please refresh.")
@@ -2088,258 +2086,545 @@ def page_investing_financing():
 
     df_inv = fetch_investing_flows_for_client(selected_client_id)
     if df_inv is None:
-        st.warning("Could not load investing flows (Supabase disconnected).")
         df_inv = pd.DataFrame()
 
     df_fin = fetch_financing_flows_for_client(selected_client_id)
     if df_fin is None:
-        st.warning("Could not load financing flows (Supabase disconnected).")
         df_fin = pd.DataFrame()
 
 
- # ---- Runway + effective burn from existing engine_df ----
+    # ---- Runway + effective burn from engine_df ----
     runway_from_engine, effective_burn = compute_runway_and_effective_burn_from_df(
         engine_df,
         selected_month_start,
     )
-    # -------------------------------
-    # Prepare engine window (12 months)
-    # -------------------------------
-    cliff_date = None
-    existing_cash = 0.0
 
-    if engine_df is not None and not engine_df.empty:
-        ef = engine_df.copy()
-        ef["month_date"] = pd.to_datetime(ef["month_date"], errors="coerce")
-        ef = ef[ef["month_date"].notna()].sort_values("month_date")
-
-        focus_start = pd.to_datetime(selected_month_start).replace(day=1)
-
-        # cash in focus month
-        if "closing_cash" in ef.columns:
-            row = ef[ef["month_date"] == focus_start]
-            if not row.empty:
-                existing_cash = float(row["closing_cash"].iloc[0] or 0.0)
-
-        # first month cash <= 0 (cash cliff)
-        if "closing_cash" in ef.columns:
-            below_zero = ef[ef["closing_cash"] <= 0]
-            if not below_zero.empty:
-                cliff_date = below_zero["month_date"].iloc[0].date()
-
-    # -------------------------------
-    # 1) Funding Decision Panel (Founder-first)
-    # -------------------------------
-    st.subheader("🚀 Funding decision panel")
-
-    if engine_df is None or engine_df.empty or runway_from_engine is None or effective_burn is None:
+    if runway_from_engine is None or effective_burn is None:
         st.info("Not enough cashflow engine data yet. Rebuild cashflow from Business overview.")
         return
 
     current_runway = float(runway_from_engine)
     current_burn = float(effective_burn)
 
-    colA, colB, colC, colD = st.columns(4)
-    with colA:
-        st.metric("Cash in bank (engine)", f"{currency_symbol}{existing_cash:,.0f}")
-    with colB:
-        st.metric("Effective burn", f"{currency_symbol}{current_burn:,.0f} / month")
-    with colC:
-        st.metric("Runway (forward)", f"{current_runway:.1f} months")
-    with colD:
-        st.metric("Cash cliff", cliff_date.strftime("%b %Y") if cliff_date else "No cliff in forecast")
-
-    # Guidance text (this is what founders want)
-    if cliff_date:
-        st.warning(
-            f"Your forecast goes cash-negative around **{cliff_date.strftime('%b %Y')}**. "
-            "To avoid last-minute fundraising, start planning your raise **2–3 months earlier**."
-        )
-    else:
-        st.success("Cash does not go negative in your current forecast window. Focus on growth efficiency and optional financing.")
-
     # -------------------------------
-    # 2) Raise Simulator (interactive strategy)
+    # Helpers
     # -------------------------------
-    st.markdown("---")
-    st.subheader("🧮 Raise simulator (how much + when)")
+    def _month_start(x):
+        return pd.to_datetime(x).to_period("M").to_timestamp()
 
-    default_target_runway = float(settings.get("target_runway_months", 12) or 12)
-    target_runway = st.number_input(
-        "Target runway after raise (months)",
-        min_value=3.0,
-        max_value=36.0,
-        step=1.0,
-        value=default_target_runway,
-        help="How many months of runway you want after funding lands.",
-    )
-
-    burn_change_pct = st.slider(
-        "Planned burn change for growth plan",
-        min_value=-50,
-        max_value=150,
-        value=0,
-        help="Increase for hiring/marketing; decrease for cost cuts.",
-    )
-
-    adjusted_burn = current_burn * (1 + burn_change_pct / 100.0)
-    if adjusted_burn <= 0:
-        st.error("Adjusted burn must be > 0 to calculate a funding plan.")
-        return
-
-    # Choose raise timing month (important UX)
-    raise_month = st.date_input(
-        "When will the funding land? (month)",
-        value=selected_month_start,
-        help="Model a realistic timing for when cash hits the bank.",
-        key="raise_month_picker",
-    )
-    raise_month = pd.to_datetime(raise_month).to_period("M").to_timestamp().date()
-
-    # Required cash to hold target runway
-    required_cash = adjusted_burn * target_runway
-    funding_gap = max(0.0, required_cash - existing_cash)
-
-    # Slider for raise amount so founders can explore choices
-    max_raise = max(funding_gap * 2, adjusted_burn * 6, 50000.0)
-    raise_amount = st.slider(
-        "Raise amount (what you plan to raise)",
-        min_value=0.0,
-        max_value=float(max_raise),
-        value=float(funding_gap),
-        step=float(max(1000.0, max_raise / 50)),
-    )
-
-    # Impact metrics (simple + founder friendly)
-    new_cash_buffer = existing_cash + raise_amount
-    new_runway_est = (new_cash_buffer / adjusted_burn) if adjusted_burn else None
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Recommended raise (to hit target)", f"{currency_symbol}{funding_gap:,.0f}")
-    with c2:
-        st.metric("Your planned raise", f"{currency_symbol}{raise_amount:,.0f}")
-    with c3:
-        st.metric("Runway after raise (simple)", f"{new_runway_est:.1f} months" if new_runway_est else "—")
-
-    st.caption(
-        f"Current runway: **{current_runway:.1f} months** (engine).  "
-        f"Adjusted burn: **{currency_symbol}{adjusted_burn:,.0f}/month** based on your plan."
-    )
-
-    # -------------------------------
-    # 3) Funding Mix (Equity / Debt / Grants)
-    # -------------------------------
-    st.markdown("---")
-    st.subheader("🏦 Funding mix options")
-
-    tab_eq, tab_debt, tab_grants = st.tabs(["Equity", "Debt", "Grants"])
-
-    with tab_eq:
-        st.markdown("#### Equity impact (dilution)")
-        pre_money = st.number_input(
-            "Pre-money valuation (rough)",
-            min_value=0.0,
-            step=100000.0,
-            value=float(settings.get("rough_pre_money", 0.0) or 0.0),
-        )
-        if pre_money > 0 and raise_amount > 0:
-            dilution = raise_amount / (pre_money + raise_amount) * 100.0
-            st.info(
-                f"Raising **{currency_symbol}{raise_amount:,.0f}** at a **{currency_symbol}{pre_money:,.0f}** pre-money "
-                f"implies ~**{dilution:.1f}%** dilution (post-money)."
-            )
-        else:
-            st.caption("Enter pre-money valuation to see dilution estimate.")
-
-    with tab_debt:
-        st.markdown("#### Debt affordability (repayment pressure)")
-        interest = st.number_input("Annual interest rate (%)", min_value=0.0, max_value=40.0, value=12.0, step=0.5)
-        term_months = st.number_input("Loan term (months)", min_value=3, max_value=84, value=24, step=1)
-
-        # very rough amortised repayment (for UX)
-        if raise_amount > 0 and term_months > 0:
-            r = (interest / 100.0) / 12.0
-            if r == 0:
-                pmt = raise_amount / term_months
-            else:
-                pmt = raise_amount * (r * (1 + r) ** term_months) / (((1 + r) ** term_months) - 1)
-
-            st.info(
-                f"Estimated monthly repayment: **{currency_symbol}{pmt:,.0f} / month**. "
-                "If this pushes burn too high, equity or a smaller debt tranche may be safer."
-            )
-
-    with tab_grants:
-        st.markdown("#### Grants (one-off inflows)")
-        grant_amount = st.number_input("Expected grant amount", min_value=0.0, step=1000.0, value=0.0)
-        if grant_amount > 0:
-            grant_runway = (existing_cash + grant_amount) / adjusted_burn
-            st.info(
-                f"A **{currency_symbol}{grant_amount:,.0f}** grant would lift simple runway to ~**{grant_runway:.1f} months**."
-            )
-        else:
-            st.caption("Enter a grant amount to see runway lift.")
-
-    # -------------------------------
-    # 4) Timeline chart (keep, but framed strategically)
-    # -------------------------------
-    st.markdown("---")
-    st.subheader("📆 Investing & financing timeline (next 12 months)")
-
-    if engine_df is None or engine_df.empty:
-        st.caption("No cashflow engine data yet.")
-    else:
-        start = pd.to_datetime(selected_month_start).replace(day=1)
-        end = start + pd.DateOffset(months=12)
-
-        ef = engine_df.copy()
+    def _prep_engine_monthly(df: pd.DataFrame) -> pd.DataFrame:
+        ef = df.copy()
         ef["month_date"] = pd.to_datetime(ef["month_date"], errors="coerce")
-        ef = ef[(ef["month_date"] >= start) & (ef["month_date"] < end)]
+        ef = ef[ef["month_date"].notna()].sort_values("month_date")
+        ef["month_date"] = ef["month_date"].dt.to_period("M").dt.to_timestamp()
 
-        if ef.empty or ("investing_cf" not in ef.columns and "financing_cf" not in ef.columns):
-            st.caption("No investing or financing cashflows in this 12-month window yet.")
+        # Ensure numeric cashflow cols exist
+        for c in ["operating_cf", "investing_cf", "financing_cf", "net_cash", "closing_cash"]:
+            if c in ef.columns:
+                ef[c] = pd.to_numeric(ef[c], errors="coerce").fillna(0.0)
+
+        # Compute net_cash if missing
+        if "net_cash" not in ef.columns or ef["net_cash"].isna().all():
+            if all(c in ef.columns for c in ["operating_cf", "investing_cf", "financing_cf"]):
+                ef["net_cash"] = ef["operating_cf"] + ef["investing_cf"] + ef["financing_cf"]
+            else:
+                ef["net_cash"] = 0.0
+
+        # If closing_cash missing, we still allow charts using cumulative net
+        if "closing_cash" not in ef.columns or ef["closing_cash"].isna().all():
+            ef["closing_cash"] = np.nan
+
+        return ef
+
+    def _derive_opening_cash_for_first_row(ef: pd.DataFrame) -> float:
+        # Best: opening = closing - net for focus month
+        focus = _month_start(selected_month_start)
+        row = ef[ef["month_date"] == focus]
+        if not row.empty:
+            closing = float(row["closing_cash"].iloc[0]) if "closing_cash" in row.columns else 0.0
+            net = float(row["net_cash"].iloc[0]) if "net_cash" in row.columns else 0.0
+            if not np.isnan(closing):
+                return closing - net
+
+        # Fallback: use earliest available closing - net
+        first = ef.iloc[0]
+        closing = float(first.get("closing_cash", 0.0) or 0.0)
+        net = float(first.get("net_cash", 0.0) or 0.0)
+        return (closing - net) if not np.isnan(closing) else 0.0
+
+    def _recompute_closing_cash_series(ef: pd.DataFrame, opening_cash: float) -> pd.DataFrame:
+        ef2 = ef.copy().sort_values("month_date")
+        closes = []
+        opens = []
+        o = float(opening_cash)
+
+        for _, r in ef2.iterrows():
+            opens.append(o)
+            net = float(r.get("net_cash", 0.0) or 0.0)
+            c = o + net
+            closes.append(c)
+            o = c
+
+        ef2["opening_cash_sim"] = opens
+        ef2["closing_cash_sim"] = closes
+        return ef2
+
+    # -------------------------------
+    # Prepare engine window (12 months)
+    # -------------------------------
+    ef = _prep_engine_monthly(engine_df)
+
+    focus_start = _month_start(selected_month_start)
+    start = focus_start
+    end = start + pd.DateOffset(months=12)
+    ef_12 = ef[(ef["month_date"] >= start) & (ef["month_date"] < end)].copy()
+
+    # Existing cash and cliff from engine (use actual closing_cash if present; else use simulated)
+    existing_cash = 0.0
+    cliff_date = None
+
+    if not ef_12.empty:
+        r0 = ef_12[ef_12["month_date"] == focus_start]
+        if not r0.empty and "closing_cash" in ef_12.columns and not np.isnan(float(r0["closing_cash"].iloc[0])):
+            existing_cash = float(r0["closing_cash"].iloc[0] or 0.0)
+
+        if "closing_cash" in ef_12.columns and ef_12["closing_cash"].notna().any():
+            below = ef_12[ef_12["closing_cash"] <= 0]
+            if not below.empty:
+                cliff_date = below["month_date"].iloc[0].date()
         else:
-            plot_cols = [c for c in ["investing_cf", "financing_cf"] if c in ef.columns]
+            # fallback to simulated cliff using cumulative net
+            opening0 = _derive_opening_cash_for_first_row(ef_12)
+            ef_tmp = _recompute_closing_cash_series(ef_12, opening0)
+            below = ef_tmp[ef_tmp["closing_cash_sim"] <= 0]
+            if not below.empty:
+                cliff_date = below["month_date"].iloc[0].date()
+            # approximate "existing cash" from sim
+            r0 = ef_tmp[ef_tmp["month_date"] == focus_start]
+            if not r0.empty:
+                existing_cash = float(r0["closing_cash_sim"].iloc[0] or 0.0)
 
-            long_df = ef.melt(
-                id_vars="month_date",
-                value_vars=plot_cols,
-                var_name="Type",
-                value_name="Amount",
+    # ===============================
+    # NEW STRUCTURE
+    # Left column = Decision + timeline + survival + cash curve + recommendation strip
+    # Right column = Raise KPI + simulator + funding mix tabs
+    # ===============================
+    col_left, col_right = st.columns([2, 1])
+
+    # -------------------------------
+    # LEFT: Funding decision panel + timeline (and later, survival + cash curve + strip)
+    # -------------------------------
+    with col_left:
+        st.subheader("🚀 Funding decision panel")
+
+        colA, colB, colC, colD = st.columns(4)
+        with colA:
+            st.metric("Cash in bank (engine)", f"{currency_symbol}{existing_cash:,.0f}")
+        with colB:
+            st.metric("Effective burn", f"{currency_symbol}{current_burn:,.0f} / month")
+        with colC:
+            st.metric("Runway (forward)", f"{current_runway:.1f} months")
+        with colD:
+            st.metric("Cash cliff", cliff_date.strftime("%b %Y") if cliff_date else "No cliff in forecast")
+
+        if cliff_date:
+            st.warning(
+                f"Your forecast goes cash-negative around **{cliff_date.strftime('%b %Y')}**. "
+                "To avoid last-minute fundraising, start planning your raise **2–3 months earlier**."
+            )
+        else:
+            st.success("Cash does not go negative in your current forecast window. Funding is optional—optimize growth efficiency.")
+
+        # ---- Timeline chart (next 12 months) directly under KPIs ----
+        st.markdown("---")
+        st.subheader("📆 Investing & financing timeline (next 12 months)")
+
+        if ef_12.empty:
+            st.caption("No cashflow engine data in this 12-month window.")
+        else:
+            plot_cols = [c for c in ["investing_cf", "financing_cf"] if c in ef_12.columns]
+            if not plot_cols:
+                st.caption("No investing or financing cashflows in this 12-month window yet.")
+            else:
+                long_df = ef_12.melt(
+                    id_vars="month_date",
+                    value_vars=plot_cols,
+                    var_name="Type",
+                    value_name="Amount",
+                )
+                type_labels = {
+                    "investing_cf": "Investing (CAPEX / R&D / assets)",
+                    "financing_cf": "Financing (Equity / Debt / Repayments)",
+                }
+                long_df["Type"] = long_df["Type"].map(type_labels).fillna(long_df["Type"])
+
+                chart = (
+                    alt.Chart(long_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
+                        y=alt.Y("Amount:Q", title=f"Cashflow ({currency_code})"),
+                        color=alt.Color("Type:N", title="Flow"),
+                        tooltip=[
+                            alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
+                            "Type:N",
+                            alt.Tooltip("Amount:Q", title="Cashflow", format=",.0f"),
+                        ],
+                    )
+                )
+                st.altair_chart(chart.interactive(), width="stretch")
+                st.caption("Positive = cash in. Negative = cash out.")
+
+    # -------------------------------
+    # RIGHT: Raise KPI (top) + Raise simulator (middle) + Funding mix tabs (bottom)
+    # -------------------------------
+    with col_right:
+        st.subheader("🧮 Raise plan")
+
+        # ---- Simulator inputs ----
+        default_target_runway = float(settings.get("target_runway_months", 12) or 12)
+        target_runway = st.number_input(
+            "Target runway after raise (months)",
+            min_value=3.0,
+            max_value=36.0,
+            step=1.0,
+            value=default_target_runway,
+            help="How many months of runway you want after funding lands.",
+        )
+
+        burn_change_pct = st.slider(
+            "Planned burn change for growth plan",
+            min_value=-50,
+            max_value=150,
+            value=0,
+            help="Increase for hiring/marketing; decrease for cost cuts.",
+        )
+
+        adjusted_burn = current_burn * (1 + burn_change_pct / 100.0)
+        if adjusted_burn <= 0:
+            st.error("Adjusted burn must be > 0 to calculate a funding plan.")
+            return
+
+        raise_month = st.date_input(
+            "When will the funding land? (month)",
+            value=selected_month_start,
+            help="Model a realistic timing for when cash hits the bank.",
+            key="raise_month_picker",
+        )
+        raise_month = pd.to_datetime(raise_month).to_period("M").to_timestamp().date()
+        raise_month_ts = pd.to_datetime(raise_month).to_period("M").to_timestamp()
+
+        # ---- Funding amount guidance (buffers) ----
+        st.markdown("##### Funding amount guidance")
+        safety_buffer_pct = st.slider(
+            "Safety buffer (%)",
+            min_value=0,
+            max_value=50,
+            value=int(settings.get("funding_safety_buffer_pct", 15) or 15),
+            help="Adds a buffer so you don’t raise too little.",
+        )
+        one_off_costs = st.number_input(
+            f"One-off raise costs ({currency_code})",
+            min_value=0.0,
+            step=5000.0,
+            value=float(settings.get("one_off_raise_costs", 0.0) or 0.0),
+            help="Legal, audit, hiring fees, equipment step-changes, etc.",
+        )
+        wc_buffer = st.number_input(
+            f"Working-capital buffer ({currency_code})",
+            min_value=0.0,
+            step=5000.0,
+            value=float(settings.get("working_capital_buffer", 0.0) or 0.0),
+            help="Extra buffer if collections are slow / AR timing risk.",
+        )
+
+        # ---- Recommended raise ----
+        base_required_cash = adjusted_burn * float(target_runway)
+        buffer_mult = 1.0 + (float(safety_buffer_pct) / 100.0)
+        required_cash = (base_required_cash * buffer_mult) + float(one_off_costs) + float(wc_buffer)
+        funding_gap = max(0.0, required_cash - existing_cash)
+
+        max_raise = max(funding_gap * 2, adjusted_burn * 6, 50_000.0)
+        raise_amount = st.slider(
+            "Raise amount (what you plan to raise)",
+            min_value=0.0,
+            max_value=float(max_raise),
+            value=float(funding_gap),
+            step=float(max(1000.0, max_raise / 50)),
+        )
+
+        # ---- KPI block (TOP of right column, as requested) ----
+        new_cash_buffer_simple = existing_cash + raise_amount
+        new_runway_est_simple = (new_cash_buffer_simple / adjusted_burn) if adjusted_burn else None
+
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.metric("Recommended raise", f"{currency_symbol}{funding_gap:,.0f}")
+        with k2:
+            st.metric("Planned raise", f"{currency_symbol}{raise_amount:,.0f}")
+        with k3:
+            st.metric("Runway after raise (simple)", f"{new_runway_est_simple:.1f}m" if new_runway_est_simple else "—")
+
+        st.caption(
+            f"Adjusted burn: **{currency_symbol}{adjusted_burn:,.0f}/month** · "
+            f"Target runway: **{target_runway:.0f} months** · "
+            f"Buffers: **{safety_buffer_pct}% + {currency_symbol}{one_off_costs:,.0f} + {currency_symbol}{wc_buffer:,.0f}**"
+        )
+
+        # -------------------------------
+        # Funding Mix (Equity / Debt / Grants) – upgraded
+        # -------------------------------
+        st.markdown("---")
+        st.subheader("🏦 Funding mix options")
+
+        tab_eq, tab_debt, tab_grants = st.tabs(["Equity", "Debt", "Grants"])
+
+        with tab_eq:
+            st.markdown("#### Equity impact (post-money + ownership remaining)")
+
+            pre_money = st.number_input(
+                "Pre-money valuation (rough)",
+                min_value=0.0,
+                step=100000.0,
+                value=float(settings.get("rough_pre_money", 0.0) or 0.0),
             )
 
-            type_labels = {
-                "investing_cf": "Investing (CAPEX / R&D / assets)",
-                "financing_cf": "Financing (Equity / Debt / Repayments)",
-            }
-            long_df["Type"] = long_df["Type"].map(type_labels)
+            founder_ownership_pct = st.number_input(
+                "Current founder ownership (%)",
+                min_value=0.0,
+                max_value=100.0,
+                step=1.0,
+                value=float(settings.get("founder_ownership_pct", 100.0) or 100.0),
+                help="If you have co-founders/investors already, enter the founder’s current %.",
+            )
+
+            if pre_money > 0 and raise_amount > 0:
+                post_money = pre_money + raise_amount
+                dilution = (raise_amount / post_money) * 100.0
+                ownership_remaining = founder_ownership_pct * (pre_money / post_money)
+
+                st.info(
+                    f"Post-money ≈ **{currency_symbol}{post_money:,.0f}** · "
+                    f"Dilution ≈ **{dilution:.1f}%** · "
+                    f"Founder ownership remaining ≈ **{ownership_remaining:.1f}%**"
+                )
+            else:
+                st.caption("Enter pre-money valuation and a raise amount to see post-money, dilution, and ownership remaining.")
+
+        with tab_debt:
+            st.markdown("#### Debt sanity (DSCR-style + runway impact)")
+
+            interest = st.number_input("Annual interest rate (%)", min_value=0.0, max_value=40.0, value=12.0, step=0.5)
+            term_months = st.number_input("Loan term (months)", min_value=3, max_value=84, value=24, step=1)
+
+            if raise_amount > 0 and term_months > 0:
+                r = (interest / 100.0) / 12.0
+                if r == 0:
+                    pmt = raise_amount / term_months
+                else:
+                    pmt = raise_amount * (r * (1 + r) ** term_months) / (((1 + r) ** term_months) - 1)
+
+                # “DSCR-style” sanity: compare ability to carry repayments vs cash burn
+                # We treat adjusted_burn as baseline cash cost. Debt adds repayment pressure.
+                burn_with_debt = adjusted_burn + float(pmt)
+                runway_with_debt = (existing_cash / burn_with_debt) if burn_with_debt > 0 else None
+
+                # Coverage proxy: repayment as % of burn (lower is healthier)
+                repayment_share = (pmt / adjusted_burn) * 100.0 if adjusted_burn > 0 else None
+
+                st.info(
+                    f"Estimated monthly repayment ≈ **{currency_symbol}{pmt:,.0f} / month**"
+                )
+
+                cA, cB = st.columns(2)
+                with cA:
+                    st.metric("Repayment as % of burn", f"{repayment_share:.0f}%" if repayment_share is not None else "—")
+                with cB:
+                    st.metric("Runway with debt repayment", f"{runway_with_debt:.1f}m" if runway_with_debt else "—")
+
+                if runway_with_debt is not None and runway_with_debt < current_runway:
+                    st.warning(
+                        "Debt repayments shorten runway. If you’re already tight, consider equity, a smaller debt tranche, "
+                        "or push the repayment start later."
+                    )
+            else:
+                st.caption("Set a raise amount and loan term to estimate repayment pressure and runway impact.")
+
+        with tab_grants:
+            st.markdown("#### Grants (one-off inflows)")
+            grant_amount = st.number_input("Expected grant amount", min_value=0.0, step=1000.0, value=0.0)
+            if grant_amount > 0:
+                grant_runway = (existing_cash + grant_amount) / adjusted_burn
+                st.info(
+                    f"A **{currency_symbol}{grant_amount:,.0f}** grant would lift simple runway to ~**{grant_runway:.1f} months**."
+                )
+            else:
+                st.caption("Enter a grant amount to see runway lift.")
+
+    # ==========================================================
+    # BELOW THE MAIN KPI BLOCK (LEFT COLUMN CONTINUES):
+    # 1) Can we survive until the raise lands?
+    # 2) Cash curve before vs after raise
+    # 3) Funding recommendation strip
+    # ==========================================================
+    with col_left:
+        st.markdown("---")
+        st.subheader("🧱 Can you survive until the raise lands?")
+
+        if ef_12.empty:
+            st.caption("No engine data to test survival.")
+        else:
+            # Base series (simulated if needed)
+            opening0 = _derive_opening_cash_for_first_row(ef_12)
+            base_series = _recompute_closing_cash_series(ef_12, opening0)
+
+            # Find worst cash before raise month (inclusive)
+            before_raise = base_series[base_series["month_date"] <= raise_month_ts].copy()
+            min_before = float(before_raise["closing_cash_sim"].min()) if not before_raise.empty else None
+
+            survives = (min_before is not None and min_before > 0)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Raise lands (month)", raise_month_ts.strftime("%b %Y"))
+            with c2:
+                st.metric("Min projected cash before raise", f"{currency_symbol}{min_before:,.0f}" if min_before is not None else "—")
+            with c3:
+                st.metric("Survive until raise?", "Yes ✅" if survives else "No ⚠️")
+
+            if not survives:
+                st.error(
+                    "You are projected to run out of cash **before** the raise lands. "
+                    "Options: raise earlier, cut burn now, pull forward collections, or arrange a bridge."
+                )
+            else:
+                st.success("You remain cash-positive until the raise lands (based on current forecast).")
+
+        # -------------------------------
+        # Cash curve before vs after raise
+        # -------------------------------
+        st.markdown("---")
+        st.subheader("📈 Cash curve: before vs after raise")
+
+        if ef_12.empty:
+            st.caption("No engine data to plot cash curve.")
+        else:
+            # Base curve
+            opening0 = _derive_opening_cash_for_first_row(ef_12)
+            base_series = _recompute_closing_cash_series(ef_12, opening0)
+
+            # After-raise curve: inject raise into financing_cf in raise_month, recompute
+            sim = ef_12.copy()
+            if "financing_cf" in sim.columns:
+                sim.loc[sim["month_date"] == raise_month_ts, "financing_cf"] = (
+                    sim.loc[sim["month_date"] == raise_month_ts, "financing_cf"].fillna(0.0) + float(raise_amount)
+                )
+                # re-net
+                if all(c in sim.columns for c in ["operating_cf", "investing_cf", "financing_cf"]):
+                    sim["net_cash"] = sim["operating_cf"] + sim["investing_cf"] + sim["financing_cf"]
+            else:
+                # If financing_cf not present, we still can add to net_cash
+                sim.loc[sim["month_date"] == raise_month_ts, "net_cash"] = (
+                    sim.loc[sim["month_date"] == raise_month_ts, "net_cash"].fillna(0.0) + float(raise_amount)
+                )
+
+            after_series = _recompute_closing_cash_series(sim, opening0)
+
+            plot_df = pd.DataFrame({
+                "month_date": base_series["month_date"],
+                "Base forecast": base_series["closing_cash_sim"],
+                "After raise": after_series["closing_cash_sim"],
+            })
+
+            plot_long = plot_df.melt("month_date", var_name="Scenario", value_name="Closing cash")
 
             chart = (
-                alt.Chart(long_df)
-                .mark_bar()
+                alt.Chart(plot_long)
+                .mark_line()
                 .encode(
                     x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
-                    y=alt.Y("Amount:Q", title=f"Cashflow ({currency_code})"),
-                    color=alt.Color("Type:N", title="Flow"),
+                    y=alt.Y("Closing cash:Q", title=f"Projected closing cash ({currency_code})"),
+                    color=alt.Color("Scenario:N", title="Scenario"),
                     tooltip=[
                         alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                        "Type:N",
-                        alt.Tooltip("Amount:Q", title="Cashflow", format=",.0f"),
+                        "Scenario:N",
+                        alt.Tooltip("Closing cash:Q", title="Closing cash", format=",.0f"),
                     ],
                 )
             )
             st.altair_chart(chart.interactive(), width="stretch")
-            st.caption("Positive = cash in. Negative = cash out.")
+
+            # quick delta
+            base_end = float(base_series["closing_cash_sim"].iloc[-1] or 0.0)
+            after_end = float(after_series["closing_cash_sim"].iloc[-1] or 0.0)
+            st.caption(
+                f"End-of-window cash: Base **{currency_symbol}{base_end:,.0f}** → After raise **{currency_symbol}{after_end:,.0f}**."
+            )
+
+        # -------------------------------
+        # Funding recommendation strip
+        # -------------------------------
+        st.markdown("---")
+        st.subheader("🟨 Funding recommendation")
+
+        # Determine urgency
+        recommendation = []
+        sev = "green"
+
+        # When to start raise: cliff - 90 days (configurable later)
+        raise_start_by = None
+        if cliff_date:
+            raise_start_by = (pd.to_datetime(cliff_date) - pd.DateOffset(days=90)).date()
+
+        # Use survive flag if available
+        try:
+            survives_flag = survives
+        except Exception:
+            survives_flag = True
+
+        if cliff_date and not survives_flag:
+            sev = "red"
+            recommendation.append(
+                f"Cash goes negative around **{pd.to_datetime(cliff_date).strftime('%b %Y')}** and you don’t survive until the raise month."
+            )
+            recommendation.append("Move raise earlier **or** implement immediate burn reduction / bridge funding.")
+        elif cliff_date and current_runway < 6:
+            sev = "amber"
+            recommendation.append(
+                f"Cash goes negative around **{pd.to_datetime(cliff_date).strftime('%b %Y')}** (runway ~{current_runway:.1f} months)."
+            )
+            if raise_start_by:
+                recommendation.append(f"Start fundraising by **{pd.to_datetime(raise_start_by).strftime('%b %Y')}** to avoid a last-minute raise.")
+        elif current_runway < 6:
+            sev = "amber"
+            recommendation.append(f"Runway is **{current_runway:.1f} months**. You’re not in immediate danger, but you should prepare a raise.")
+            recommendation.append("Tighten burn discipline + improve collections to extend runway while you prepare.")
+        else:
+            sev = "green"
+            recommendation.append("Runway looks healthy in the current forecast window.")
+            recommendation.append("Funding is optional—use it strategically for growth, pricing power, or product acceleration.")
+
+        recommendation.append(
+            f"Recommended raise (incl. buffers): **{currency_symbol}{funding_gap:,.0f}** · Planned: **{currency_symbol}{raise_amount:,.0f}**"
+        )
+
+        msg = "  \n".join([f"- {x}" for x in recommendation])
+
+        if sev == "red":
+            st.error(msg)
+        elif sev == "amber":
+            st.warning(msg)
+        else:
+            st.success(msg)
 
     # -------------------------------
-    # 5) Raw flows + add forms (move to expander so founders stay strategic)
+    # Admin expander + collaboration (unchanged)
     # -------------------------------
     st.markdown("---")
     with st.expander("📚 Detailed investing & financing entries (admin)", expanded=False):
-        col_left, col_right = st.columns([2, 1])
+        col_left_admin, col_right_admin = st.columns([2, 1])
 
-        with col_left:
+        with col_left_admin:
             st.markdown("### Investing flows")
             if df_inv is None or df_inv.empty:
                 st.caption("No investing flows yet.")
@@ -2362,7 +2647,7 @@ def page_investing_financing():
                 cols = ["id", "Month"] + [c for c in ["amount", "category", "notes"] if c in fin_view.columns]
                 st.dataframe(fin_view[cols], width="stretch")
 
-        with col_right:
+        with col_right_admin:
             st.markdown("### ➕ Add investing flow")
             with st.form(key="new_investing_flow_form"):
                 inv_date = st.date_input("Month", value=selected_month_start, key="inv_date")
@@ -2399,9 +2684,7 @@ def page_investing_financing():
                     else:
                         st.error("Could not save financing flow.")
 
-    # -------------------------------
     # Collaboration layer at bottom
-    # -------------------------------
     st.markdown("---")
     col_comments, col_tasks = st.columns([3, 1])
     with col_comments:
@@ -2410,6 +2693,115 @@ def page_investing_financing():
         with st.expander("✅ Tasks for this page", expanded=False):
             tasks_block("investing_financing")
 
+
+
+##Pipeline health panel#
+def build_pipeline_health_panel(df_pipeline, focus_month, currency_symbol):
+    if df_pipeline is None or df_pipeline.empty:
+        return ("warning", ["No deals yet. Add your top 5–10 active deals to see pipeline health."], [])
+
+    df = df_pipeline.copy()
+    df["value_total"] = pd.to_numeric(df.get("value_total"), errors="coerce").fillna(0.0)
+    df["probability_pct"] = pd.to_numeric(df.get("probability_pct"), errors="coerce").fillna(0.0)
+    df["stage"] = df.get("stage", "").astype(str).str.lower()
+
+    # closing month logic
+    closing = pd.to_datetime(df.get("end_month"), errors="coerce")
+    startm = pd.to_datetime(df.get("start_month"), errors="coerce")
+    df["closing_month"] = closing.fillna(startm)
+
+    focus = pd.to_datetime(focus_month).replace(day=1)
+    d90 = focus + pd.DateOffset(months=3)
+
+    open_mask = df["stage"].isin(["idea","proposal","demo","contract"])
+    df_open = df[open_mask].copy()
+    df_open["weighted"] = df_open["value_total"] * df_open["probability_pct"] / 100.0
+
+    # KPIs
+    weighted_total = float(df_open["weighted"].sum())
+    weighted_90d = float(df_open.loc[(df_open["closing_month"] >= focus) & (df_open["closing_month"] < d90), "weighted"].sum())
+
+    # Warnings
+    decisions = []
+    metrics = []
+    severity = "success"
+
+    missing_dates = int(df_open["closing_month"].isna().sum())
+    if missing_dates > 0:
+        severity = "warning"
+        decisions.append(f"{missing_dates} open deals have no expected close month. Add dates to make forecasting meaningful.")
+
+    early_stage_weighted = float(df_open.loc[df_open["stage"].isin(["idea","proposal"]), "weighted"].sum())
+    if weighted_total > 0 and (early_stage_weighted / weighted_total) > 0.6:
+        severity = "warning"
+        decisions.append("Pipeline is mostly early-stage (Idea/Proposal). Push deals to Demo/Contract to de-risk the forecast.")
+
+    if weighted_90d == 0 and weighted_total > 0:
+        severity = "warning"
+        decisions.append("No weighted pipeline is closing in the next ~90 days. You may face a near-term revenue gap.")
+
+    # Concentration
+    top = df_open.sort_values("weighted", ascending=False).head(2)["weighted"].sum()
+    if weighted_total > 0 and (top / weighted_total) > 0.5:
+        severity = "warning"
+        decisions.append("Pipeline is highly concentrated in 1–2 deals. Create backup deals to reduce risk.")
+
+    metrics.append(("Weighted pipeline (total)", f"{currency_symbol}{weighted_total:,.0f}"))
+    metrics.append(("Weighted closing in ~90 days", f"{currency_symbol}{weighted_90d:,.0f}"))
+
+    if not decisions:
+        decisions.append("Pipeline health looks reasonable. Focus on closing the next best 2–3 deals and keeping dates/probabilities current.")
+
+    return severity, decisions, metrics
+
+def build_sales_next_actions(df_pipeline):
+    if df_pipeline is None or df_pipeline.empty:
+        return ["Add your top 5–10 active deals (name, value, stage, win chance, close month)."]
+
+    df = df_pipeline.copy()
+    df["stage"] = df.get("stage", "").astype(str).str.lower()
+
+    actions = []
+    if (df["stage"] == "idea").any():
+        actions.append("Move **Idea → Proposal**: qualify ICP, confirm pain, book next meeting, set a close month.")
+    if (df["stage"] == "proposal").any():
+        actions.append("Move **Proposal → Demo**: confirm decision criteria, timeline, stakeholders; schedule demo on calendar.")
+    if (df["stage"] == "demo").any():
+        actions.append("Move **Demo → Contract**: identify champion, confirm procurement/legal, send pricing + implementation plan.")
+    if (df["stage"] == "contract").any():
+        actions.append("Close **Contract → Closed won**: push signature, confirm start date, invoice/PO, remove blockers weekly.")
+
+    if not actions:
+        actions.append("No active deals in selling stages. Add opportunities or restart outbound to build pipeline.")
+
+    return actions[:4]
+
+def build_pipeline_data_checks(df_pipeline):
+    if df_pipeline is None or df_pipeline.empty:
+        return []
+
+    df = df_pipeline.copy()
+    df["value_total"] = pd.to_numeric(df.get("value_total"), errors="coerce")
+    df["probability_pct"] = pd.to_numeric(df.get("probability_pct"), errors="coerce")
+    df["stage"] = df.get("stage", "").astype(str).str.lower()
+
+    startm = pd.to_datetime(df.get("start_month"), errors="coerce")
+    endm = pd.to_datetime(df.get("end_month"), errors="coerce")
+    closing = endm.fillna(startm)
+
+    issues = []
+    if df["value_total"].isna().sum() > 0 or (df["value_total"].fillna(0) <= 0).sum() > 0:
+        issues.append("Some deals have **$0 / blank value**. Add an estimate to make pipeline meaningful.")
+    if df["probability_pct"].isna().sum() > 0:
+        issues.append("Some deals have **blank win chance**. Set 10–90% for open deals.")
+    if closing.isna().sum() > 0:
+        issues.append("Some deals have **no expected close month**. Add close month to improve forecasting.")
+    if ((df["stage"] == "closed_won") & (df["probability_pct"].fillna(0) < 90)).any():
+        issues.append("Some **Closed won** deals have low probability. Set Closed won deals to 100% for consistency.")
+    if ((df["stage"] == "closed_lost") & (df["probability_pct"].fillna(0) > 0)).any():
+        issues.append("Some **Closed lost** deals still have probability > 0. Set to 0% to avoid confusion.")
+
+    return issues
 
 
 def page_sales_deals():
@@ -2513,7 +2905,13 @@ def page_sales_deals():
         weighted_pipeline = float(
             (df_pipeline["value_total"] * df_pipeline["probability_pct"] / 100.0).sum()
         )
-        open_deals_count = len(df_pipeline)
+        open_stages = ["idea", "proposal", "demo", "contract"]
+        open_deals_count = int(df_pipeline["stage"].astype(str).str.lower().isin(open_stages).sum())
+
+
+
+    
+
 
     # --------------------------------
     # Main layout: LEFT (overview) / RIGHT (deal editor)
@@ -2552,6 +2950,33 @@ def page_sales_deals():
                 f"{(horizon_end - pd.DateOffset(days=1)).strftime('%b %Y')} "
                 "(next 12 months window)."
             )
+            #health panel#
+
+            sev, decisions, metrics = build_pipeline_health_panel(df_pipeline, selected_month_start, currency_symbol)
+
+          
+            if metrics:
+                mcols = st.columns(len(metrics))
+                for i, (label, val) in enumerate(metrics):
+                    mcols[i].metric(label, val)
+
+            if sev == "error":
+                st.error("\n".join([f"• {d}" for d in decisions]))
+            elif sev == "warning":
+                st.warning("\n".join([f"• {d}" for d in decisions]))
+            else:
+                st.success("\n".join([f"• {d}" for d in decisions]))
+
+
+            st.markdown("### ✅ What to do this week")
+            next_actions = build_sales_next_actions(df_pipeline)
+            st.info("\n".join([f"• {a}" for a in next_actions]))
+
+
+            issues = build_pipeline_data_checks(df_pipeline)
+            if issues:
+                st.warning("**Data checks**\n" + "\n".join([f"• {i}" for i in issues]))
+
 
             # ---- Pipeline waterfall (Closed to date + pipeline stages) ----
             st.markdown("#### 🎯 Pipeline waterfall – closed + weighted pipeline (this 12-month year)")
@@ -2760,7 +3185,7 @@ def page_sales_deals():
                     }
                 )
                 with st.expander("View full pipeline list", expanded=False):
-                    st.dataframe(view, use_container_width=True)
+                    st.dataframe(view, width="stretch")
             else:
                 st.caption("No pipeline columns available to show in the table yet.")
 
@@ -2901,11 +3326,19 @@ def page_sales_deals():
                 else:
                     if selected_deal_id:
                         # For updates we keep using your helper that updates stage + probability
-                        ok = update_pipeline_deal_status(
+                        ok = update_pipeline_deal(
                             selected_deal_id,
-                            stage,
-                            probability_pct,
+                            deal_name=deal_name,
+                            customer_name=customer_name,
+                            value_total=value_total,
+                            probability_pct=probability_pct,
+                            stage=stage,
+                            start_month=start_month_input,
+                            end_month=None,
+                            commentary=commentary,
+                            contract_months=contract_months,
                         )
+
                         if ok:
                             st.success("Deal updated.")
                         else:
@@ -3153,6 +3586,18 @@ def page_sales_deals():
                 )
                 st.dataframe(table_view, width="stretch")
 
+
+    st.markdown("### 🧠 Revenue confidence (next 90 days)")
+    confidence_lines = []
+    if next_3_rev <= 0:
+        confidence_lines.append("No recognised revenue in the next 3 months → **high risk**. Pull forward deals or reduce burn.")
+    else:
+        confidence_lines.append(f"Recognised revenue next 3 months: **{currency_symbol}{next_3_rev:,.0f}**.")
+
+    # Optional: compare to payroll/burn later if you want
+    st.info("\n".join([f"• {l}" for l in confidence_lines]))
+
+
     # ---------- Revenue recognition engine output ----------
     st.markdown("---")
     st.subheader("📆 Revenue recognition over time (by method)")
@@ -3353,47 +3798,83 @@ def create_pipeline_deal(
     except Exception as e:
         print("Error creating deal:", e)
         return False
-
-
-
-
-def update_pipeline_deal_status(
-    deal_id: int,
-    new_stage: str,
-    new_probability_pct: float | int,
+    
+def update_pipeline_deal(
+    deal_id,
+    deal_name=None,
+    customer_name=None,
+    value_total=None,
+    probability_pct=None,
+    stage=None,
+    start_month=None,
+    end_month=None,
+    commentary=None,
+    method=None,
+    contract_months=None,
 ):
-    """
-    Update a pipeline deal's stage and probability.
-    Also keeps is_won / is_lost flags in sync.
-    """
-    if not deal_id:
-        return False
-
-    stage = (new_stage or "").lower()
-
-    # Auto-set probability for won/lost
-    if stage == "closed_won":
-        prob = 100.0
-    elif stage == "closed_lost":
-        prob = 0.0
-    else:
-        prob = float(new_probability_pct or 0.0)
-
-    data = {
-        "stage": stage,
-        "probability_pct": prob,
-        "is_won": stage == "closed_won",
-        "is_lost": stage == "closed_lost",
-    }
-
     try:
-        supabase.table("revenue_pipeline").update(data).eq("id", deal_id).execute()
-        # 🔄 Invalidate cached data so pipeline + charts refresh immediately
-        st.cache_data.clear()
+        payload = {}
+
+        def _to_month_iso(d):
+            dt = pd.to_datetime(d, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return dt.to_period("M").to_timestamp().date().isoformat()
+
+        if deal_name is not None:
+            payload["deal_name"] = str(deal_name).strip()
+
+        if customer_name is not None:
+            payload["customer_name"] = str(customer_name).strip()
+
+        if value_total is not None:
+            payload["value_total"] = float(value_total)
+
+        if probability_pct is not None:
+            payload["probability_pct"] = float(probability_pct)
+
+        if stage is not None:
+            stage_norm = str(stage).lower()
+            payload["stage"] = stage_norm
+
+            # enforce rules
+            if stage_norm == "closed_won":
+                payload["probability_pct"] = 100.0
+            elif stage_norm == "closed_lost":
+                payload["probability_pct"] = 0.0
+
+        if start_month is not None:
+            payload["start_month"] = _to_month_iso(start_month)
+
+        if end_month is not None:
+            payload["end_month"] = _to_month_iso(end_month)
+
+        if commentary is not None:
+            payload["commentary"] = str(commentary)
+
+        if method is not None:
+            payload["method"] = str(method)
+
+        if contract_months is not None:
+            payload["contract_months"] = int(contract_months)
+
+        # Nothing to update
+        if not payload:
+            return True
+
+        res = (
+            supabase.table("revenue_pipeline")   # ✅ FIXED TABLE NAME
+            .update(payload)
+            .eq("id", deal_id)
+            .execute()
+        )
+
         return True
+
     except Exception as e:
-        print("Error updating pipeline deal:", e)
+        print(f"[ERROR] update_pipeline_deal failed: {type(e).__name__}: {e}")
         return False
+
 
 # ---------------------------------------------------------
 # Investing & Financing flows – simple fetch helpers
@@ -6772,6 +7253,95 @@ def render_quick_scenario_block_for_overview():
         st.altair_chart(cash_chart.interactive(), width="stretch")
 
 
+
+def _safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _compute_health_verdict(
+    runway_months: float | None,
+    cash_balance: float | None,
+    money_in: float | None,
+    money_out: float | None,
+    active_alerts: list | None,
+):
+    """
+    Returns: (status, headline, message)
+    status: "good" | "warn" | "risk"
+    """
+    runway = _safe_float(runway_months, default=None) if runway_months is not None else None
+    cash = _safe_float(cash_balance, default=None) if cash_balance is not None else None
+    rev = _safe_float(money_in, 0.0)
+    burn = _safe_float(money_out, 0.0)
+
+    # alert severity count
+    critical = 0
+    high = 0
+    if active_alerts:
+        for a in active_alerts:
+            sev = str(a.get("severity", "")).lower()
+            if sev == "critical":
+                critical += 1
+            elif sev == "high":
+                high += 1
+
+    # Basic health logic (simple + founder-friendly)
+    if runway is not None and runway <= 2.0:
+        status = "risk"
+        headline = "🔴 Business health: At risk"
+        msg = "Runway is very tight. You should act immediately on cash preservation and start funding prep now."
+        return status, headline, msg
+
+    if runway is not None and runway <= 4.0:
+        status = "warn"
+        headline = "🟡 Business health: Tight runway"
+        msg = "Cash is stable short-term, but runway is tight. Tighten costs/collections and plan funding early."
+        # If also many severe alerts, escalate tone
+        if critical > 0 or high >= 2:
+            msg = "Runway is tight and risk signals are elevated. Prioritise cash control this month and prepare funding."
+        return status, headline, msg
+
+    # If runway looks fine, but burn > revenue (or revenue is zero), still caution
+    if burn > 0 and rev >= 0 and burn > rev and (runway is None or runway <= 8.0):
+        status = "warn"
+        headline = "🟡 Business health: Watching burn"
+        msg = "Runway is okay for now, but spend is outpacing inflows. Keep burn controlled and improve collections."
+        return status, headline, msg
+
+    status = "good"
+    headline = "🟢 Business health: Stable"
+    msg = "Cash position looks stable in the near term. Focus on efficient growth and keep an eye on upcoming commitments."
+    return status, headline, msg
+
+
+def _compute_recovery_vs_funding_signal(
+    runway_months: float | None,
+    money_in: float | None,
+    money_out: float | None,
+):
+    """
+    Returns: (mode, message)
+    mode: "recover" | "mixed" | "funding"
+    """
+    runway = _safe_float(runway_months, default=None) if runway_months is not None else None
+    rev = _safe_float(money_in, 0.0)
+    burn = _safe_float(money_out, 0.0)
+
+    # Heuristics: founders need a clear fork
+    if runway is not None and runway <= 3.0:
+        return "funding", "Funding likely required unless you can cut burn fast. Start funding prep now (2–3 months lead time)."
+
+    if runway is not None and runway <= 6.0 and burn > rev:
+        return "mixed", "You may recover operationally (reduce burn / speed up collections), but also start light funding prep as a backup."
+
+    return "recover", "You likely can recover through operating levers (collections, costs, pricing) without immediate funding—monitor runway monthly."
+
+
 def page_business_overview():
     top_header("Business at a Glance")
 
@@ -6875,6 +7445,39 @@ def page_business_overview():
         )
         st.caption(expl["runway"])
 
+        # ---------- Health verdict (explicit) ----------
+    # Use engine runway if available, else KPI runway
+    runway_num = None
+    try:
+        runway_num = float(runway_months_val) if runway_months_val not in (None, "—") else None
+    except Exception:
+        runway_num = None
+
+    # Pull numeric cash/rev/burn for verdict
+    cash_num = None
+    if kpis:
+        cash_num = _safe_float(kpis.get("cash_balance"), default=None)
+
+    rev_num = _safe_float(money_in_val, 0.0) if money_in_val != "—" else 0.0
+    burn_num = _safe_float(money_out_val, 0.0) if money_out_val != "—" else 0.0
+
+    # Use alerts list (already fetched later) -> quick fetch here for verdict
+    active_alerts = fetch_alerts_for_client(selected_client_id, only_active=True, limit=50) or []
+
+    status, headline, msg = _compute_health_verdict(
+        runway_months=runway_num,
+        cash_balance=cash_num,
+        money_in=rev_num,
+        money_out=burn_num,
+        active_alerts=active_alerts,
+    )
+
+    if status == "risk":
+        st.error(f"{headline}\n\n{msg}")
+    elif status == "warn":
+        st.warning(f"{headline}\n\n{msg}")
+    else:
+        st.success(f"{headline}\n\n{msg}")
 
     # ---------- Key alerts ----------
     st.markdown("---")
@@ -7124,11 +7727,62 @@ def page_business_overview():
             "compared to net operating cashflow."
         )
 
+        # ------------------------------------------------------------------
+    # Recovery vs Funding signal (clear fork)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("🧭 Recovery vs funding signal")
+
+    mode, signal_msg = _compute_recovery_vs_funding_signal(
+        runway_months=runway_num,
+        money_in=rev_num,
+        money_out=burn_num,
+    )
+
+    if mode == "funding":
+        st.error(f"🔴 {signal_msg}  → Go to **Funding Strategy** page.")
+    elif mode == "mixed":
+        st.warning(f"🟡 {signal_msg}  → Work on recovery + explore **Funding Strategy**.")
+    else:
+        st.info(f"🟢 {signal_msg}  → Focus on operating improvements first.")
+
+
+        # ------------------------------------------------------------------
+    # Ranked next actions (end-of-page action box)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("✅ Ranked next actions (do these first)")
+
+    actions = []
+
+    # 1) If runway tight -> funding prep + cash control
+    if runway_num is not None and runway_num <= 4.0:
+        actions.append("Start funding prep: build your raise plan, timeline, and target amount (Funding Strategy page).")
+        actions.append("Freeze / slow discretionary spend and hiring until runway improves.")
+        actions.append("Aggressively chase overdue AR and pull forward collections (Cash & Bills page).")
+    else:
+        # 2) If burn > revenue -> focus burn discipline + collections
+        if burn_num > rev_num:
+            actions.append("Reduce burn drivers (payroll + vendor commitments). Identify 1–2 cuts that move the needle.")
+            actions.append("Improve collections: tighten terms, follow-ups, incentives for early payment (Cash & Bills page).")
+            actions.append("Review pricing/discounting: ensure growth isn’t destroying cash.")
+        else:
+            actions.append("Keep burn controlled and invest only where ROI is clear (avoid unnecessary fixed commitments).")
+            actions.append("Strengthen collection discipline so AR doesn’t become a hidden cash leak (Cash & Bills page).")
+            actions.append("Run a quick scenario to stress-test the next 90 days (Scenarios section above).")
+
+    # Render top 3 only (keep it sharp)
+    actions = actions[:3]
+    st.markdown("\n".join([f"{i+1}. {a}" for i, a in enumerate(actions)]))
+    st.caption("This list is intentionally short. The goal is focus, not a to-do dump.")
+
+
         # ---------- Quick scenarios (founder-friendly) ----------
     st.markdown("---")
-    st.subheader("🔮 Quick scenarios (play with what-if)")
+    st.subheader("🔮 Recovery Scenarios")
 
     render_quick_scenario_block_for_overview()
+
 
     # ---------- Collaboration layer (comments + tasks) ----------
     st.markdown("---")
@@ -8005,47 +8659,42 @@ def page_team_spending():
         st.info("Select a client from the sidebar to view this page.")
         return
 
-    # Currency (for nicer formatting if you want later)
     currency_code, currency_symbol = get_client_currency(selected_client_id)
 
-    # Dept overspend alerts
     ensure_dept_overspend_alert(selected_client_id, selected_month_start)
 
     # ------------------------------------------------------------------
     # Load core data once
     # ------------------------------------------------------------------
-    with st.spinner("Loading team and department data..."):
+    with st.spinner("Loading team and spending data..."):
         df_positions = fetch_payroll_positions_for_client(selected_client_id)
         df_hiring = fetch_hiring_monthly_for_client(selected_client_id)
-        df_dept = fetch_dept_monthly_for_client(selected_client_id)
+
+        # NOTE: If dept view moved to Budget vs Actuals page, remove this next line
+        # df_dept = fetch_dept_monthly_for_client(selected_client_id)
+
         df_ar_ap = fetch_ar_ap_for_client(selected_client_id)
-        # Pull KPIs so we can get revenue for this month
         kpis = fetch_kpis_for_client_month(selected_client_id, selected_month_start)
 
-    # Unpack AR/AP if tuple
     if isinstance(df_ar_ap, tuple):
         df_ar, df_ap = df_ar_ap
     else:
         df_ar, df_ap = None, None
 
     # ------------------------------------------------------------------
-    # 1) Top KPIs – Payroll vs bills vs headcount vs revenue
+    # Month setup
     # ------------------------------------------------------------------
-    st.subheader("👥 Payroll snapshot for this month")
+    month_ts = pd.to_datetime(selected_month_start)
 
-    # One-month index (selected month)
-    month_index = pd.date_range(
-        start=pd.to_datetime(selected_month_start),
-        periods=1,
-        freq="MS",
-    )
-    month_ts = month_index[0]
-
-    # Payroll for the month
-    payroll_by_month = compute_payroll_by_month(selected_client_id, month_index)
+    # ------------------------------------------------------------------
+    # Payroll (this month)
+    # ------------------------------------------------------------------
+    payroll_by_month = compute_payroll_by_month(selected_client_id, pd.date_range(start=month_ts, periods=1, freq="MS"))
     month_payroll = float(payroll_by_month.get(month_ts, 0.0))
 
-    # Bills (AP) in the same month
+    # ------------------------------------------------------------------
+    # AP (this month)
+    # ------------------------------------------------------------------
     month_ap = 0.0
     if df_ap is not None and not df_ap.empty:
         df_ap = df_ap.copy()
@@ -8058,15 +8707,14 @@ def page_team_spending():
         if pay_col is not None:
             df_ap[pay_col] = pd.to_datetime(df_ap[pay_col], errors="coerce")
             df_ap["bucket_month"] = df_ap[pay_col].dt.to_period("M").dt.to_timestamp()
-
-            month_ap = float(
-                df_ap.loc[df_ap["bucket_month"] == month_ts, "amount"].sum()
-            )
+            month_ap = float(df_ap.loc[df_ap["bucket_month"] == month_ts, "amount"].sum())
 
     total_cash_out = month_payroll + month_ap
     payroll_share = (month_payroll / total_cash_out * 100.0) if total_cash_out else 0.0
 
-    # Revenue (from KPIs) for this month
+    # ------------------------------------------------------------------
+    # Revenue + runway (from KPIs)
+    # ------------------------------------------------------------------
     month_revenue = 0.0
     if kpis:
         try:
@@ -8076,7 +8724,15 @@ def page_team_spending():
 
     payroll_vs_rev_pct = (month_payroll / month_revenue * 100.0) if month_revenue else None
 
-    # Headcount / FTE from payroll positions
+    runway_months = None
+    try:
+        runway_months = float(kpis.get("runway_months")) if kpis else None
+    except Exception:
+        runway_months = None
+
+    # ------------------------------------------------------------------
+    # Headcount / FTE (active this month)
+    # ------------------------------------------------------------------
     headcount_fte = 0.0
     avg_cost_per_fte = 0.0
     if df_positions is not None and not df_positions.empty:
@@ -8084,12 +8740,7 @@ def page_team_spending():
         pos["start_date"] = pd.to_datetime(pos.get("start_date"), errors="coerce")
         pos["end_date"] = pd.to_datetime(pos.get("end_date"), errors="coerce")
 
-        month_start = pd.to_datetime(selected_month_start)
-
-        # Active roles in this month: start <= month_start <= end (or no end)
-        active_mask = (pos["start_date"] <= month_start) & (
-            pos["end_date"].isna() | (pos["end_date"] >= month_start)
-        )
+        active_mask = (pos["start_date"] <= month_ts) & (pos["end_date"].isna() | (pos["end_date"] >= month_ts))
         pos_active = pos[active_mask]
 
         if not pos_active.empty:
@@ -8097,41 +8748,38 @@ def page_team_spending():
             if headcount_fte > 0 and month_payroll > 0:
                 avg_cost_per_fte = month_payroll / headcount_fte
 
-    # KPI row
+    # ------------------------------------------------------------------
+    # Compute payroll delta (next 6 months) BEFORE decision panel
+    # ------------------------------------------------------------------
+    month_index_6 = pd.date_range(start=month_ts, periods=6, freq="MS")
+    payroll_by_month_6 = compute_payroll_by_month(selected_client_id, month_index_6)
+
+    delta_payroll_6m = 0.0
+    if payroll_by_month_6:
+        vals = [float(payroll_by_month_6.get(m, 0.0)) for m in month_index_6]
+        if len(vals) >= 2:
+            delta_payroll_6m = vals[-1] - vals[0]
+
+    # ------------------------------------------------------------------
+    # 1) Top KPIs
+    # ------------------------------------------------------------------
+    st.subheader("👥 Payroll snapshot for this month")
+
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.metric(
-            "Payroll cash this month",
-            f"{currency_symbol}{month_payroll:,.0f}",
-            help="Total payroll cash out for this month from the payroll engine.",
-        )
+        st.metric("Payroll cash this month", f"{currency_symbol}{month_payroll:,.0f}",
+                  help="Total payroll cash out for this month from the payroll engine.")
     with k2:
-        st.metric(
-            "Bills (AP) this month",
-            f"{currency_symbol}{month_ap:,.0f}",
-            help="Supplier bills expected to be paid this month.",
-        )
+        st.metric("Supplier bills (AP) this month", f"{currency_symbol}{month_ap:,.0f}",
+                  help="Supplier bills expected to be paid this month.")
     with k3:
-        st.metric(
-            "Payroll as % of total cash out",
-            f"{payroll_share:.0f}%",
-            help="Payroll divided by (payroll + supplier bills) for this month.",
-        )
+        st.metric("Payroll share of tracked cash-out", f"{payroll_share:.0f}%",
+                  help="Payroll ÷ (Payroll + Supplier bills) for this month.")
     with k4:
-        if payroll_vs_rev_pct is None:
-            st.metric(
-                "Payroll as % of revenue",
-                "—",
-                help="Revenue not available for this month yet.",
-            )
-        else:
-            st.metric(
-                "Payroll as % of revenue",
-                f"{payroll_vs_rev_pct:.0f}%",
-                help="How much of this month's revenue is spent on team costs.",
-            )
+        st.metric("Payroll as % of revenue",
+                  "—" if payroll_vs_rev_pct is None else f"{payroll_vs_rev_pct:.0f}%",
+                  help="How much of this month's revenue is spent on team costs.")
 
-    # Headcount summary as caption under KPI row
     if headcount_fte > 0:
         st.caption(
             f"Active headcount this month: **{headcount_fte:.1f} FTE**  •  "
@@ -8141,188 +8789,113 @@ def page_team_spending():
     st.markdown("---")
 
     # ------------------------------------------------------------------
-    # 2) Team & payroll – left: trends + drilldown, right: role editor
+    # 1b) Decision panel + affordability context (rule-based)
+    # ------------------------------------------------------------------
+    settings = get_client_settings(selected_client_id)
+    runway_min = float(settings.get("runway_min_months", 4.0)) if settings else 4.0
+
+    severity, decisions = build_team_decision_panel(
+        runway_months,
+        runway_min,
+        payroll_vs_rev_pct,
+        delta_payroll_6m,
+    )
+
+    st.markdown("### 🧭 Team decision panel")
+
+    msg = "\n".join([f"• {d}" for d in decisions]) if decisions else "• No decision signals available yet."
+    if severity == "error":
+        st.error(msg)
+    elif severity == "warning":
+        st.warning(msg)
+    else:
+        st.success(msg)
+
+    afford_bits = []
+    if payroll_vs_rev_pct is not None:
+        afford_bits.append(f"Payroll is **{payroll_vs_rev_pct:.0f}% of revenue** this month")
+    if runway_months is not None:
+        afford_bits.append(f"Runway is **{runway_months:.1f} months**")
+    if delta_payroll_6m != 0:
+        direction = "increasing" if delta_payroll_6m > 0 else "decreasing"
+        afford_bits.append(f"Team cost is **{direction}** by ~{currency_symbol}{abs(delta_payroll_6m):,.0f} over 6 months")
+
+    if afford_bits:
+        st.caption(" • ".join(afford_bits))
+
+    # ------------------------------------------------------------------
+    # 2) Team & payroll section
     # ------------------------------------------------------------------
     st.subheader("👥 Team & payroll (drives cashflow engine)")
-
     col_left, col_right = st.columns([2, 1])
 
-    # ---------- LEFT: payroll trend + team drilldown ----------
+    # ---------- LEFT ----------
     with col_left:
-        # Payroll forecast (next 6 months)
         st.markdown("#### Payroll cash-out (next 6 months)")
 
-        month_index_6 = pd.date_range(
-            start=pd.to_datetime(selected_month_start),
-            periods=6,
-            freq="MS",
-        )
-        payroll_by_month_6 = compute_payroll_by_month(selected_client_id, month_index_6)
-
         if payroll_by_month_6:
-            pay_df = pd.DataFrame(
-                {
-                    "month_date": month_index_6,
-                    "Payroll_cash": [
-                        float(payroll_by_month_6.get(m, 0.0)) for m in month_index_6
-                    ],
-                }
-            )
-            pay_df["Month"] = pay_df["month_date"].dt.strftime("%b %Y")
+            pay_df = pd.DataFrame({
+                "month_date": month_index_6,
+                "Payroll_cash": [float(payroll_by_month_6.get(m, 0.0)) for m in month_index_6],
+            })
 
             chart = (
                 alt.Chart(pay_df)
                 .mark_line()
                 .encode(
-                    x=alt.X(
-                        "month_date:T",
-                        title="Month",
-                        axis=alt.Axis(format="%b %Y"),
-                    ),
-                    y=alt.Y(
-                        "Payroll_cash:Q",
-                        title=f"Payroll cash-out ({currency_code})",
-                    ),
+                    x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
+                    y=alt.Y("Payroll_cash:Q", title=f"Payroll cash-out ({currency_code})"),
                     tooltip=[
                         alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                        alt.Tooltip(
-                            "Payroll_cash:Q",
-                            title="Payroll cash",
-                            format=",.0f",
-                        ),
+                        alt.Tooltip("Payroll_cash:Q", title="Payroll cash", format=",.0f"),
                     ],
                 )
             )
             st.altair_chart(chart.interactive(), width="stretch")
 
-            # ---------- Explanation: why payroll is changing ----------
-            first_val = float(pay_df["Payroll_cash"].iloc[0])
-            last_val = float(pay_df["Payroll_cash"].iloc[-1])
-            delta_payroll = last_val - first_val
+            month_label = month_ts.strftime("%b %Y")
+            story_lines, action_lines = build_team_spending_story(
+                currency_symbol, month_label,
+                month_payroll, month_ap, payroll_share, payroll_vs_rev_pct,
+                delta_payroll_6m
+            )
 
-            window_start = pay_df["month_date"].iloc[0]
-            window_end = pay_df["month_date"].iloc[-1]
-
-            expl_lines = []
-
-            # High-level movement
-            if delta_payroll > 0:
-                expl_lines.append(
-                    f"- Payroll increased by **{currency_symbol}{delta_payroll:,.0f}** "
-                    f"between **{window_start.strftime('%b %Y')}** and **{window_end.strftime('%b %Y')}**."
-                )
-            elif delta_payroll < 0:
-                expl_lines.append(
-                    f"- Payroll decreased by **{currency_symbol}{abs(delta_payroll):,.0f}** "
-                    f"between **{window_start.strftime('%b %Y')}** and **{window_end.strftime('%b %Y')}**."
-                )
-            else:
-                expl_lines.append(
-                    "- Payroll is broadly flat over the next 6 months."
-                )
-
-            # Role-driven drivers (new + ended roles in the window)
-            if df_positions is not None and not df_positions.empty:
-                pos_trend = df_positions.copy()
-                pos_trend["start_date"] = pd.to_datetime(
-                    pos_trend.get("start_date"), errors="coerce"
-                )
-                pos_trend["end_date"] = pd.to_datetime(
-                    pos_trend.get("end_date"), errors="coerce"
-                )
-
-                new_roles = pos_trend[
-                    (pos_trend["start_date"].notna())
-                    & (pos_trend["start_date"] >= window_start)
-                    & (pos_trend["start_date"] <= window_end)
-                ]
-
-                ended_roles = pos_trend[
-                    (pos_trend["end_date"].notna())
-                    & (pos_trend["end_date"] >= window_start)
-                    & (pos_trend["end_date"] <= window_end)
-                ]
-
-                if not new_roles.empty:
-                    role_names = (
-                        new_roles.get("role_name")
-                        .dropna()
-                        .astype(str)
-                        .unique()
-                        .tolist()
-                    )
-                    role_names = role_names[:3]
-                    joined = ", ".join(role_names)
-                    expl_lines.append(f"- **New roles started** in this window: {joined}.")
-
-                if not ended_roles.empty:
-                    end_names = (
-                        ended_roles.get("role_name")
-                        .dropna()
-                        .astype(str)
-                        .unique()
-                        .tolist()
-                    )
-                    end_names = end_names[:3]
-                    joined_end = ", ".join(end_names)
-                    expl_lines.append(f"- **Roles ended** in this window: {joined_end}.")
-
-            if len(expl_lines) == 1:
-                expl_lines.append(
-                    "- No major changes in start/end dates detected; changes may be from salary or FTE adjustments."
-                )
-
-            st.markdown("#### 🧠 Why this is changing")
-            st.markdown("\n".join(expl_lines))
-
-        else:
-            st.caption("No payroll yet – add roles on the right to see the forecast.")
-
-        st.markdown("#### Team list & roles (drilldown)")
-
-        if df_positions is None or df_positions.empty:
+            st.markdown("### 🧠 What this means (founder view)")
             st.info(
-                "No roles added yet. Add your team on the right to drive payroll in the cashflow engine."
+                "\n".join([f"• {l}" for l in story_lines])
+                + "\n\n**Recommended actions**\n"
+                + "\n".join([f"• {a}" for a in action_lines])
             )
         else:
-            view = df_positions.copy()
-            rename_map = {
-                "role_name": "Role",
-                "employee_name": "Employee",
-                "fte": "FTE",
-                "base_salary_annual": "Base salary (annual)",
-                "super_rate_pct": "Super (%)",
-                "payroll_tax_pct": "Payroll tax (%)",
-                "start_date": "Start date",
-                "end_date": "End date",
-                "notes": "Notes",
-            }
-            cols = [c for c in rename_map.keys() if c in view.columns]
-            view = view[cols].rename(columns=rename_map)
+            st.caption("No payroll forecast yet — add roles on the right to populate this chart.")
 
-            with st.expander("View detailed team list", expanded=False):
-                filter_text = st.text_input(
-                    "Filter by role or employee",
-                    value="",
-                    key="team_filter",
-                )
-                if filter_text:
-                    ft = filter_text.lower()
-                    mask = (
-                        view["Role"].astype(str).str.lower().str.contains(ft)
-                        | view["Employee"].astype(str).str.lower().str.contains(ft)
-                    )
-                    view_filtered = view[mask]
-                else:
-                    view_filtered = view
+        # Spend mix (labels improved)
+        st.markdown("#### 💸 Spend mix this month (cash basis)")
+        mix_df = pd.DataFrame({
+            "Spend category": ["Payroll (team)", "Supplier bills (AP)"],
+            "Cash out": [month_payroll, month_ap],
+        }).set_index("Spend category")
 
-                st.dataframe(view_filtered, width="stretch")
-                st.caption(
-                    "These roles feed your payroll cash-out in the core cashflow engine "
-                    "and the 'Payroll vs bills vs Net operating cash' chart."
-                )
+        st.bar_chart(mix_df)
 
-    # ---------- RIGHT: Add / edit / delete role panel ----------
+        st.caption(
+            "Cash basis = money leaving the bank this month for payroll + supplier bills. "
+            "This is not a full P&L."
+        )
+
+        # Data checks
+        warnings = []
+        if month_revenue == 0 and month_payroll > 0:
+            warnings.append("Revenue is 0/blank for this month. Payroll % of revenue may be misleading.")
+        if (df_positions is None or df_positions.empty) and month_payroll > 0:
+            warnings.append("Payroll shows spend but no roles exist in Team list. Check payroll engine inputs.")
+        if df_ap is None or df_ap.empty:
+            warnings.append("No AP bills found. If you pay suppliers, add AP invoices to improve accuracy.")
+
+        if warnings:
+            st.warning("**Data checks**\n" + "\n".join([f"• {w}" for w in warnings]))
+
+    # ---------- RIGHT (keep your existing role editor exactly) ----------
     with col_right:
         st.markdown("#### ➕ Add or update a role")
 
@@ -8469,126 +9042,10 @@ def page_team_spending():
                     else:
                         st.error("Could not delete that role.")
 
-    # ------------------------------------------------------------------
-    # 3) Department spend vs plan
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("🏢 Department spend vs plan")
 
-    if df_dept is None or df_dept.empty:
-        st.info("No department budget/actuals yet for this business.")
-    else:
-        budget_col = None
-        actual_col = None
-
-        for cand in ["budget_total", "budget", "budget_opex_total"]:
-            if cand in df_dept.columns:
-                budget_col = cand
-                break
-
-        for cand in ["actual_total", "actual", "actual_opex_total"]:
-            if cand in df_dept.columns:
-                actual_col = cand
-                break
-
-        if budget_col is None or actual_col is None or "department" not in df_dept.columns:
-            st.error(
-                "dept_monthly is missing expected columns (department, budget_*, actual_*). "
-                "Please check the table structure."
-            )
-        else:
-            if "month_date" in df_dept.columns and selected_month_start is not None:
-                df_dept["month_date"] = pd.to_datetime(df_dept["month_date"], errors="coerce")
-                df_dept_month = df_dept[
-                    df_dept["month_date"]
-                    == pd.to_datetime(selected_month_start)
-                ]
-                if df_dept_month.empty:
-                    latest = df_dept["month_date"].max()
-                    df_dept_month = df_dept[df_dept["month_date"] == latest]
-            else:
-                df_dept_month = df_dept.copy()
-
-            dept_view = (
-                df_dept_month
-                .groupby("department", as_index=False)
-                .agg(
-                    {
-                        budget_col: "sum",
-                        actual_col: "sum",
-                    }
-                )
-            )
-
-            dept_view = dept_view.rename(
-                columns={
-                    "department": "Department",
-                    budget_col: "Plan",
-                    actual_col: "Actual",
-                }
-            )
-            dept_view["Variance"] = dept_view["Actual"] - dept_view["Plan"]
-            dept_view["Variance %"] = dept_view.apply(
-                lambda row: (row["Variance"] / row["Plan"] * 100) if row["Plan"] else 0,
-                axis=1,
-            )
-
-            st.dataframe(dept_view, width="stretch")
-            st.caption("Plan vs actual by department (selected / latest month)")
-
-            chart_df = dept_view.set_index("Department")[["Plan", "Actual"]]
-            st.bar_chart(chart_df)
 
     # ------------------------------------------------------------------
-    # 4) Internal CSV uploads (test only)
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    with st.expander("🧪 Upload test data (internal only)", expanded=False):
-        st.caption(
-            "Use this to quickly upload test data for this business. "
-            "CSV columns must match the Supabase table columns (except client_id)."
-        )
-
-        col_u1, col_u2 = st.columns(2)
-
-        with col_u1:
-            st.markdown("**Upload hiring_monthly CSV**")
-            hiring_csv = st.file_uploader(
-                "Select CSV for hiring_monthly",
-                type=["csv"],
-                key="hiring_monthly_csv",
-            )
-            if hiring_csv is not None:
-                if st.button("Upload to hiring_monthly", key="upload_hiring_monthly"):
-                    ok, msg = upload_csv_to_table_for_client(
-                        selected_client_id, hiring_csv, "hiring_monthly"
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-        with col_u2:
-            st.markdown("**Upload dept_monthly CSV**")
-            dept_csv = st.file_uploader(
-                "Select CSV for dept_monthly",
-                type=["csv"],
-                key="dept_monthly_csv",
-            )
-            if dept_csv is not None:
-                if st.button("Upload to dept_monthly", key="upload_dept_monthly"):
-                    ok, msg = upload_csv_to_table_for_client(
-                        selected_client_id, dept_csv, "dept_monthly"
-                    )
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-    # ------------------------------------------------------------------
-    # 5) Collaboration: comments + tasks (bottom-right)
+    # 5) Collaboration: comments + tasks
     # ------------------------------------------------------------------
     st.markdown("---")
     col_comments, col_tasks = st.columns([3, 1])
@@ -8599,6 +9056,82 @@ def page_team_spending():
     with col_tasks:
         with st.expander("✅ Tasks for this page", expanded=False):
             tasks_block("team_spending")
+
+
+
+def build_team_decision_panel(
+    runway_months: float | None,
+    runway_min: float | None,
+    payroll_vs_rev_pct: float | None,
+    delta_payroll_6m: float,
+):
+    decisions = []
+    severity = "info"  # info / warning / error
+
+    # Runway rule
+    if runway_months is not None and runway_min is not None:
+        if runway_months < runway_min:
+            decisions.append(
+                f"Runway is **{runway_months:.1f} months**, below your safety threshold "
+                f"of **{runway_min:.1f} months**."
+            )
+            decisions.append("Hiring freeze recommended until runway improves.")
+            severity = "error"
+
+    # Payroll vs revenue rule
+    if payroll_vs_rev_pct is not None:
+        if payroll_vs_rev_pct > 100:
+            decisions.append(
+                f"Payroll is **{payroll_vs_rev_pct:.0f}% of revenue**, which is not sustainable "
+                f"without near-term revenue growth."
+            )
+            severity = max(severity, "warning")
+
+    # Forward cost rule
+    if delta_payroll_6m > 0:
+        decisions.append(
+            f"Payroll is expected to increase by **${delta_payroll_6m:,.0f}** over the next 6 months."
+        )
+
+    if not decisions:
+        decisions.append(
+            "Team cost is currently aligned with runway and revenue assumptions."
+        )
+
+    return severity, decisions
+
+def build_team_spending_story(currency_symbol, month_label, month_payroll, month_ap, payroll_share, payroll_vs_rev_pct, delta_payroll_6m):
+    lines = []
+    lines.append(f"Payroll is {currency_symbol}{month_payroll:,.0f} in {month_label}.")
+    if month_ap > 0:
+        lines.append(f"Supplier bills expected this month are {currency_symbol}{month_ap:,.0f}.")
+    lines.append(f"Payroll is {payroll_share:.0f}% of tracked cash-out on this page.")
+
+    if payroll_vs_rev_pct is None:
+        lines.append("Revenue for this month is not available yet, so payroll-to-revenue can’t be assessed.")
+    else:
+        if payroll_vs_rev_pct >= 150:
+            lines.append(f"Payroll is {payroll_vs_rev_pct:.0f}% of revenue → **high burn risk** unless revenue ramps fast.")
+        elif payroll_vs_rev_pct >= 80:
+            lines.append(f"Payroll is {payroll_vs_rev_pct:.0f}% of revenue → monitor hiring pace and collections closely.")
+        else:
+            lines.append(f"Payroll is {payroll_vs_rev_pct:.0f}% of revenue → broadly healthy for an early-stage team (context matters).")
+
+    # Forward trend
+    if delta_payroll_6m > 0:
+        lines.append(f"Forward view: payroll rises by {currency_symbol}{delta_payroll_6m:,.0f} over the next 6 months (new roles / raises / FTE changes).")
+    elif delta_payroll_6m < 0:
+        lines.append(f"Forward view: payroll falls by {currency_symbol}{abs(delta_payroll_6m):,.0f} over the next 6 months (roles ending / cost reduction).")
+    else:
+        lines.append("Forward view: payroll is broadly flat over the next 6 months.")
+
+    # Actions
+    actions = [
+        "Confirm every planned role maps to a revenue milestone or delivery deadline.",
+        "If runway is tight: pause non-critical hiring and review contractors.",
+        "Check role end-dates and FTE assumptions are accurate (these drive the cash engine).",
+    ]
+    return lines, actions
 
 
 @st.cache_data(ttl=60)
@@ -8893,10 +9426,11 @@ def page_cash_bills():
     k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric(
-            "Cash in bank (approx)",
+            "Projected opening cash (week 1)",
             cash_now_label,
-            help="Approximate opening cash for the current week from your cashflow engine.",
+            help="Opening cash implied by week 1 of the 14-week cashflow projection (not a live bank feed).",
         )
+
     with k2:
         st.metric(
             "Invoices to collect (next 4 weeks)",
@@ -8915,6 +9449,52 @@ def page_cash_bills():
             f"{currency_symbol}{net_4w:,.0f}",
             help="Invoices due in minus bills due out over the next 28 days.",
         )
+    # ------------------------------------------------------------------
+    # Cash danger summary strip (from 14-week view)
+    # ------------------------------------------------------------------
+    st.markdown("### 🚨 Cash danger summary (next 14 weeks)")
+
+    if week_df is None or week_df.empty or "closing_cash" not in week_df.columns:
+        st.info("14-week cashflow not available yet to assess cash risk.")
+    else:
+        w = week_df.copy()
+
+        # Ensure datetime
+        if "week_start" in w.columns:
+            w["week_start"] = pd.to_datetime(w["week_start"], errors="coerce")
+
+        min_cash = float(w["closing_cash"].min())
+        idx_min = int(w["closing_cash"].idxmin())
+        worst_week = w.loc[idx_min, "week_start"] if "week_start" in w.columns else None
+
+        # Optional safety buffer from settings (add later if you want)
+        cash_buffer = float((settings.get("min_cash_buffer") or 0.0))
+
+        gap_to_buffer = max(0.0, cash_buffer - min_cash)
+
+        # Severity label
+        if min_cash <= 0:
+            sev = "error"
+            headline = "Cash goes negative in the next 14 weeks."
+        elif gap_to_buffer > 0:
+            sev = "warning"
+            headline = "Cash stays positive, but falls below your safety buffer."
+        else:
+            sev = "success"
+            headline = "Cash stays above your safety buffer."
+
+        cA, cB, cC, cD = st.columns(4)
+        cA.metric("Lowest projected cash", f"{currency_symbol}{min_cash:,.0f}")
+        cB.metric("Week of lowest cash", worst_week.strftime("%d %b %Y") if worst_week is not None else "—")
+        cC.metric("Safety buffer", f"{currency_symbol}{cash_buffer:,.0f}")
+        cD.metric("Gap to buffer", f"{currency_symbol}{gap_to_buffer:,.0f}")
+
+        if sev == "error":
+            st.error(f"• {headline}")
+        elif sev == "warning":
+            st.warning(f"• {headline}")
+        else:
+            st.success(f"• {headline}")
 
     # Short caption for overdue situation
     overdue_bits = []
@@ -9325,6 +9905,39 @@ def page_cash_bills():
             )
 
         st.markdown("\n".join(lines))
+    # ------------------------------------------------------------------
+    # Action box (Founder next steps)
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("✅ Action plan (next 7 days)")
+
+    actions = []
+
+    # 1) Cash risk actions from 14-week view
+    if week_df is not None and not week_df.empty and "closing_cash" in week_df.columns:
+        min_cash = float(week_df["closing_cash"].min())
+        if min_cash <= 0:
+            actions.append("Trigger cash protection mode: freeze non-essential spend and re-check payroll + supplier schedule.")
+            actions.append("Pull forward collections: chase overdue AR and ask top customers to pay early.")
+            actions.append("Prepare funding path: bridge loan / investor update / overdraft discussions this week.")
+        elif min_cash < 50_000:  # you can replace with settings buffer later
+            actions.append("Cash is tight: renegotiate payment timing for non-critical AP and tighten AR follow-ups.")
+
+    # 2) AR actions
+    if ar_overdue_amt > 0:
+        actions.append(f"Chase overdue customer invoices totaling **{currency_symbol}{ar_overdue_amt:,.0f}** (prioritise top 3 by value).")
+    elif ar_next_4w > 0:
+        actions.append(f"Confirm expected receipts of **{currency_symbol}{ar_next_4w:,.0f}** due in the next 4 weeks (lock in payment dates).")
+
+    # 3) AP actions
+    if ap_next_4w > 0:
+        actions.append(f"Review supplier bills of **{currency_symbol}{ap_next_4w:,.0f}** due in next 4 weeks and delay non-critical payments if needed.")
+
+    # 4) If there are no actions (very rare)
+    if not actions:
+        actions.append("No immediate cash risks detected. Keep AR current and avoid unplanned spending.")
+
+    st.info("\n".join([f"• {a}" for a in actions]))
 
     # ------------------------------------------------------------------
     # 5) Collaboration: comments + tasks (bottom-right)
