@@ -70,6 +70,60 @@ def save_scenario_for_client(
         print("Error saving scenario:", e)
         return False
 
+def _download_csv_template(filename: str, df_template: pd.DataFrame):
+    csv = df_template.to_csv(index=False)
+    st.download_button(
+        label=f"⬇️ Download {filename}",
+        data=csv,
+        file_name=filename,
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+def _read_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    # robust csv reader (handles Excel-export csv)
+    raw = uploaded_file.read()
+    return pd.read_csv(io.BytesIO(raw))
+
+def _normalize_dates(df: pd.DataFrame, date_cols: list[str]):
+    for c in date_cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
+    return df
+
+def _normalize_month_start(df: pd.DataFrame, col: str):
+    # converts to first of month date
+    if col in df.columns:
+        dt = pd.to_datetime(df[col], errors="coerce")
+        df[col] = dt.dt.to_period("M").dt.to_timestamp().dt.date
+    return df
+
+def _require_columns(df: pd.DataFrame, required: list[str]):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+def _keep_columns(df: pd.DataFrame, allowed: list[str]):
+    # keep only known columns; ignore extras safely
+    keep = [c for c in allowed if c in df.columns]
+    return df[keep].copy()
+
+def _clean_empty_rows(df: pd.DataFrame):
+    # drop completely empty rows
+    df = df.dropna(how="all")
+    # strip string columns
+    for c in df.columns:
+        if pd.api.types.is_object_dtype(df[c]):
+            df[c] = df[c].astype(str).str.strip()
+            df.loc[df[c].isin(["", "nan", "None"]), c] = None
+    return df
+
+def _supabase_upsert_rows(table: str, rows: list[dict]):
+    # assumes you have global `supabase`
+    if not rows:
+        return
+    supabase.table(table).upsert(rows).execute()
+
 
 def fetch_scenario_by_id(scenario_id: int):
     """Get a single scenario by numeric ID."""
@@ -173,6 +227,122 @@ def fetch_financing_flows_for_client(client_id) -> pd.DataFrame:
     return df
 
 
+UPLOAD_SPECS = {
+    "payroll_positions": {
+        "label": "🧩 Payroll / Employees",
+        "required": ["role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
+        "allowed": ["client_id", "role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
+        "date_cols": ["start_date", "end_date"],
+        "month_cols": [],
+        "template": pd.DataFrame([{
+            "role_name": "Account Executive",
+            "employee_name": "Jane Doe",
+            "fte": 1.0,
+            "base_salary": 90000,
+            "super_rate_pct": 11.0,
+            "payroll_tax_pct": 4.75,
+            "start_date": "2025-12-01",
+            "end_date": ""
+        }])
+    },
+
+    "ar_ap_tracker": {
+        "label": "🧩 Accounts Receivable / Accounts Payable",
+        "required": ["type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "status"],
+        "allowed": ["client_id", "type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "partially_paid_amount", "status", "alert"],
+        "date_cols": ["issue_date", "due_date"],
+        "month_cols": [],
+        "template": pd.DataFrame([{
+            "type": "AR",
+            "counterparty": "Acme Pty Ltd",
+            "invoice_number": "INV-1001",
+            "amount": 12000,
+            "currency": "AUD",
+            "issue_date": "2025-12-01",
+            "due_date": "2025-12-31",
+            "expected_payment_days": 30,
+            "partially_paid": False,
+            "partially_paid_amount": 0,
+            "status": "unpaid",
+            "alert": ""
+        }])
+    },
+
+    "revenue_pipeline": {
+        "label": "🧩 Deals / Pipeline",
+        "required": ["deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month", "is_won", "is_lost"],
+        "allowed": ["client_id", "deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month",
+                    "milestone_schedule", "commentary", "is_won", "is_lost", "contract_months", "created", "updated"],
+        "date_cols": [],
+        "month_cols": ["start_month", "end_month"],
+        "template": pd.DataFrame([{
+            "deal_name": "Enterprise Plan - Acme",
+            "customer_name": "Acme Pty Ltd",
+            "value": 60000,
+            "currency": "AUD",
+            "probability": 0.6,
+            "method": "saas",
+            "start_month": "2026-01-01",
+            "end_month": "2026-12-01",
+            "milestone_schedule": "",
+            "commentary": "In procurement review",
+            "is_won": False,
+            "is_lost": False,
+            "contract_months": 12
+        }])
+    },
+
+    "investing_flows": {
+        "label": "🧩 Investing Flows (CAPEX)",
+        "required": ["month_date", "amount", "category"],
+        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
+        "date_cols": [],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2026-02-01",
+            "amount": 15000,
+            "category": "Capex",
+            "notes": "Laptops + equipment"
+        }])
+    },
+
+    "financing_flows": {
+        "label": "🧩 Financing Flows",
+        "required": ["month_date", "amount", "category"],
+        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
+        "date_cols": [],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2026-02-01",
+            "amount": 250000,
+            "category": "Equity raise",
+            "notes": "Seed top-up"
+        }])
+    },
+
+    "opex_entries": {
+        "label": "🧩 Operating Flow (Opex entries)",
+        "required": ["month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring"],
+        "allowed": ["client_id", "month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring",
+                    "recurrence_pattern", "recurrence_end_date", "paid_from_account", "created_at"],
+        "date_cols": ["recurrence_end_date", "created_at"],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2025-12-01",
+            "category": "Software",
+            "subcategory": "Subscriptions",
+            "description": "AWS",
+            "cash_out": 3000,
+            "cash_in": 0,
+            "is_recurring": True,
+            "recurrence_pattern": "monthly",
+            "recurrence_end_date": "",
+            "paid_from_account": "Main"
+        }])
+    },
+}
+
+
 def page_client_settings():
     st.title("⚙️ Client Settings")
 
@@ -207,8 +377,9 @@ def page_client_settings():
                 "opening_cash_start": float(opening_cash),
             }
         ).execute()
-        get_client_settings.clear()
         st.success("Opening cash saved.")
+        st.rerun()
+
 
     st.markdown("---")
 
@@ -239,8 +410,9 @@ def page_client_settings():
                 "ap_default_days": int(ap_days),
             }
         ).execute()
-        get_client_settings.clear()
         st.success("AR/AP defaults saved.")
+        st.rerun()
+
 
     st.markdown("---")
 
@@ -280,8 +452,9 @@ def page_client_settings():
                 "overspend_high_pct": float(danger_pct),
             }
         ).execute()
-        get_client_settings.clear()
         st.success("Risk thresholds saved.")
+        st.rerun()
+
 
     st.markdown("---")
 
@@ -302,8 +475,91 @@ def page_client_settings():
                 "revenue_recognition_method": method,
             }
         ).execute()
-        get_client_settings.clear()
+        
         st.success("Revenue recognition method updated.")
+        st.rerun()
+
+
+    # ----------------- Data upload templates -----------------#
+    st.markdown("---")
+    st.subheader("📤 Data upload templates (CSV → Supabase)")
+    st.caption("Download the template, fill it, then upload. We'll validate and upsert into Supabase for this client.")
+
+    for table_name, spec in UPLOAD_SPECS.items():
+        with st.expander(spec["label"], expanded=False):
+
+            left, right = st.columns([1, 2])
+
+            with left:
+                _download_csv_template(f"{table_name}_template.csv", spec["template"])
+
+            with right:
+                uploaded = st.file_uploader(
+                    f"Upload filled template for {table_name}",
+                    type=["csv"],
+                    key=f"uploader_{table_name}",
+                )
+
+            if uploaded is None:
+                continue
+
+            try:
+                df = _read_uploaded_csv(uploaded)
+                df.columns = [c.strip() for c in df.columns]  # normalize header spaces
+                df = _clean_empty_rows(df)
+
+                # Ensure required columns exist
+                _require_columns(df, spec["required"])
+
+                # Add client_id (force correct client)
+                df["client_id"] = str(selected_client_id)
+
+                # Keep only allowed columns (ignore extras)
+                df = _keep_columns(df, spec["allowed"])
+
+                # Date normalization
+                if spec.get("date_cols"):
+                    df = _normalize_dates(df, spec["date_cols"])
+                if spec.get("month_cols"):
+                    for mc in spec["month_cols"]:
+                        df = _normalize_month_start(df, mc)
+
+                # Basic numeric coercion
+                for num_col in ["amount", "value", "cash_out", "cash_in", "fte", "base_salary", "probability",
+                                "super_rate_pct", "payroll_tax_pct", "expected_payment_days", "contract_months"]:
+                    if num_col in df.columns:
+                        df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
+
+                # Boolean coercion
+                for bool_col in ["is_recurring", "is_won", "is_lost", "partially_paid"]:
+                    if bool_col in df.columns:
+                        df[bool_col] = df[bool_col].astype(str).str.lower().map(
+                            {"true": True, "false": False, "1": True, "0": False, "yes": True, "no": False}
+                        )
+
+                # Final sanity: drop rows missing must-have columns
+                df = df.dropna(subset=[c for c in spec["required"] if c != "client_id"], how="any")
+
+                st.write("Preview (first 20 rows):")
+                st.dataframe(df.head(20), width="stretch")
+
+                if st.button(f"✅ Import into {table_name}", key=f"import_{table_name}"):
+                    rows = df.to_dict(orient="records")
+                    _supabase_upsert_rows(table_name, rows)
+                    st.success(f"Imported {len(rows)} rows into {table_name}.")
+
+                    # Clear caches if needed
+                    try:
+                        fetch_cashflow_summary_for_client.clear()
+                    except Exception:
+                        pass
+
+                    st.rerun()
+
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+
 
 # ---------- Helpers (data + utilities) ----------
 
@@ -4010,59 +4266,82 @@ def fetch_ar_ap_for_client(client_id):
 
     return df_ar, df_ap
 
+# ----------AR Aging ----------#
+
+PAID_STATUSES = {"paid", "closed", "settled"}
+
+def _to_date_safe(x):
+    if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+        return None
+    if isinstance(x, date) and not isinstance(x, datetime):
+        return x
+    try:
+        return pd.to_datetime(x, errors="coerce").date()
+    except Exception:
+        return None
+
+def _pick_first(row, candidates):
+    for c in candidates:
+        if c in row and row.get(c) not in (None, "", "nan"):
+            return row.get(c)
+    return None
+
 def add_ar_aging(df_ar: pd.DataFrame, as_of: date, ar_default_days: int) -> pd.DataFrame:
     """
-    Add AR ageing columns to df_ar:
-
-      - expected_date (if missing, recomputed using issued_date + default days, fallback due_date)
-      - days_past_expected  -> days overdue based on expected_date
-      - aging_bucket        -> "0–30", "30–60", "60–90", "90+ days overdue", or "Not due / current"
-      - is_over_default     -> True if days_past_expected > 0 (i.e. beyond default terms)
-
-    Only counts invoices that are not fully paid/closed as overdue.
+    Adds:
+      - expected_date
+      - days_past_expected
+      - aging_bucket
+      - is_over_default
     """
     if df_ar is None or df_ar.empty:
         return df_ar
 
     df = df_ar.copy()
 
-    # Normalise date-like columns to python date objects
-    def _to_date(x):
-        if pd.isna(x):
-            return None
-        if isinstance(x, date) and not isinstance(x, datetime):
-            return x
-        try:
-            return pd.to_datetime(x).date()
-        except Exception:
-            return None
-
-    for col in ["issued_date", "due_date", "expected_date"]:
+    # Normalize common date columns if present
+    for col in ["issue_date", "issued_date", "issue_Date", "due_date", "expected_date"]:
         if col in df.columns:
-            df[col] = df[col].apply(_to_date)
+            df[col] = df[col].apply(_to_date_safe)
 
-    # Recompute expected_date if missing, using the same logic as your overdue function
-    if "expected_date" not in df.columns or df["expected_date"].isna().all():
-        def _compute_expected(row):
-            issued = row.get("issued_date")
-            row_days = row.get("default_receipt_days")
-            try:
-                if issued is not None:
-                    days = row_days if row_days is not None else ar_default_days
-                    return issued + timedelta(days=int(days))
-            except Exception:
-                pass
-            # fallback
-            return row.get("due_date")
-        df["expected_date"] = df.apply(_compute_expected, axis=1)
+    # Normalize status
+    if "status" in df.columns:
+        df["status"] = df["status"].astype(str).str.strip().str.lower()
     else:
-        # At least normalise existing values
-        df["expected_date"] = df["expected_date"].apply(_to_date)
+        df["status"] = ""
 
-    # Helper: determine if status is "paid" or closed
+    # Compute expected_date if missing or mostly empty
+    if "expected_date" not in df.columns:
+        df["expected_date"] = None
+
+    def _compute_expected(row):
+        # If already has expected_date, keep it
+        exp = row.get("expected_date")
+        if exp:
+            return exp
+
+        # Prefer due_date if available (strongest explicit expectation)
+        due = row.get("due_date")
+        if due:
+            return due
+
+        issued = _pick_first(row, ["issue_date", "issued_date", "issue_Date"])
+        if not issued:
+            return None
+
+        # Row-level override days (your schema)
+        row_days = row.get("expected_payment_days", None)
+        try:
+            days = int(row_days) if row_days is not None and not pd.isna(row_days) else int(ar_default_days)
+        except Exception:
+            days = int(ar_default_days)
+
+        return issued + timedelta(days=days)
+
+    df["expected_date"] = df.apply(_compute_expected, axis=1)
+
     def _is_paid(row):
-        status = str(row.get("status", "")).lower()
-        return status in ["paid", "closed", "settled"]
+        return str(row.get("status", "")).strip().lower() in PAID_STATUSES
 
     def _days_past_expected(row):
         if _is_paid(row):
@@ -4070,13 +4349,12 @@ def add_ar_aging(df_ar: pd.DataFrame, as_of: date, ar_default_days: int) -> pd.D
         exp = row.get("expected_date")
         if not exp:
             return 0
-        # as_of is a python date already
-        return (as_of - exp).days
+        d = (as_of - exp).days
+        return d
 
-    df["days_past_expected"] = df.apply(_days_past_expected, axis=1)
+    df["days_past_expected"] = df.apply(_days_past_expected, axis=1).fillna(0).astype(int)
 
     def _bucket(days):
-        # Not overdue yet
         if days <= 0:
             return "Not due / current"
         if days <= 30:
@@ -4088,11 +4366,11 @@ def add_ar_aging(df_ar: pd.DataFrame, as_of: date, ar_default_days: int) -> pd.D
         return "90+ days overdue"
 
     df["aging_bucket"] = df["days_past_expected"].apply(_bucket)
-
-    # Over default terms as soon as it's past expected_date
     df["is_over_default"] = df["days_past_expected"] > 0
 
     return df
+
+
 
 def rebuild_cashflow_summary_for_client(client_id):
     """
@@ -4197,64 +4475,67 @@ def rebuild_cashflow_summary_for_client(client_id):
     except Exception as e:
         return False, f"Failed to upsert cashflow_summary: {e}"
 
-
 def add_ap_aging(df_ap: pd.DataFrame, as_of: date, ap_default_days: int) -> pd.DataFrame:
     """
-    Add AP ageing columns to df_ap:
-
-      - pay_expected_date      -> expected payment date (expected_payment_date, or due_date,
-                                  or issued_date + default days)
-      - days_past_expected     -> days you've gone past that expected payment date
-      - aging_bucket           -> "0–30", "30–60", "60–90", "90+ days overdue", or "Not due / current"
-      - is_over_default        -> True if days_past_expected > 0 (i.e. you are beyond your terms)
-
-    Only counts bills that are not fully paid/closed as overdue.
+    Adds:
+      - pay_expected_date
+      - days_past_expected
+      - aging_bucket
+      - is_over_default
     """
     if df_ap is None or df_ap.empty:
         return df_ap
 
     df = df_ap.copy()
 
-    # Normalise date-like columns to python date objects
-    def _to_date(x):
-        if pd.isna(x):
-            return None
-        if isinstance(x, date) and not isinstance(x, datetime):
-            return x
-        try:
-                return pd.to_datetime(x).date()
-        except Exception:
-            return None
-
-    for col in ["issued_date", "due_date", "expected_payment_date"]:
+    # Normalize date columns
+    for col in ["issue_date", "issued_date", "issue_Date", "due_date", "pay_expected_date", "expected_payment_date"]:
         if col in df.columns:
-            df[col] = df[col].apply(_to_date)
+            df[col] = df[col].apply(_to_date_safe)
 
-    # Compute pay_expected_date priority:
-    # 1) expected_payment_date
-    # 2) due_date
-    # 3) issued_date + default days
-    def _compute_expected(row):
-        if row.get("expected_payment_date"):
-            return row.get("expected_payment_date")
-        if row.get("due_date"):
-            return row.get("due_date")
-        issued = row.get("issued_date")
-        if issued:
-            row_days = row.get("default_payment_days")
-            try:
-                days = row_days if row_days is not None else ap_default_days
-                return issued + timedelta(days=int(days))
-            except Exception:
-                return None
-        return None
+    # Normalize status
+    if "status" in df.columns:
+        df["status"] = df["status"].astype(str).str.strip().str.lower()
+    else:
+        df["status"] = ""
 
-    df["pay_expected_date"] = df.apply(_compute_expected, axis=1)
+    # Ensure pay_expected_date exists
+    if "pay_expected_date" not in df.columns:
+        df["pay_expected_date"] = None
 
-    # Helper: determine if bill is already paid/closed
+    def _compute_pay_expected(row):
+        # If already has pay_expected_date, keep it
+        pe = row.get("pay_expected_date")
+        if pe:
+            return pe
+
+        # If you store an explicit expected_payment_date, use it
+        epd = row.get("expected_payment_date")
+        if epd:
+            return epd
+
+        # Then due_date
+        due = row.get("due_date")
+        if due:
+            return due
+
+        issued = _pick_first(row, ["issue_date", "issued_date", "issue_Date"])
+        if not issued:
+            return None
+
+        # Row-level override days (same column name in your tracker)
+        row_days = row.get("expected_payment_days", None)
+        try:
+            days = int(row_days) if row_days is not None and not pd.isna(row_days) else int(ap_default_days)
+        except Exception:
+            days = int(ap_default_days)
+
+        return issued + timedelta(days=days)
+
+    df["pay_expected_date"] = df.apply(_compute_pay_expected, axis=1)
+
     def _is_paid(row):
-        status = str(row.get("status", "")).lower()
-        return status in ["paid", "closed", "settled"]
+        return str(row.get("status", "")).strip().lower() in PAID_STATUSES
 
     def _days_past_expected(row):
         if _is_paid(row):
@@ -4264,25 +4545,20 @@ def add_ap_aging(df_ap: pd.DataFrame, as_of: date, ap_default_days: int) -> pd.D
             return 0
         return (as_of - exp).days
 
-    df["days_past_expected"] = df.apply(_days_past_expected, axis=1)
+    df["days_past_expected"] = df.apply(_days_past_expected, axis=1).fillna(0).astype(int)
 
-    def _bucket(days):
-        if days <= 0:
-            return "Not due / current"
-        if days <= 30:
-            return "0–30 days overdue"
-        if days <= 60:
-            return "30–60 days overdue"
-        if days <= 90:
-            return "60–90 days overdue"
-        return "90+ days overdue"
+    df["aging_bucket"] = df["days_past_expected"].apply(lambda d: (
+        "Not due / current" if d <= 0 else
+        "0–30 days overdue" if d <= 30 else
+        "30–60 days overdue" if d <= 60 else
+        "60–90 days overdue" if d <= 90 else
+        "90+ days overdue"
+    ))
 
-    df["aging_bucket"] = df["days_past_expected"].apply(_bucket)
-
-    # Over default terms as soon as it's past expected payment date
     df["is_over_default"] = df["days_past_expected"] > 0
 
     return df
+
 
 
 def build_cash_commitments(df_ar: pd.DataFrame, df_ap: pd.DataFrame, limit: int = 7):
@@ -5627,7 +5903,7 @@ def format_money_for_client(client_id: str | None, value) -> str:
     _, symbol = get_client_currency(client_id)
     return f"{symbol}{num:,.0f}"
 
-
+@st.cache_data(show_spinner=False, ttl=300)
 def get_client_settings(client_id: str) -> dict:
     try:
         resp = (
@@ -5641,17 +5917,21 @@ def get_client_settings(client_id: str) -> dict:
     except Exception:
         row = {}
 
-    return {
-        "ar_default_days": int(row.get("ar_default_days", 30)),
-        "ap_default_days": int(row.get("ap_default_days", 30)),
-        "runway_min_months": float(row.get("runway_min_months", 3.0)),
-        "overspend_warn_pct": float(row.get("overspend_warn_pct", 10.0)),
-        "overspend_high_pct": float(row.get("overspend_high_pct", 25.0)),
-        "revenue_recognition_method": row.get("revenue_recognition_method", "instant"),
-        # 👇 NEW: opening cash for engine
-        "opening_cash_start": float(row.get("opening_cash_start", 0.0) or 0.0),
-    }
+    # ✅ pull currency_code from DB (default AUD)
+    currency_code = row.get("currency_code") or "AUD"
 
+    return {
+        "ar_default_days": int(row.get("ar_default_days", 30) or 30),
+        "ap_default_days": int(row.get("ap_default_days", 30) or 30),
+        "runway_min_months": float(row.get("runway_min_months", 3.0) or 3.0),
+        "overspend_warn_pct": float(row.get("overspend_warn_pct", 10.0) or 10.0),
+        "overspend_high_pct": float(row.get("overspend_high_pct", 25.0) or 25.0),
+        "revenue_recognition_method": row.get("revenue_recognition_method", "instant") or "instant",
+        "opening_cash_start": float(row.get("opening_cash_start", 0.0) or 0.0),
+
+        # ✅ add this
+        "currency_code": str(currency_code).upper(),
+    }
 
 
 def save_alert_thresholds(client_id, runway_min_months: float,
@@ -5721,49 +6001,32 @@ def save_revenue_method(client_id, method: str):
     except Exception:
         return False
 
-
-def save_client_settings(
-    client_id,
-    ar_days: int | None = None,
-    ap_days: int | None = None,
-    **extra_fields,
-):
-    """
-    Upsert client settings (AR/AP days + any extra fields such as currency_code).
-    Works with:
-        save_client_settings(client_id, 30, 45)
-        save_client_settings(client_id, currency_code="USD")
-    """
+def save_client_settings(client_id, ar_days=None, ap_days=None, **extra_fields):
     if client_id is None:
         return False
 
-    payload = {
-        "client_id": str(client_id),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
+    payload = {"client_id": str(client_id), "updated_at": datetime.utcnow().isoformat()}
 
-    # Only include AR/AP if provided
     if ar_days is not None:
         payload["ar_default_days"] = int(ar_days)
     if ap_days is not None:
         payload["ap_default_days"] = int(ap_days)
 
-    # Extra fields e.g. currency_code="USD"
     if extra_fields:
         payload.update(extra_fields)
 
     try:
-        supabase.table("client_settings") \
-            .upsert(payload, on_conflict="client_id") \
-            .execute()
+        supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
 
-        # Invalidate cached settings so the UI sees latest values
-        st.cache_data.clear()
+        try:
+            get_client_settings.clear()
+        except Exception:
+            pass
+
         return True
     except Exception as e:
         print("Error in save_client_settings:", e)
         return False
-
 
 
 def render_currency_settings_section(client_id: str) -> None:
@@ -5852,45 +6115,47 @@ def sort_alerts_by_severity(alerts: list[dict]) -> list[dict]:
 
     return sorted(alerts, key=alert_key)
 
-def ensure_overdue_ar_alert(client_id, as_of: date | None = None, min_days_overdue: int = 14):
+def ensure_overdue_ar_alert(client_id, as_of: date | None = None, min_days_overdue: int = 0):
     """
-    Look at overdue AR for this client and create/resolve an 'ar_overdue' alert.
-
-    Logic:
-      - overdue based on expected_date (issued_date + default_receipt_days, fallback due_date)
-      - if any rows with days_overdue > min_days_overdue -> create alert for this month
-      - otherwise resolve existing alerts for this month
+    Create/resolve an 'ar_overdue' alert for the month of `as_of`.
+    Overdue = unpaid invoices with days_past_expected > min_days_overdue
+    where expected_date is derived from:
+      expected_date (if present) else due_date else issue_date + expected_payment_days / client default
     """
     if client_id is None:
         return
-
     if as_of is None:
         as_of = date.today()
 
-    df_overdue = fetch_overdue_ar_for_client(client_id, as_of=as_of)
-    if df_overdue.empty or "expected_date" not in df_overdue.columns:
+    # Pull settings so alert aligns to client rules
+    settings = get_client_settings(client_id) or {}
+    ar_default_days = int(settings.get("ar_default_days", 30))
+
+    # IMPORTANT: use your existing fetch. If this already returns all AR, great.
+    # If it returns only overdue, still fine; we compute expected anyway.
+    df_ar = fetch_ar_for_client(client_id) if "fetch_ar_for_client" in globals() else fetch_overdue_ar_for_client(client_id, as_of=as_of)
+
+    if df_ar is None or df_ar.empty:
         _resolve_ar_alerts_for_month(client_id, as_of)
         return
 
-    df_overdue = df_overdue.copy()
-    # days overdue = today - expected receipt date
-    df_overdue["days_overdue"] = df_overdue["expected_date"].apply(
-        lambda d: (as_of - d).days if pd.notnull(d) else 0
-    )
+    df_ar = add_ar_aging(df_ar, as_of=as_of, ar_default_days=ar_default_days)
 
-    # Keep only invoices seriously overdue
-    df_overdue = df_overdue[df_overdue["days_overdue"] > min_days_overdue]
+    # unpaid + overdue threshold
+    df_ar["status"] = df_ar.get("status", "").astype(str).str.strip().str.lower()
+    unpaid = ~df_ar["status"].isin(list(PAID_STATUSES))
+    overdue = df_ar["days_past_expected"] > int(min_days_overdue)
 
+    df_overdue = df_ar[unpaid & overdue].copy()
     if df_overdue.empty:
         _resolve_ar_alerts_for_month(client_id, as_of)
         return
 
-    # Aggregate stats
-    count_invoices = len(df_overdue)
-    total_amount = float(df_overdue.get("amount", 0).fillna(0).sum())
-    max_days_overdue = int(df_overdue["days_overdue"].max())
+    count_invoices = int(len(df_overdue))
+    total_amount = float(pd.to_numeric(df_overdue.get("amount", 0), errors="coerce").fillna(0).sum())
+    max_days_overdue = int(df_overdue["days_past_expected"].max())
 
-    # Decide severity
+    # Severity
     if max_days_overdue > 60 or total_amount > 100_000:
         severity = "critical"
     elif max_days_overdue > 30 or total_amount > 50_000:
@@ -5900,11 +6165,10 @@ def ensure_overdue_ar_alert(client_id, as_of: date | None = None, min_days_overd
 
     month_start = as_of.replace(day=1)
 
-    # Avoid duplicate active alerts
+    # Prevent duplicate
     try:
         existing = (
-            supabase
-            .table("alerts")
+            supabase.table("alerts")
             .select("id")
             .eq("client_id", str(client_id))
             .eq("alert_type", "ar_overdue")
@@ -5915,11 +6179,12 @@ def ensure_overdue_ar_alert(client_id, as_of: date | None = None, min_days_overd
         if existing.data:
             return
     except Exception:
-        return
+        # if select fails, don't block insert attempt
+        pass
 
     msg = (
-        f"{count_invoices} customer invoice(s) are overdue more than {min_days_overdue} days "
-        f"past their expected date, totalling approx ${total_amount:,.0f}. "
+        f"{count_invoices} customer invoice(s) are overdue more than {int(min_days_overdue)} days "
+        f"past expected receipt date, totalling approx ${total_amount:,.0f}. "
         f"Oldest is about {max_days_overdue} days late."
     )
 
@@ -11321,4 +11586,9 @@ def _safe_pct(numerator, denominator):
 
 def _month_start(d: date) -> date:
     return pd.to_datetime(d).to_period("M").to_timestamp().date()
+
+
+
+
+
 
