@@ -152,25 +152,6 @@ def delete_scenario_by_id(scenario_id: int) -> bool:
         return False
 
 
-def fetch_opex_for_client(client_id) -> pd.DataFrame:
-    supabase = get_supabase_client()
-    resp = (
-        supabase.table("opex_entries")
-        .select("*")
-        .eq("client_id", str(client_id))
-        .execute()
-    )
-    data = resp.data or []
-    if not data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data)
-    if "month_date" in df.columns:
-        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    df["cash_out"] = pd.to_numeric(df.get("cash_out"), errors="coerce").fillna(0.0)
-    df["cash_in"] = pd.to_numeric(df.get("cash_in"), errors="coerce").fillna(0.0)
-    return df
-
-
 def fetch_operating_other_income_for_client(client_id) -> pd.DataFrame:
     supabase = get_supabase_client()
     resp = (
@@ -188,159 +169,6 @@ def fetch_operating_other_income_for_client(client_id) -> pd.DataFrame:
     df["cash_in"] = pd.to_numeric(df.get("cash_in"), errors="coerce").fillna(0.0)
     return df
 
-
-def fetch_investing_flows_for_client(client_id) -> pd.DataFrame:
-    supabase = get_supabase_client()
-    resp = (
-        supabase.table("investing_cash_movements")
-        .select("*")
-        .eq("client_id", str(client_id))
-        .execute()
-    )
-    data = resp.data or []
-    if not data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data)
-    if "month_date" in df.columns:
-        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    df["cash_out"] = pd.to_numeric(df.get("cash_out"), errors="coerce").fillna(0.0)
-    df["cash_in"] = pd.to_numeric(df.get("cash_in"), errors="coerce").fillna(0.0)
-    return df
-
-
-def fetch_financing_flows_for_client(client_id) -> pd.DataFrame:
-    supabase = get_supabase_client()
-    resp = (
-        supabase.table("financing_cash_movements")
-        .select("*")
-        .eq("client_id", str(client_id))
-        .execute()
-    )
-    data = resp.data or []
-    if not data:
-        return pd.DataFrame()
-    df = pd.DataFrame(data)
-    if "month_date" in df.columns:
-        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    df["cash_out"] = pd.to_numeric(df.get("cash_out"), errors="coerce").fillna(0.0)
-    df["cash_in"] = pd.to_numeric(df.get("cash_in"), errors="coerce").fillna(0.0)
-    return df
-
-
-UPLOAD_SPECS = {
-    "payroll_positions": {
-        "label": "🧩 Payroll / Employees",
-        "required": ["role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
-        "allowed": ["client_id", "role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
-        "date_cols": ["start_date", "end_date"],
-        "month_cols": [],
-        "template": pd.DataFrame([{
-            "role_name": "Account Executive",
-            "employee_name": "Jane Doe",
-            "fte": 1.0,
-            "base_salary": 90000,
-            "super_rate_pct": 11.0,
-            "payroll_tax_pct": 4.75,
-            "start_date": "2025-12-01",
-            "end_date": ""
-        }])
-    },
-
-    "ar_ap_tracker": {
-        "label": "🧩 Accounts Receivable / Accounts Payable",
-        "required": ["type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "status"],
-        "allowed": ["client_id", "type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "partially_paid_amount", "status", "alert"],
-        "date_cols": ["issue_date", "due_date"],
-        "month_cols": [],
-        "template": pd.DataFrame([{
-            "type": "AR",
-            "counterparty": "Acme Pty Ltd",
-            "invoice_number": "INV-1001",
-            "amount": 12000,
-            "currency": "AUD",
-            "issue_date": "2025-12-01",
-            "due_date": "2025-12-31",
-            "expected_payment_days": 30,
-            "partially_paid": False,
-            "partially_paid_amount": 0,
-            "status": "unpaid",
-            "alert": ""
-        }])
-    },
-
-    "revenue_pipeline": {
-        "label": "🧩 Deals / Pipeline",
-        "required": ["deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month", "is_won", "is_lost"],
-        "allowed": ["client_id", "deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month",
-                    "milestone_schedule", "commentary", "is_won", "is_lost", "contract_months", "created", "updated"],
-        "date_cols": [],
-        "month_cols": ["start_month", "end_month"],
-        "template": pd.DataFrame([{
-            "deal_name": "Enterprise Plan - Acme",
-            "customer_name": "Acme Pty Ltd",
-            "value": 60000,
-            "currency": "AUD",
-            "probability": 0.6,
-            "method": "saas",
-            "start_month": "2026-01-01",
-            "end_month": "2026-12-01",
-            "milestone_schedule": "",
-            "commentary": "In procurement review",
-            "is_won": False,
-            "is_lost": False,
-            "contract_months": 12
-        }])
-    },
-
-    "investing_flows": {
-        "label": "🧩 Investing Flows (CAPEX)",
-        "required": ["month_date", "amount", "category"],
-        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
-        "date_cols": [],
-        "month_cols": ["month_date"],
-        "template": pd.DataFrame([{
-            "month_date": "2026-02-01",
-            "amount": 15000,
-            "category": "Capex",
-            "notes": "Laptops + equipment"
-        }])
-    },
-
-    "financing_flows": {
-        "label": "🧩 Financing Flows",
-        "required": ["month_date", "amount", "category"],
-        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
-        "date_cols": [],
-        "month_cols": ["month_date"],
-        "template": pd.DataFrame([{
-            "month_date": "2026-02-01",
-            "amount": 250000,
-            "category": "Equity raise",
-            "notes": "Seed top-up"
-        }])
-    },
-
-    "opex_entries": {
-        "label": "🧩 Operating Flow (Opex entries)",
-        "required": ["month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring"],
-        "allowed": ["client_id", "month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring",
-                    "recurrence_pattern", "recurrence_end_date", "paid_from_account", "created_at"],
-        "date_cols": ["recurrence_end_date", "created_at"],
-        "month_cols": ["month_date"],
-        "template": pd.DataFrame([{
-            "month_date": "2025-12-01",
-            "category": "Software",
-            "subcategory": "Subscriptions",
-            "description": "AWS",
-            "cash_out": 3000,
-            "cash_in": 0,
-            "is_recurring": True,
-            "recurrence_pattern": "monthly",
-            "recurrence_end_date": "",
-            "paid_from_account": "Main"
-        }])
-    },
-}
 
 
 def page_client_settings():
@@ -560,6 +388,121 @@ def page_client_settings():
                 st.error(f"Upload failed: {e}")
 
 
+UPLOAD_SPECS = {
+    "payroll_positions": {
+        "label": "🧩 Payroll / Employees",
+        "required": ["role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
+        "allowed": ["client_id", "role_name", "employee_name", "fte", "base_salary", "super_rate_pct", "payroll_tax_pct", "start_date", "end_date"],
+        "date_cols": ["start_date", "end_date"],
+        "month_cols": [],
+        "template": pd.DataFrame([{
+            "role_name": "Account Executive",
+            "employee_name": "Jane Doe",
+            "fte": 1.0,
+            "base_salary": 90000,
+            "super_rate_pct": 11.0,
+            "payroll_tax_pct": 4.75,
+            "start_date": "2025-12-01",
+            "end_date": ""
+        }])
+    },
+
+    "ar_ap_tracker": {
+        "label": "🧩 Accounts Receivable / Accounts Payable",
+        "required": ["type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "status"],
+        "allowed": ["client_id", "type", "counterparty", "invoice_number", "amount", "currency", "issue_date", "due_date", "expected_payment_days", "partially_paid", "partially_paid_amount", "status", "alert"],
+        "date_cols": ["issue_date", "due_date"],
+        "month_cols": [],
+        "template": pd.DataFrame([{
+            "type": "AR",
+            "counterparty": "Acme Pty Ltd",
+            "invoice_number": "INV-1001",
+            "amount": 12000,
+            "currency": "AUD",
+            "issue_date": "2025-12-01",
+            "due_date": "2025-12-31",
+            "expected_payment_days": 30,
+            "partially_paid": False,
+            "partially_paid_amount": 0,
+            "status": "unpaid",
+            "alert": ""
+        }])
+    },
+
+    "revenue_pipeline": {
+        "label": "🧩 Deals / Pipeline",
+        "required": ["deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month", "is_won", "is_lost"],
+        "allowed": ["client_id", "deal_name", "customer_name", "value", "currency", "probability", "method", "start_month", "end_month",
+                    "milestone_schedule", "commentary", "is_won", "is_lost", "contract_months", "created", "updated"],
+        "date_cols": [],
+        "month_cols": ["start_month", "end_month"],
+        "template": pd.DataFrame([{
+            "deal_name": "Enterprise Plan - Acme",
+            "customer_name": "Acme Pty Ltd",
+            "value": 60000,
+            "currency": "AUD",
+            "probability": 0.6,
+            "method": "saas",
+            "start_month": "2026-01-01",
+            "end_month": "2026-12-01",
+            "milestone_schedule": "",
+            "commentary": "In procurement review",
+            "is_won": False,
+            "is_lost": False,
+            "contract_months": 12
+        }])
+    },
+
+    "investing_flows": {
+        "label": "🧩 Investing Flows (CAPEX)",
+        "required": ["month_date", "amount", "category"],
+        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
+        "date_cols": [],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2026-02-01",
+            "amount": 15000,
+            "category": "Capex",
+            "notes": "Laptops + equipment"
+        }])
+    },
+
+    "financing_flows": {
+        "label": "🧩 Financing Flows",
+        "required": ["month_date", "amount", "category"],
+        "allowed": ["client_id", "month_date", "amount", "category", "notes"],
+        "date_cols": [],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2026-02-01",
+            "amount": 250000,
+            "category": "Equity raise",
+            "notes": "Seed top-up"
+        }])
+    },
+
+    "opex_entries": {
+        "label": "🧩 Operating Flow (Opex entries)",
+        "required": ["month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring"],
+        "allowed": ["client_id", "month_date", "category", "subcategory", "description", "cash_out", "cash_in", "is_recurring",
+                    "recurrence_pattern", "recurrence_end_date", "paid_from_account", "created_at"],
+        "date_cols": ["recurrence_end_date", "created_at"],
+        "month_cols": ["month_date"],
+        "template": pd.DataFrame([{
+            "month_date": "2025-12-01",
+            "category": "Software",
+            "subcategory": "Subscriptions",
+            "description": "AWS",
+            "cash_out": 3000,
+            "cash_in": 0,
+            "is_recurring": True,
+            "recurrence_pattern": "monthly",
+            "recurrence_end_date": "",
+            "paid_from_account": "Main"
+        }])
+    },
+}
+
 
 # ---------- Helpers (data + utilities) ----------
 
@@ -650,62 +593,8 @@ def fetch_payroll_positions_for_client(client_id):
 
     return df
 
-def upsert_payroll_position(
-    client_id,
-    position_id,
-    role_name,
-    employee_name,
-    fte,
-    base_salary_annual,
-    super_rate_pct,
-    payroll_tax_pct,
-    start_date,
-    end_date,
-    notes,
-) -> bool:
-    """
-    Insert or update a payroll position row.
-    """
-    if client_id is None:
-        return False
-
-    payload = {
-        "client_id": str(client_id),
-        "role_name": role_name or None,
-        "employee_name": employee_name or None,
-        "fte": float(fte) if fte is not None else 1.0,
-        "base_salary_annual": float(base_salary_annual or 0),
-        "super_rate_pct": float(super_rate_pct or 0),
-        "payroll_tax_pct": float(payroll_tax_pct or 0),
-        "start_date": start_date.isoformat() if start_date else None,
-        "end_date": end_date.isoformat() if end_date else None,
-        "notes": notes or None,
-    }
-
-    try:
-        if position_id is None:
-            supabase.table("payroll_positions").insert(payload).execute()
-        else:
-            supabase.table("payroll_positions").update(payload).eq("id", position_id).execute()
-        return True
-    except Exception as e:
-        print("Error upserting payroll position:", e)
-        return False
-
-
-def delete_payroll_position(position_id) -> bool:
-    if not position_id:
-        return False
-    try:
-        supabase.table("payroll_positions").delete().eq("id", position_id).execute()
-        return True
-    except Exception as e:
-        print("Error deleting payroll position:", e)
-        return False
-
 
 from typing import List, Optional
-import pandas as pd
 
 # -----------------------------------------
 # Central task fetcher for Collaboration Hub
@@ -4168,38 +4057,6 @@ def fetch_investing_flows_for_client(client_id: str) -> pd.DataFrame | None:
     return df
 
 
-def fetch_financing_flows_for_client(client_id: str) -> pd.DataFrame | None:
-    """
-    Read financing_flows for this client.
-
-    Returns:
-        - None  -> Supabase connection problem
-        - empty DataFrame -> call succeeded but no rows
-        - non-empty DataFrame -> valid data
-    """
-    if not client_id:
-        return pd.DataFrame()
-
-    def _call():
-        return (
-            supabase
-            .table("financing_flows")
-            .select("*")
-            .eq("client_id", str(client_id))
-            .execute()
-        )
-
-    resp = sb_execute_with_retry(_call, label="fetch financing_flows")
-    if resp is None:
-        print("[ERROR] fetch_financing_flows_for_client -> connection problem (None)")
-        return None
-
-    data = getattr(resp, "data", None) if hasattr(resp, "data") else resp.get("data")
-    df = pd.DataFrame(data or [])
-    print(f"[DEBUG] fetch_financing_flows_for_client -> {len(df)} rows for {client_id}")
-    return df
-
-
 @st.cache_data(ttl=60)
 def fetch_ar_ap_for_client(client_id):
     """
@@ -5223,8 +5080,6 @@ def recompute_cashflow_from_ar_ap(
         return False
 
 
-
-
 def debug_cashflow_engine(
     client_id,
     base_month: date,
@@ -5426,37 +5281,6 @@ def debug_cashflow_engine(
     return debug_df
 
 
-
-def fetch_investing_flows_for_client(client_id) -> pd.DataFrame:
-    if client_id is None:
-        return pd.DataFrame()
-
-    try:
-        resp = (
-            supabase.table("investing_flows")
-            .select("*")
-            .eq("client_id", str(client_id))
-            .order("month_date", desc=False)
-            .execute()
-        )
-
-        data = getattr(resp, "data", None)
-        if data is None and isinstance(resp, dict):
-            data = resp.get("data", [])
-
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
-        return df
-
-    except Exception as e:
-        print("Error fetching investing_flows:", e)
-        return pd.DataFrame()
-
-
 def fetch_financing_flows_for_client(client_id) -> pd.DataFrame:
     if client_id is None:
         return pd.DataFrame()
@@ -5593,7 +5417,6 @@ def _build_synthetic_cash_curve(base_month: date | None, n_months: int = 12) -> 
     return df
 
 
-from datetime import date, datetime
 
 def compute_runway_and_effective_burn_from_df(
     engine_df: pd.DataFrame,
@@ -9478,17 +9301,30 @@ def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
     )
     payroll_by_month = compute_payroll_by_month(client_id, month_index)
 
-    # 4) Opening cash: use KPI cash_balance for the focus month if possible
+       # 4) Opening cash: priority = client_settings → KPI → default
     opening_cash = None
-    kpi_row = fetch_kpis_for_client_month(client_id, start_date)
-    if kpi_row and "cash_balance" in kpi_row:
+
+    # (a) From client_settings
+    settings = get_client_settings(client_id) or {}
+    if settings.get("opening_cash_start") is not None:
         try:
-            opening_cash = float(kpi_row["cash_balance"])
+            opening_cash = float(settings["opening_cash_start"])
         except Exception:
             opening_cash = None
 
+    # (b) If still None, try KPI cash_balance for focus month
     if opening_cash is None:
-        opening_cash = 120_000.0  # fallback default
+        kpi_row = fetch_kpis_for_client_month(client_id, start_date)
+        if kpi_row and "cash_balance" in kpi_row:
+            try:
+                opening_cash = float(kpi_row["cash_balance"])
+            except Exception:
+                opening_cash = None
+
+    # (c) Final fallback
+    if opening_cash is None:
+        opening_cash = 0.0  # or whatever default you actually want
+
 
     # 5) Build 14 weekly buckets
     week_starts = [start_date + timedelta(weeks=i) for i in range(14)]
