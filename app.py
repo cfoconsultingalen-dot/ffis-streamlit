@@ -10,6 +10,7 @@ import time
 import numpy as np
 import io
 import matplotlib.pyplot as plt
+from pandas.tseries.offsets import MonthEnd
 
 #import Fundtion for Board Reportinf
 from io import BytesIO
@@ -29,7 +30,7 @@ def get_supabase_client():
 
 supabase = get_supabase_client()
 
-st.set_page_config(page_title="FFIS – Founder Financial Intelligence", layout="wide")
+st.set_page_config(page_title="Matfina – Founder Financial Intelligence", layout="wide")
 
 #......Month Seection.......$
 
@@ -113,6 +114,27 @@ def _collect_months_from_table(
             months.add(d)
 
     return months
+
+
+
+def get_focus_month_window(focus_month: date) -> tuple[date, date]:
+    """
+    Given a focus month (any date within the month),
+    return (month_start, month_end) as pure date objects.
+    """
+    if focus_month is None:
+        return None, None
+
+    # Normalise to 1st of month
+    month_start_ts = pd.to_datetime(focus_month).to_period("M").to_timestamp()
+    month_start = month_start_ts.date()
+
+    # Last day of that month
+    month_end_ts = (month_start_ts + pd.offsets.MonthEnd(0))
+    month_end = month_end_ts.date()
+
+    return month_start, month_end
+
 
 def get_client_focus_month_options(client_id: str) -> List[str]:
     """
@@ -1064,6 +1086,7 @@ def parse_month_label_to_date(label: str) -> date:
     """
     return pd.to_datetime(label, format="%b %Y").date().replace(day=1)
 
+
 @st.cache_data(ttl=60)
 def fetch_dept_monthly_for_client(client_id):
     """
@@ -1650,7 +1673,6 @@ def fetch_cashflow_summary_for_client(client_id: str) -> pd.DataFrame | None:
     return df
 
 
-
 def fetch_kpis_for_client_month(
     client_id: str,
     month_date: date | datetime,
@@ -1662,14 +1684,25 @@ def fetch_kpis_for_client_month(
       - AR (cash in)
       - AP + payroll (+ optional opex) (cash out)
       - cashflow_summary (closing cash + runway)
+
     and just RETURN it (no upsert).
+
+    IMPORTANT:
+      - We treat 'month_date' purely as a focus month
+      - Money in/out are for THAT month only
+      - Overdue / ageing is computed as of month END
     """
     if client_id is None or month_date is None:
         return None
 
-    # Normalise to first of month (as date + ISO string)
+    # --- Normalise month + window ---
+    # month_dt is 1st of the focus month
     month_dt = pd.to_datetime(month_date).date().replace(day=1)
     month_iso = month_dt.isoformat()
+
+    # start = 1st, end = last day of that month
+    month_start, month_end = get_focus_month_window(month_dt)
+    base_month_ts = pd.to_datetime(month_start)
 
     # ---------- 1) Try to read from kpi_monthly directly ----------
     try:
@@ -1696,9 +1729,6 @@ def fetch_kpis_for_client_month(
 
     # ---------- 2) Derive KPIs from AR/AP + payroll + engine ----------
     try:
-        base_month_ts = pd.to_datetime(month_dt).replace(day=1)
-        as_of_date = base_month_ts.date()
-
         # Settings + AR/AP
         settings = get_client_settings(client_id) or {}
         ar_days = int(settings.get("ar_default_days", 30))
@@ -1706,38 +1736,64 @@ def fetch_kpis_for_client_month(
 
         df_ar, df_ap = fetch_ar_ap_for_client(client_id)
 
-        # ----- AR: expected cash-in this month -----
+        # ----- AR: expected cash-in THIS MONTH (Money In) -----
         money_in = 0.0
         if df_ar is not None and not df_ar.empty:
             df_ar = df_ar.copy()
-            df_ar = add_ar_aging(df_ar, as_of=as_of_date, ar_default_days=ar_days)
+            # Age as at month END (not start, not today)
+            df_ar = add_ar_aging(df_ar, as_of=month_end, ar_default_days=ar_days)
 
-            df_ar["expected_date"] = pd.to_datetime(df_ar.get("expected_date"), errors="coerce")
-            df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
+            df_ar["expected_date"] = pd.to_datetime(
+                df_ar.get("expected_date"), errors="coerce"
+            )
+            df_ar["amount"] = pd.to_numeric(
+                df_ar.get("amount"), errors="coerce"
+            ).fillna(0.0)
 
+            # Ignore fully paid/closed AR
             if "status" in df_ar.columns:
-                df_ar = df_ar[~df_ar["status"].astype(str).str.lower().isin(["paid", "closed", "settled"])]
+                df_ar = df_ar[
+                    ~df_ar["status"]
+                    .astype(str)
+                    .str.lower()
+                    .isin(["paid", "closed", "settled"])
+                ]
 
+            # Only rows whose expected_date lies in THIS month
             mask_ar = df_ar["expected_date"].dt.to_period("M") == base_month_ts.to_period("M")
             money_in = float(df_ar.loc[mask_ar, "amount"].sum())
 
-        # ----- AP: expected cash-out this month -----
+        # ----- AP: expected cash-out THIS MONTH (Money Out) -----
         ap_cash = 0.0
         if df_ap is not None and not df_ap.empty:
             df_ap = df_ap.copy()
-            df_ap = add_ap_aging(df_ap, as_of=as_of_date, ap_default_days=ap_days)
+            # Age as at month END
+            df_ap = add_ap_aging(df_ap, as_of=month_end, ap_default_days=ap_days)
 
-            # ----- AP bucketing should follow due_date, not expected payment date -----
-            pay_col = "due_date"
+            # Decide which date column we use for "cash out" timing
+            if "pay_expected_date" in df_ap.columns:
+                pay_col = "pay_expected_date"
+            elif "expected_payment_date" in df_ap.columns:
+                pay_col = "expected_payment_date"
+            else:
+                # IMPORTANT: we now use due_date to align with the engine
+                pay_col = "due_date"
+
             df_ap[pay_col] = pd.to_datetime(df_ap.get(pay_col), errors="coerce")
+            df_ap["amount"] = pd.to_numeric(
+                df_ap.get("amount"), errors="coerce"
+            ).fillna(0.0)
 
-
-            df_ap[pay_col] = pd.to_datetime(df_ap.get(pay_col), errors="coerce")
-            df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
-
+            # Ignore already paid AP
             if "status" in df_ap.columns:
-                df_ap = df_ap[~df_ap["status"].astype(str).str.lower().isin(["paid", "closed", "settled"])]
+                df_ap = df_ap[
+                    ~df_ap["status"]
+                    .astype(str)
+                    .str.lower()
+                    .isin(["paid", "closed", "settled"])
+                ]
 
+            # Only rows whose pay date lies in THIS month
             mask_ap = df_ap[pay_col].dt.to_period("M") == base_month_ts.to_period("M")
             ap_cash = float(df_ap.loc[mask_ap, "amount"].sum())
 
@@ -1750,7 +1806,7 @@ def fetch_kpis_for_client_month(
             print("[WARN] compute_payroll_by_month failed:", e)
             payroll_cash = 0.0
 
-        # ----- Optional Opex -----
+        # ----- Optional Opex this month -----
         opex_cash = 0.0
         try:
             df_opex = fetch_opex_for_client(client_id)
@@ -1762,42 +1818,47 @@ def fetch_kpis_for_client_month(
                     .dt.to_timestamp()
                 )
                 mask_ox = df_opex["month_bucket"] == base_month_ts
-                opex_cash = float(pd.to_numeric(df_opex.loc[mask_ox, "amount"], errors="coerce").fillna(0.0).sum())
+                opex_cash = float(
+                    pd.to_numeric(
+                        df_opex.loc[mask_ox, "amount"], errors="coerce"
+                    )
+                    .fillna(0.0)
+                    .sum()
+                )
         except Exception:
             opex_cash = 0.0
 
         money_out = ap_cash + payroll_cash + opex_cash
 
-        # ----- Engine: closing cash + runway -----
+        # ----- Engine: closing cash + runway for THIS month -----
         closing_cash = None
         runway_months = None
         effective_burn = None
 
         engine_df = fetch_cashflow_summary_for_client(client_id)
 
-        if engine_df is None:
-            # connection failure: keep cash/runway as None (don’t fake zeros)
-            pass
-        elif engine_df.empty:
-            # success but no engine rows yet
-            pass
-        else:
+        if engine_df is not None and not engine_df.empty:
             df_eng = engine_df.copy()
-            df_eng["month_date"] = pd.to_datetime(df_eng["month_date"], errors="coerce").dt.date
+            df_eng["month_date"] = pd.to_datetime(
+                df_eng["month_date"], errors="coerce"
+            ).dt.date
             row_eng = df_eng[df_eng["month_date"] == month_dt]
 
             if not row_eng.empty and "closing_cash" in row_eng.columns:
                 closing_cash = float(row_eng["closing_cash"].iloc[0] or 0.0)
 
-            # your runway helper supports focus_month keyword; safe to use
+            # IMPORTANT: runway based on THIS month, not global sidebar
             runway_months, effective_burn = compute_runway_and_effective_burn_from_df(
-            engine_df,
-            selected_month_start,
-        )
+                engine_df,
+                month_dt,   # <= key change here
+            )
 
         kpi_row = {
             "client_id": client_id,
             "month_date": month_iso,
+            # Names used on Business overview:
+            # Money in  -> revenue
+            # Money out -> burn
             "revenue": float(money_in),
             "burn": float(money_out),
             "cash_balance": closing_cash,      # None if engine unavailable
@@ -1814,7 +1875,6 @@ def fetch_kpis_for_client_month(
     except Exception as e:
         print("Error deriving KPIs from cashflow_summary:", e)
         return None
-
 
 
 def fetch_pipeline_for_client(client_id):
@@ -2069,6 +2129,57 @@ def build_expected_revenue_curve(
         }
     )
     return out_df
+
+def get_recognised_revenue_for_month(
+    client_id: str,
+    focus_month: date,
+) -> float:
+    """
+    Return total recognised revenue for the given focus_month
+    using the same schedule logic as page_sales_deals.
+
+    Uses build_revenue_schedule_for_client(...).
+    """
+    if not client_id or focus_month is None:
+        return 0.0
+
+    snap_df = build_revenue_schedule_for_client(
+        client_id,
+        base_month=focus_month,
+        n_months=12,  # same as Sales & Deals
+    )
+
+    if snap_df is None or snap_df.empty:
+        return 0.0
+
+    df = snap_df.copy()
+    df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+    df = df[df["month_date"].notna()]
+
+    # Decide which column holds the recognised revenue
+    value_col = None
+    for cand in ["recognised_revenue", "revenue_amount", "amount"]:
+        if cand in df.columns:
+            value_col = cand
+            break
+
+    if value_col is None:
+        return 0.0
+
+    # Bucket to the first of the focus month
+    focus_start = pd.to_datetime(focus_month).replace(day=1)
+
+    monthly = (
+        df.groupby("month_date", as_index=False)[value_col]
+        .sum()
+        .sort_values("month_date")
+    )
+
+    this_row = monthly[monthly["month_date"] == focus_start]
+    this_rev = float(this_row[value_col].iloc[0]) if not this_row.empty else 0.0
+    return this_rev
+
+
 
 @st.cache_data(ttl=60)
 def build_revenue_schedule_for_client(
@@ -3373,14 +3484,6 @@ def page_investing_financing():
                     else:
                         st.error("Could not save financing flow.")
 
-    # Collaboration layer at bottom
-    st.markdown("---")
-    col_comments, col_tasks = st.columns([3, 1])
-    with col_comments:
-        comments_block("investing_financing")
-    with col_tasks:
-        with st.expander("✅ Tasks for this page", expanded=False):
-            tasks_block("investing_financing")
 
 
 
@@ -4344,14 +4447,6 @@ def page_sales_deals():
             )
             st.altair_chart(chart.interactive(), width="stretch")
 
-    # ---------- Bottom: comments + tasks in right expander ----------
-    st.markdown("---")
-    col_bottom_left, col_bottom_right = st.columns([2, 1])
-    with col_bottom_right:
-        with st.expander("🤝 Team space: comments & actions", expanded=False):
-            comments_block("sales_deals")
-            tasks_block("sales_deals")
-
 
 def create_investing_flow(
     client_id,
@@ -4599,6 +4694,71 @@ def fetch_investing_flows_for_client(client_id: str) -> pd.DataFrame | None:
     df = pd.DataFrame(data or [])
     print(f"[DEBUG] fetch_investing_flows_for_client -> {len(df)} rows for {client_id}")
     return df
+
+PAID_STATUSES = {"paid", "closed", "settled"}
+NON_CASH_STATUSES = {"cancelled", "disputed"}
+
+
+def normalise_ar_ap_for_cash(df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Clean AR/AP rows for cash forecasting:
+
+    - Drop fully paid / closed / settled / cancelled / disputed
+    - Normalise `status` to lowercase
+    - Ensure numeric 'amount' and 'amount_paid'
+    - Compute 'effective_amount' = balance still due:
+        * if partially_paid == True -> amount - amount_paid
+        * otherwise -> amount
+    - Add 'is_cash_relevant' for quick filtering (effective_amount > 0)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    # Normalise status and drop non-cash rows
+    if "status" in out.columns:
+        out["status"] = out["status"].astype(str).str.strip().str.lower()
+        drop_statuses = PAID_STATUSES | NON_CASH_STATUSES
+        out = out[~out["status"].isin(drop_statuses)]
+
+    if out.empty:
+        return out
+
+    # Base amount
+    out["amount"] = pd.to_numeric(out.get("amount"), errors="coerce").fillna(0.0)
+
+    # Amount already paid
+    if "amount_paid" in out.columns:
+        out["amount_paid"] = pd.to_numeric(
+            out.get("amount_paid"), errors="coerce"
+        ).fillna(0.0)
+    else:
+        out["amount_paid"] = 0.0
+
+    # Partially paid flag
+    if "partially_paid" in out.columns:
+        out["partially_paid"] = out["partially_paid"].fillna(False).astype(bool)
+    else:
+        out["partially_paid"] = False
+
+    # Balance still due
+    def _effective(row) -> float:
+        amt = float(row.get("amount") or 0.0)
+        amt_paid = float(row.get("amount_paid") or 0.0)
+        if bool(row.get("partially_paid", False)):
+            return max(0.0, amt - amt_paid)
+        return amt
+
+    out["effective_amount"] = out.apply(_effective, axis=1)
+
+    # No negative balances
+    out["effective_amount"] = out["effective_amount"].clip(lower=0.0)
+
+    # Convenience flag
+    out["is_cash_relevant"] = out["effective_amount"] > 0
+
+    return out
 
 
 @st.cache_data(ttl=60)
@@ -4963,44 +5123,137 @@ def add_ap_aging(df_ap: pd.DataFrame, as_of: date, ap_default_days: int) -> pd.D
 
 
 
-def build_cash_commitments(df_ar: pd.DataFrame, df_ap: pd.DataFrame, limit: int = 7):
-    frames = []
+def build_cash_commitments(
+    df_ar: pd.DataFrame | None,
+    df_ap: pd.DataFrame | None,
+    as_of: date,
+    horizon_days: int = 60,
+    limit: int = 7,
+) -> pd.DataFrame:
+    """
+    Build a short list of upcoming cash commitments around the Focus Month.
 
-    if not df_ar.empty:
-        tmp = df_ar.copy()
+    Rules:
+      - Only UNPAID AR/AP are included
+        (paid / closed / settled / cancelled / disputed are dropped).
+      - Timing is driven by DUE DATE (fallbacks only if due_date missing).
+      - If an item is overdue (original_due < as_of) and still unpaid,
+        we treat it as 'due now' → date = as_of.
+      - Only commitments between as_of and as_of + horizon_days are shown.
+      - Uses 'effective_amount' where available (balance due after partial payments).
+      - Adds:
+          * original_due (original invoice/bill due date)
+          * overdue ("Yes"/"No") based on original_due < as_of
+      - Sorted by date then amount (biggest first on same day).
+    """
+    frames: list[pd.DataFrame] = []
+    horizon_end = as_of + timedelta(days=horizon_days)
+
+    # ---------- AR: cash in ----------
+    ar_norm = normalise_ar_ap_for_cash(df_ar)
+    if ar_norm is not None and not ar_norm.empty:
+        tmp = ar_norm.copy()
         tmp["direction"] = "Cash in"
         tmp["who"] = tmp.get("counterparty", "")
-        tmp["amount"] = tmp.get("amount", 0)
 
-        # Prefer expected_date → expected_payment_date → due_date
-        if "expected_date" in tmp.columns:
-            tmp["date"] = tmp["expected_date"]
+        # Use balance due if present
+        amt_col = "effective_amount" if "effective_amount" in tmp.columns else "amount"
+        tmp["amount"] = pd.to_numeric(tmp.get(amt_col, 0), errors="coerce").fillna(0.0)
+
+        # Use due_date first, else expected_date
+        if "due_date" in tmp.columns:
+            base_dates = tmp["due_date"]
+        elif "expected_date" in tmp.columns:
+            base_dates = tmp["expected_date"]
         else:
-            tmp["date"] = tmp.get("expected_payment_date").fillna(tmp.get("due_date"))
+            base_dates = pd.NaT
 
-        frames.append(tmp[["direction", "who", "amount", "date"]])
+        # Original due = real invoice due
+        tmp["original_due"] = pd.to_datetime(base_dates, errors="coerce").dt.date
 
-    if not df_ap.empty:
-        tmp = df_ap.copy()
+        # Scheduling date used in this commitments grid
+        tmp["date"] = tmp["original_due"]
+
+        # Overdue but unpaid → treat as "due now" in this Focus Month
+        overdue_mask = tmp["original_due"] < as_of
+        tmp.loc[overdue_mask, "date"] = as_of
+
+        # Keep commitments in [as_of, as_of + horizon_days]
+        mask_window = (
+            (tmp["date"] >= as_of) &
+            (tmp["date"] <= horizon_end)
+        )
+        tmp = tmp[mask_window]
+
+        if not tmp.empty:
+            frames.append(
+                tmp[["direction", "who", "amount", "date", "original_due"]]
+            )
+
+    # ---------- AP: cash out ----------
+    ap_norm = normalise_ar_ap_for_cash(df_ap)
+    if ap_norm is not None and not ap_norm.empty:
+        tmp = ap_norm.copy()
         tmp["direction"] = "Cash out"
         tmp["who"] = tmp.get("counterparty", "")
-        tmp["amount"] = tmp.get("amount", 0)
 
-        tmp["date"] = tmp.get("expected_payment_date").fillna(tmp.get("due_date"))
-        frames.append(tmp[["direction", "who", "amount", "date"]])
+        amt_col = "effective_amount" if "effective_amount" in tmp.columns else "amount"
+        tmp["amount"] = pd.to_numeric(tmp.get(amt_col, 0), errors="coerce").fillna(0.0)
 
+        # Use due_date first, then expected_payment_date, then pay_expected_date
+        if "due_date" in tmp.columns:
+            base_dates = tmp["due_date"]
+        elif "expected_payment_date" in tmp.columns:
+            base_dates = tmp["expected_payment_date"]
+        elif "pay_expected_date" in tmp.columns:
+            base_dates = tmp["pay_expected_date"]
+        else:
+            base_dates = pd.NaT
+
+        tmp["original_due"] = pd.to_datetime(base_dates, errors="coerce").dt.date
+        tmp["date"] = tmp["original_due"]
+
+        overdue_mask = tmp["original_due"] < as_of
+        tmp.loc[overdue_mask, "date"] = as_of
+
+        mask_window = (
+            (tmp["date"] >= as_of) &
+            (tmp["date"] <= horizon_end)
+        )
+        tmp = tmp[mask_window]
+
+        if not tmp.empty:
+            frames.append(
+                tmp[["direction", "who", "amount", "date", "original_due"]]
+            )
+
+    # ---------- Combine + Overdue flag ----------
     if not frames:
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # 🔥 FIX: normalise 'date' to Python date objects
+    # Overdue? badge (based on original_due vs as_of)
+    combined["overdue"] = combined["original_due"].apply(
+        lambda d: "Yes" if (pd.notna(d) and d < as_of) else "No"
+    )
+
+    # Normalise to python date for safety
     combined["date"] = pd.to_datetime(combined["date"], errors="coerce").dt.date
 
-    # Now safe to sort
-    combined = combined.sort_values("date", na_position="last").head(limit)
+    # Sort by scheduling date, then amount (largest first on same day)
+    combined = combined.sort_values(
+        by=["date", "amount"],
+        ascending=[True, False],
+        ignore_index=True,
+    )
+
+    # Apply limit
+    combined = combined.head(limit)
 
     return combined
+
+
 
 
 def save_comment(client_id, page_name: str, body: str, month_start: date):
@@ -5933,7 +6186,38 @@ def debug_cashflow_engine(
 
     inv_by_month: dict[pd.Timestamp, float] = {}
     if df_inv is not None and not df_inv.empty:
+        # Keep a copy WITHOUT filtering for fallback
+        orig_df_inv = df_inv.copy()
         df_inv = df_inv.copy()
+
+        # Optional versioning by created_at – but only if it actually works
+        if "created_at" in df_inv.columns:
+            df_inv["created_at"] = pd.to_datetime(
+                df_inv["created_at"], errors="coerce"
+            )
+            # Drop timezone if present
+            try:
+                df_inv["created_at"] = df_inv["created_at"].dt.tz_convert(None)
+            except TypeError:
+                pass  # already naive
+
+            before_len = len(df_inv)
+            df_inv = df_inv[df_inv["created_at"] <= as_of_cutoff]
+            after_len = len(df_inv)
+            print(
+                f"[DEBUG] investing_flows created_at filter: "
+                f"{before_len} -> {after_len} rows (as_of_cutoff={as_of_cutoff.date()})"
+            )
+
+            # 🔁 Fallback: if everything got filtered out, ignore created_at for now
+            if after_len == 0:
+                print(
+                    "[WARN] investing_flows all filtered out by created_at; "
+                    "falling back to using all investing rows without versioning."
+                )
+                df_inv = orig_df_inv
+
+        # Now aggregate by month_date
         df_inv["month_bucket"] = (
             pd.to_datetime(df_inv["month_date"], errors="coerce")
             .dt.to_period("M")
@@ -5948,6 +6232,7 @@ def debug_cashflow_engine(
             row["month_date"]: float(row["amount"] or 0.0)
             for _, row in inv_agg.iterrows()
         }
+
 
     fin_by_month: dict[pd.Timestamp, float] = {}
     if df_fin is not None and not df_fin.empty:
@@ -6089,288 +6374,6 @@ def debug_cashflow_engine(
     )
 
     return debug_df
-
-
-def recompute_cashflow_from_ar_ap(
-    client_id,
-    base_month: date,
-    n_months: int = 12,
-    opening_cash_hint: float | None = None,
-) -> bool:
-    if client_id is None or base_month is None:
-        return False
-
-    try:
-        # Normalise base_month to first of month
-        base_month_ts = pd.to_datetime(base_month).replace(day=1)
-        as_of_date = base_month_ts.date()
-
-        # Month index for forecast horizon
-        month_index = pd.date_range(start=base_month_ts, periods=n_months, freq="MS")
-
-        # ---------- Settings ----------
-        settings = get_client_settings(client_id)
-        ar_days = int(settings.get("ar_default_days", 30))
-        ap_days = int(settings.get("ap_default_days", 30))
-
-        # ---------- AR / AP invoices ----------
-        df_ar, df_ap = fetch_ar_ap_for_client(client_id)
-
-        # ----- AR -----
-        if df_ar is not None and not df_ar.empty:
-            df_ar = df_ar.copy()
-            df_ar = add_ar_aging(df_ar, as_of=as_of_date, ar_default_days=ar_days)
-            df_ar["expected_date"] = pd.to_datetime(df_ar.get("expected_date"), errors="coerce")
-            df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
-        else:
-            df_ar = pd.DataFrame(columns=["id", "expected_date", "amount"])
-
-        # ----- AP -----
-        if df_ap is not None and not df_ap.empty:
-            df_ap = df_ap.copy()
-            df_ap = add_ap_aging(df_ap, as_of=as_of_date, ap_default_days=ap_days)
-
-            if "pay_expected_date" in df_ap.columns:
-                pay_col = "pay_expected_date"
-            elif "expected_payment_date" in df_ap.columns:
-                pay_col = "expected_payment_date"
-            else:
-                pay_col = "due_date"
-
-            df_ap[pay_col] = pd.to_datetime(df_ap.get(pay_col), errors="coerce")
-            df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
-        else:
-            df_ap = pd.DataFrame(columns=["id", "due_date", "amount"])
-            pay_col = "due_date"
-
-        # ---------- Payments (for partial payments + actual timing) ----------
-        df_pay = fetch_ar_ap_payments_for_client(client_id)
-        ar_cash_map, ap_cash_map = build_monthly_ar_ap_cash_maps(
-            df_ar=df_ar,
-            df_ap=df_ap,
-            df_payments=df_pay,
-            month_index=month_index,
-        )
-
-        # ---------- Opex ----------
-        try:
-            df_opex = fetch_opex_for_client(client_id)
-            if df_opex is not None and not df_opex.empty:
-                df_opex = df_opex.copy()
-                df_opex["month_bucket"] = (
-                    pd.to_datetime(df_opex["month_date"], errors="coerce")
-                    .dt.to_period("M")
-                    .dt.to_timestamp()
-                )
-            else:
-                df_opex = pd.DataFrame(columns=["month_bucket", "amount"])
-        except Exception as e:
-            print("Error fetching operating_opex:", e)
-            df_opex = pd.DataFrame(columns=["month_bucket", "amount"])
-
-        # ---------- Operating other income (cash-in by month) ----------
-        try:
-            df_oinc = fetch_operating_other_income_for_client(client_id)
-        except Exception as e:
-            print("Error fetching operating_other_income:", e)
-            df_oinc = pd.DataFrame()
-
-        if df_oinc is None or df_oinc.empty:
-            df_oinc = pd.DataFrame(columns=["month_bucket", "cash_in"])
-
-        if not df_oinc.empty:
-            # Ensure month_bucket + numeric cash_in
-            if "month_bucket" not in df_oinc.columns:
-                df_oinc["month_bucket"] = (
-                    pd.to_datetime(df_oinc["month_date"], errors="coerce")
-                    .dt.to_period("M")
-                    .dt.to_timestamp()
-                )
-            df_oinc["cash_in"] = pd.to_numeric(df_oinc.get("cash_in"), errors="coerce").fillna(0.0)
-
-            oinc_agg = (
-                df_oinc.groupby("month_bucket", as_index=False)["cash_in"]
-                .sum()
-                .rename(columns={"month_bucket": "month_date"})
-            )
-            other_income_by_month: dict[pd.Timestamp, float] = {
-                row["month_date"]: float(row["cash_in"] or 0.0)
-                for _, row in oinc_agg.iterrows()
-            }
-
-            print("[DEBUG] other_operating_income by month:")
-            for k, v in other_income_by_month.items():
-                print(f"  {k.strftime('%Y-%m-%d')}: {v:.2f}")
-        else:
-            other_income_by_month = {}
-
-        # ---------- Investing & Financing moves ----------
-        try:
-            df_inv = fetch_investing_flows_for_client(client_id)
-        except Exception as e:
-            print("Error fetching investing_flows:", e)
-            df_inv = None
-
-        try:
-            df_fin = fetch_financing_flows_for_client(client_id)
-        except Exception as e:
-            print("Error fetching financing_flows:", e)
-            df_fin = None
-
-        inv_by_month: dict[pd.Timestamp, float] = {}
-        if df_inv is not None and not df_inv.empty:
-            df_inv = df_inv.copy()
-            df_inv["month_bucket"] = (
-                pd.to_datetime(df_inv["month_date"], errors="coerce")
-                .dt.to_period("M")
-                .dt.to_timestamp()
-            )
-            inv_agg = (
-                df_inv.groupby("month_bucket", as_index=False)["amount"]
-                .sum()
-                .rename(columns={"month_bucket": "month_date"})
-            )
-            inv_by_month = {
-                row["month_date"]: float(row["amount"] or 0.0)
-                for _, row in inv_agg.iterrows()
-            }
-
-        fin_by_month: dict[pd.Timestamp, float] = {}
-        if df_fin is not None and not df_fin.empty:
-            df_fin = df_fin.copy()
-            df_fin["month_bucket"] = (
-                pd.to_datetime(df_fin["month_date"], errors="coerce")
-                .dt.to_period("M")
-                .dt.to_timestamp()
-            )
-            fin_agg = (
-                df_fin.groupby("month_bucket", as_index=False)["amount"]
-                .sum()
-                .rename(columns={"month_bucket": "month_date"})
-            )
-            fin_by_month = {
-                row["month_date"]: float(row["amount"] or 0.0)
-                for _, row in fin_agg.iterrows()
-            }
-
-        # ---------- Payroll by month ----------
-        payroll_by_month = compute_payroll_by_month(client_id, month_index)
-
-        # ---------- Opening cash ----------
-        if opening_cash_hint is not None:
-            opening_cash_0 = float(opening_cash_hint)
-        else:
-            kpi_row = fetch_kpis_for_client_month(client_id, as_of_date)
-            opening_cash_0 = 0.0
-            if kpi_row and "cash_balance" in kpi_row:
-                try:
-                    opening_cash_0 = float(kpi_row["cash_balance"])
-                except Exception:
-                    opening_cash_0 = 0.0
-
-        rows = []
-        current_closing = opening_cash_0
-
-        for m in month_index:
-            m_key = pd.to_datetime(m).to_period("M").to_timestamp()
-            opening_cash = current_closing
-
-            cash_in_ar = float(ar_cash_map.get(m_key, 0.0))
-            cash_out_ap = float(ap_cash_map.get(m_key, 0.0))
-            payroll_cash = float(payroll_by_month.get(m_key, 0.0))
-
-            if df_opex is not None and not df_opex.empty:
-                mask_ox = df_opex["month_bucket"] == m_key
-                opex_cash = float(df_opex.loc[mask_ox, "amount"].sum())
-            else:
-                opex_cash = 0.0
-
-            other_income_cash = float(other_income_by_month.get(m_key, 0.0))
-            investing_cf = float(inv_by_month.get(m_key, 0.0))
-            financing_cf = float(fin_by_month.get(m_key, 0.0))
-
-            operating_cf = (
-                cash_in_ar
-                + other_income_cash
-                - cash_out_ap
-                - payroll_cash
-                - opex_cash
-            )
-            free_cf = operating_cf + investing_cf + financing_cf
-            closing_cash = opening_cash + free_cf
-            cash_danger_flag = closing_cash <= 0.0
-
-            print(
-                f"[ENGINE] {m_key.strftime('%Y-%m')} | "
-                f"open={opening_cash:.2f}, ar_in={cash_in_ar:.2f}, "
-                f"other_in={other_income_cash:.2f}, ap_out={cash_out_ap:.2f}, "
-                f"payroll={payroll_cash:.2f}, opex={opex_cash:.2f}, "
-                f"inv={investing_cf:.2f}, fin={financing_cf:.2f}, "
-                f"free_cf={free_cf:.2f}, close={closing_cash:.2f}"
-            )
-
-            rows.append(
-                {
-                    "client_id": str(client_id),
-                    "month_date": m_key.date().isoformat(),
-                    "opening_cash": round(opening_cash, 2),
-                    "operating_cf": round(operating_cf, 2),
-                    "investing_cf": round(investing_cf, 2),
-                    "financing_cf": round(financing_cf, 2),
-                    "free_cash_flow": round(free_cf, 2),
-                    "closing_cash": round(closing_cash, 2),
-                    "cash_danger_flag": cash_danger_flag,
-                    "notes": None,
-                }
-            )
-
-            current_closing = closing_cash
-
-        if not rows:
-            print("No rows computed for cashflow_summary recompute.")
-            return False
-
-        try:
-            supabase.table("cashflow_summary").delete().eq("client_id", str(client_id)).execute()
-        except Exception as e:
-            print("Warning deleting old cashflow_summary rows:", e)
-
-        try:
-            resp = supabase.table("cashflow_summary").insert(rows).execute()
-        except Exception as e:
-            print("Error recomputing cashflow_summary:", e)
-            return False
-
-        if isinstance(resp, dict) and resp.get("error"):
-            print("Error recomputing cashflow_summary:", resp["error"])
-            return False
-
-        print(f"Recomputed {len(rows)} rows into cashflow_summary")
-        return True
-
-
-    # 🔁 Clear cached cashflow + alerts so UI sees fresh data
-        try:
-            fetch_cashflow_summary_for_client.clear()
-        except Exception:
-            pass
-
-        try:
-            fetch_alerts_for_client.clear()
-        except Exception:
-            pass
-
-        # 🚨 Run alerts for all months in this engine horizon
-        try:
-            run_all_alerts_for_client_months(client_id, month_index)
-        except Exception as e:
-            print(f"Warning running alerts after cashflow recompute: {e}")
-
-        return True
-
-    except Exception as e:
-        print("Error recomputing cashflow_summary:", e)
-        return False
 
 
 
@@ -6673,7 +6676,7 @@ def create_comment_for_client_page(
 
 # ---------- Sidebar: global controls ----------
 
-st.sidebar.title("FFIS")
+st.sidebar.title("Matfina")
 
 # Client selector (multi-tenant ready)
 clients_data = load_clients()
@@ -8829,6 +8832,8 @@ def _detect_revenue_value_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+
+
 def _build_revenue_trend_df(client_id, focus_month) -> pd.DataFrame:
     """
     Build a 6-month recognised revenue trend ending at focus_month.
@@ -8880,7 +8885,6 @@ def _build_revenue_trend_df(client_id, focus_month) -> pd.DataFrame:
     monthly["Month"] = monthly["month_date"].dt.strftime("%b %Y")
     return monthly[["month_date", "Month", "Revenue"]]
 
-
 def _build_burn_and_cash_trend_df(
     engine_df: pd.DataFrame | None,
     focus_month,
@@ -8890,9 +8894,9 @@ def _build_burn_and_cash_trend_df(
     ending at focus_month.
 
     Burn logic:
-      - If a 'burn' or 'net_burn' column exists, use that.
-      - Else, if 'free_cash_flow' exists, burn = max(0, -free_cash_flow).
-      - Else, if 'operating_cf' exists, burn = max(0, -operating_cf).
+      - Prefer an explicit 'burn' / 'net_burn' column if present.
+      - Else, prefer 'operating_cf' (core operating burn, excluding financing).
+      - Else, fall back to 'free_cash_flow'.
 
     Returns:
       burn_df:  ["month_date", "Month", "Burn"]
@@ -8901,36 +8905,50 @@ def _build_burn_and_cash_trend_df(
     if engine_df is None or engine_df.empty or focus_month is None:
         return pd.DataFrame(), pd.DataFrame()
 
+    # 6-month window ending at focus_month
     window = _six_month_window(focus_month)
 
     df = engine_df.copy()
+
+    # Normalise month_date to month-start Timestamp
     df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
     df["month_date"] = df["month_date"].dt.to_period("M").dt.to_timestamp()
     df = df[df["month_date"].notna()]
 
+    # NEW: if engine_df carries multiple plan versions per month_date,
+    # keep only the latest as_of_month snapshot for each month.
+    if "as_of_month" in df.columns:
+        df["as_of_month"] = pd.to_datetime(df["as_of_month"], errors="coerce")
+        df = (
+            df.sort_values(["month_date", "as_of_month"])
+              .groupby("month_date", as_index=False)
+              .tail(1)
+        )
+
+    # Filter to the 6-month window
     df_window = df[df["month_date"].isin(window)].copy()
 
-    # Ensure we have rows for all months
+    # Ensure we have one row for every month in the window (even if no data)
     grid = pd.DataFrame({"month_date": window})
     df_window = grid.merge(df_window, on="month_date", how="left")
 
-    # ----- Burn series -----
+    # ---------- Burn series ----------
+    # Prefer operating_cf over free_cash_flow so chart shows *operating burn*.
     burn_source_col = None
-    for cand in ["burn", "net_burn", "free_cash_flow", "operating_cf"]:
+    for cand in ["burn", "net_burn", "operating_cf", "free_cash_flow"]:
         if cand in df_window.columns:
             burn_source_col = cand
             break
 
     burn_df = pd.DataFrame(columns=["month_date", "Month", "Burn"])
     if burn_source_col is not None:
-        vals = pd.to_numeric(
-            df_window[burn_source_col], errors="coerce"
-        ).fillna(0.0)
+        vals = pd.to_numeric(df_window[burn_source_col], errors="coerce").fillna(0.0)
 
         if burn_source_col in ["burn", "net_burn"]:
+            # Already in "burn" convention (positive = burn)
             burn_vals = vals
         else:
-            # Convert negative CF into positive burn magnitude
+            # Convert negative CF into positive burn magnitude; positive CF -> 0 burn
             burn_vals = vals.apply(lambda v: -v if v < 0 else 0.0)
 
         burn_df = pd.DataFrame(
@@ -8941,12 +8959,10 @@ def _build_burn_and_cash_trend_df(
             }
         )
 
-    # ----- Cash balance series -----
+    # ---------- Cash balance series ----------
     cash_df = pd.DataFrame(columns=["month_date", "Month", "Closing cash"])
     if "closing_cash" in df_window.columns:
-        cash_vals = pd.to_numeric(
-            df_window["closing_cash"], errors="coerce"
-        ).fillna(0.0)
+        cash_vals = pd.to_numeric(df_window["closing_cash"], errors="coerce").fillna(0.0)
         cash_df = pd.DataFrame(
             {
                 "month_date": df_window["month_date"],
@@ -8957,6 +8973,54 @@ def _build_burn_and_cash_trend_df(
 
     return burn_df, cash_df
 
+
+
+def fetch_cashflow_summary_for_client_as_of(
+    client_id: str,
+    as_of_month: date,
+) -> pd.DataFrame | None:
+    """
+    Fetch cashflow_summary rows for a client that belong to the plan
+    as-of a given Focus Month (as_of_month).
+    """
+    if client_id is None or as_of_month is None:
+        return pd.DataFrame()
+
+    def _call():
+        return (
+            supabase
+            .table("cashflow_summary")
+            .select("*")
+            .eq("client_id", str(client_id))
+            .eq("as_of_month", str(as_of_month))
+            .order("month_date")
+            .execute()
+        )
+
+    res = sb_execute_with_retry(_call, label="fetch cashflow_summary as_of")
+    if res is None:
+        print("[ERROR] fetch_cashflow_summary_for_client_as_of -> connection problem (None)")
+        return None
+
+    rows = res.data or []
+    if not rows:
+        print(
+            "[DEBUG] fetch_cashflow_summary_for_client_as_of -> 0 rows for",
+            client_id, "as_of", as_of_month,
+        )
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    if "month_date" in df.columns:
+        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+        df = df[df["month_date"].notna()].sort_values("month_date")
+
+    print(
+        f"[DEBUG] fetch_cashflow_summary_for_client_as_of -> {len(df)} rows for",
+        client_id, "as_of", as_of_month,
+    )
+    return df
 
 
 
@@ -8972,6 +9036,28 @@ def page_business_overview():
 
     # --- Currency for this client ---
     currency_code, currency_symbol = get_client_currency(selected_client_id)
+
+
+    # --- Recognised revenue (this month & last month) from Sales engine ---
+    # Current month
+    this_month_rev = get_recognised_revenue_for_month(
+        selected_client_id, selected_month_start
+    )
+
+    # Previous month (for delta)
+    prev_month_date = (
+        pd.to_datetime(selected_month_start)
+        - pd.DateOffset(months=1)
+    ).to_period("M").to_timestamp().date()
+
+    prev_month_rev = get_recognised_revenue_for_month(
+        selected_client_id, prev_month_date
+    )
+
+    rev_delta_label = None
+    if prev_month_rev is not None:
+        diff = this_month_rev - prev_month_rev
+        rev_delta_label = f"{diff:+,.0f}"
 
     # Pull KPIs from Supabase
     kpis = fetch_kpis_for_client_month(selected_client_id, selected_month_start)
@@ -9031,7 +9117,8 @@ def page_business_overview():
         runway_months_val = f"{runway_from_engine:.1f}"
 
     # ---------- Top KPI row with "why it changed" under each ----------
-    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+
+    kpi_col1,kpi_col0 ,kpi_col2, kpi_col3, kpi_col4 = st.columns(5)
     with kpi_col1:
         st.metric(
             f"💰 Expect Cash in ({currency_code})",
@@ -9040,6 +9127,16 @@ def page_business_overview():
             help=f'Expected cash **in** this month from customers (unpaid AR with expected_date in this month, in {currency_code}).',
         )
         st.caption(expl["money_in"])
+    with kpi_col0:
+        st.metric(
+            f"📊 This month (recognised revenue, {currency_code})",
+            f"{currency_symbol}{this_month_rev:,.0f}",
+            delta=rev_delta_label,
+            help=(
+                "Recognised revenue for this month based on your Sales & Deals "
+                "revenue recognition schedule (SaaS / milestone / POC / etc)."
+            ),
+        )
     with kpi_col2:
         st.metric(
             f"💸 Expect Cash out ({currency_code})",
@@ -9067,6 +9164,17 @@ def page_business_overview():
         )
         st.caption(expl["runway"])
 
+    # ---------- This month in 20 seconds ----------
+    st.subheader("📌 This month in 20 seconds")
+
+    summary_text = build_month_summary_insight(
+        selected_client_id,
+        selected_month_start,
+    )
+    st.info(summary_text)
+
+    st.markdown("---")
+   
         # ---------- Health verdict (explicit) ----------
     # Use engine runway if available, else KPI runway
     runway_num = None
@@ -9103,7 +9211,7 @@ def page_business_overview():
 
     # ---------- 6-month trends: Revenue, Burn, Cash balance ----------
     st.markdown("---")
-    st.subheader("📈 6-month trends – revenue, burn, cash")
+    st.subheader("📈 6-month trends – revenue, Operating Cash Flow, cash")
 
     # Revenue trend from Sales & Deals engine
     rev_trend_df = _build_revenue_trend_df(
@@ -9149,9 +9257,9 @@ def page_business_overview():
 
     # ---- Burn trend ----
     with c_burn:
-        st.caption("Burn (cash out) (last 6 months)")
+        st.caption("Operating Cashflow (last 6 months)")
         if burn_trend_df is None or burn_trend_df.empty:
-            st.caption("No burn data available for this 6-month window.")
+            st.caption("No bOP Cashdate available for this 6-month window.")
         else:
             burn_chart = (
                 alt.Chart(burn_trend_df)
@@ -9207,59 +9315,6 @@ def page_business_overview():
             )
             st.altair_chart(cash_chart.interactive(), use_container_width=True)
 
-    # ---------- Key alerts ----------
-    st.markdown("---")
-    st.subheader("🚨 Key alerts for this month")
-
-
-    all_alerts = fetch_alerts_for_client(selected_client_id, only_active=True, limit=50)
-    if not all_alerts:
-        st.caption("No critical alerts right now. Keep doing what you're doing. 🙌")
-    else:
-        alerts_for_month = []
-        for a in all_alerts:
-            month_value = a.get("month_date")
-            if month_value and selected_month_start:
-                try:
-                    mdt = pd.to_datetime(month_value).date().replace(day=1)
-                    if mdt == selected_month_start:
-                        alerts_for_month.append(a)
-                except Exception:
-                    alerts_for_month.append(a)
-            else:
-                alerts_for_month.append(a)
-
-        if not alerts_for_month:
-            alerts_for_month = all_alerts
-
-        alerts_sorted = sort_alerts_by_severity(alerts_for_month)
-        top_alerts = alerts_sorted[:3]
-
-        for alert in top_alerts:
-            sev = str(alert.get("severity", "medium")).lower()
-            msg = alert.get("message", "")
-            atype = alert.get("alert_type", "alert")
-            label = f"[{atype}] {msg}"
-
-            if sev in ["critical", "high"]:
-                st.error(label)
-            elif sev == "medium":
-                st.warning(label)
-            else:
-                st.info(label)
-
-    st.markdown("---")
-
-    # ---------- This month in 20 seconds ----------
-    st.subheader("📌 This month in 20 seconds")
-
-    summary_text = build_month_summary_insight(
-        selected_client_id,
-        selected_month_start,
-    )
-    st.info(summary_text)
-
-    st.markdown("---")
 
     # ---------- Cashflow engine controls ----------
     st.subheader("🔁 Cashflow engine controls")
@@ -9304,7 +9359,10 @@ def page_business_overview():
     st.markdown("---")
     st.subheader("🔍 Cashflow engine – 12-month breakdown")
 
-    engine_df = fetch_cashflow_summary_for_client(selected_client_id)
+    engine_df = fetch_cashflow_summary_for_client_as_of(
+        selected_client_id,
+        selected_month_start,   # Focus Month, e.g. 2025-08-01
+    )
 
     if engine_df is None or engine_df.empty:
         st.caption(
@@ -9534,20 +9592,6 @@ def page_business_overview():
     st.markdown("\n".join([f"{i+1}. {a}" for i, a in enumerate(actions)]))
     st.caption("This list is intentionally short. The goal is focus, not a to-do dump.")
 
-
-
-
-
-    # ---------- Collaboration layer (comments + tasks) ----------
-    st.markdown("---")
-    col_comments, col_tasks = st.columns([3, 1])
-
-    with col_comments:
-        comments_block("business_overview")
-
-    with col_tasks:
-        with st.expander("✅ Tasks for this page", expanded=False):
-            tasks_block("business_overview")
 
 
 
@@ -10798,19 +10842,6 @@ def page_team_spending():
 
 
 
-    # ------------------------------------------------------------------
-    # 5) Collaboration: comments + tasks
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    col_comments, col_tasks = st.columns([3, 1])
-
-    with col_comments:
-        comments_block("team_spending")
-
-    with col_tasks:
-        with st.expander("✅ Tasks for this page", expanded=False):
-            tasks_block("team_spending")
-
 
 
 def build_team_decision_panel(
@@ -10888,179 +10919,232 @@ def build_team_spending_story(currency_symbol, month_label, month_payroll, month
     return lines, actions
 
 
-@st.cache_data(ttl=60)
-def build_14_week_cash_table(client_id, focus_month: date) -> pd.DataFrame:
-    """
-    Build a 14-week forward cash view starting from the focus month:
 
-      - Week-by-week:
-          * cash_in_ar        (customer receipts from AR.expected_date)
-          * cash_out_ap       (supplier payments from AP.pay_expected_date / due_date)
-          * cash_out_payroll  (approx. weekly payroll based on monthly payroll engine)
-          * operating_cf      = cash_in_ar - cash_out_ap - cash_out_payroll
-          * investing_cf      = 0 for now
-          * financing_cf      = 0 for now
-          * net_cash          = operating_cf + investing_cf + financing_cf
-          * closing_cash      = prior closing + net_cash
-          * danger_flag       = closing_cash <= 0
 
-    Uses:
-      - fetch_ar_ap_for_client
-      - add_ar_aging / add_ap_aging
-      - compute_payroll_by_month
-      - fetch_kpis_for_client_month for starting cash
-      - get_client_settings for AR/AP defaults
+
+
+from pandas.tseries.offsets import MonthEnd
+
+def build_14_week_cash_table(client_id: str, focus_month: date) -> pd.DataFrame:
     """
-    if client_id is None or focus_month is None:
+    Build a 14-week forward cash view anchored to the Focus Month.
+
+    Behaviour:
+      - Anchor date = first day of Focus Month (e.g. 2025-07-01 for "Jul 2025")
+      - 'as_of' for ageing = end of Focus Month (e.g. 2025-07-31)
+      - 14 weekly buckets from Focus Month start:
+          week_start_0 = focus_month_start
+          week_start_1 = focus_month_start + 7 days
+          ...
+      - AR / AP timing:
+          * Use due_date if available (else fall back to expected_* columns)
+          * Only *live* rows: paid / closed / settled / cancelled / disputed removed
+          * Uses 'effective_amount' where present (balance due after partial payments)
+          * If an invoice/bill is overdue (due_date < focus_month_start) and
+            still unpaid, it is forced into **week 0**.
+      - Columns returned:
+          week_start (datetime64[ns])
+          cash_in_ar
+          cash_out_ap
+          cash_out_payroll
+          operating_cf
+          investing_cf
+          financing_cf
+          net_cash
+          closing_cash
+    """
+    if not client_id or focus_month is None:
         return pd.DataFrame()
 
-    # ---- Client settings with safe fallbacks ----
+    # -------------------------------
+    # Anchor dates
+    # -------------------------------
+    focus_start = focus_month.replace(day=1)
+    focus_start_ts = pd.to_datetime(focus_start)
+    as_of = (focus_start_ts + MonthEnd(0)).date()  # end of Focus Month
+
+    horizon_weeks = 14
+    week_starts = [
+        focus_start_ts + timedelta(days=7 * i) for i in range(horizon_weeks)
+    ]
+
+    # -------------------------------
+    # Settings + AR/AP data
+    # -------------------------------
     settings = get_client_settings(client_id) or {}
-    ar_days = settings.get("ar_default_days", 30)
-    ap_days = settings.get("ap_default_days", 30)
+    ar_days = int(settings.get("ar_default_days", 30))
+    ap_days = int(settings.get("ap_default_days", 30))
 
-    # 1) Base date: first day of the focus month
-    start_date = focus_month.replace(day=1)
+    df_ar_raw, df_ap_raw = fetch_ar_ap_for_client(client_id)
 
-    # 2) AR / AP with proper expected dates
-    df_ar, df_ap = fetch_ar_ap_for_client(client_id)
+    # Normalise for cash: drop paid/closed/cancelled/disputed, compute effective_amount
+    df_ar = normalise_ar_ap_for_cash(df_ar_raw)
+    df_ap = normalise_ar_ap_for_cash(df_ap_raw)
 
-    # ---------- AR (cash in) ----------
+    # -------------------------------
+    # 1) AR – cash_in_ar by week (using due_date)
+    # -------------------------------
+    cash_in_by_week: dict[int, float] = {i: 0.0 for i in range(horizon_weeks)}
+
     if df_ar is not None and not df_ar.empty:
-        df_ar = add_ar_aging(df_ar, as_of=start_date, ar_default_days=ar_days)
+        ar = df_ar.copy()
+        ar = add_ar_aging(ar, as_of=as_of, ar_default_days=ar_days)
 
-        # Normalise expected_date to plain date
-        df_ar["expected_date"] = pd.to_datetime(
-            df_ar["expected_date"], errors="coerce"
-        ).dt.date
+        # Prefer due_date; fall back to expected_date
+        if "due_date" in ar.columns:
+            date_col = "due_date"
+        elif "expected_date" in ar.columns:
+            date_col = "expected_date"
+        else:
+            date_col = None
 
-        # Exclude fully paid/closed
-        if "status" in df_ar.columns:
-            df_ar["status"] = df_ar["status"].astype(str)
-            df_ar = df_ar[~df_ar["status"].str.lower().isin(["paid", "closed", "settled"])]
+        if date_col is not None:
+            ar[date_col] = pd.to_datetime(ar[date_col], errors="coerce")
+            ar = ar[ar[date_col].notna()]
 
-        df_ar["amount"] = pd.to_numeric(df_ar.get("amount"), errors="coerce").fillna(0.0)
-    else:
-        df_ar = pd.DataFrame()
+            # Effective date:
+            #   - If due_date < focus_start: treat as **week 0** (overdue but still pending)
+            #   - Else: use actual due_date
+            ar["effective_date"] = ar[date_col].where(
+                ar[date_col] >= focus_start_ts, focus_start_ts
+            )
 
-    # ---------- AP (cash out) ----------
+            # Week index from focus_start
+            ar["week_index"] = (
+                (ar["effective_date"] - focus_start_ts).dt.days // 7
+            ).astype(int)
+
+            ar = ar[(ar["week_index"] >= 0) & (ar["week_index"] < horizon_weeks)]
+
+            # Use balance due if present
+            value_col = "effective_amount" if "effective_amount" in ar.columns else "amount"
+            ar[value_col] = pd.to_numeric(ar[value_col], errors="coerce").fillna(0.0)
+
+            grouped = (
+                ar.groupby("week_index", as_index=False)[value_col]
+                .sum()
+                .rename(columns={value_col: "cash_in_ar"})
+            )
+
+            for _, r in grouped.iterrows():
+                idx = int(r["week_index"])
+                cash_in_by_week[idx] = float(r["cash_in_ar"])
+
+    # -------------------------------
+    # 2) AP – cash_out_ap by week (using due_date)
+    # -------------------------------
+    cash_out_by_week: dict[int, float] = {i: 0.0 for i in range(horizon_weeks)}
+
     if df_ap is not None and not df_ap.empty:
-        df_ap = add_ap_aging(df_ap, as_of=start_date, ap_default_days=ap_days)
+        ap = df_ap.copy()
+        ap = add_ap_aging(ap, as_of=as_of, ap_default_days=ap_days)
 
-        df_ap["pay_expected_date"] = pd.to_datetime(
-            df_ap["pay_expected_date"], errors="coerce"
-        ).dt.date
+        # Prefer due_date; fall back to expected_payment_date / pay_expected_date
+        if "due_date" in ap.columns:
+            date_col = "due_date"
+        elif "expected_payment_date" in ap.columns:
+            date_col = "expected_payment_date"
+        elif "pay_expected_date" in ap.columns:
+            date_col = "pay_expected_date"
+        else:
+            date_col = None
 
-        if "status" in df_ap.columns:
-            df_ap["status"] = df_ap["status"].astype(str)
-            df_ap = df_ap[~df_ap["status"].str.lower().isin(["paid", "closed", "settled"])]
+        if date_col is not None:
+            ap[date_col] = pd.to_datetime(ap[date_col], errors="coerce")
+            ap = ap[ap[date_col].notna()]
 
-        df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
-    else:
-        df_ap = pd.DataFrame()
+            ap["effective_date"] = ap[date_col].where(
+                ap[date_col] >= focus_start_ts, focus_start_ts
+            )
 
-    # 3) Payroll by month (we'll spread monthly payroll evenly across days)
-    month_index = pd.date_range(
-        start=pd.to_datetime(start_date),
-        periods=6,          # covers the 14-week window comfortably
+            ap["week_index"] = (
+                (ap["effective_date"] - focus_start_ts).dt.days // 7
+            ).astype(int)
+
+            ap = ap[(ap["week_index"] >= 0) & (ap["week_index"] < horizon_weeks)]
+
+            value_col = "effective_amount" if "effective_amount" in ap.columns else "amount"
+            ap[value_col] = pd.to_numeric(ap[value_col], errors="coerce").fillna(0.0)
+
+            grouped_ap = (
+                ap.groupby("week_index", as_index=False)[value_col]
+                .sum()
+                .rename(columns={value_col: "cash_out_ap"})
+            )
+
+            for _, r in grouped_ap.iterrows():
+                idx = int(r["week_index"])
+                cash_out_by_week[idx] = float(r["cash_out_ap"])
+
+    # -------------------------------
+    # 3) Payroll – approximate weekly cash-out
+    # -------------------------------
+    window_months = pd.date_range(
+        start=focus_start_ts,
+        periods=4,  # 14 weeks ≈ 3.5 months, 4 is safe
         freq="MS",
     )
-    payroll_by_month = compute_payroll_by_month(client_id, month_index)
+    payroll_by_month = compute_payroll_by_month(client_id, window_months)
 
-       # 4) Opening cash: priority = client_settings → KPI → default
-    opening_cash = None
+    print("[DEBUG] payroll_by_month for 14-week view:")
+    for m, v in payroll_by_month.items():
+        print(f"  {m}: {v:,.2f}")
 
-    # (a) From client_settings
-    settings = get_client_settings(client_id) or {}
-    if settings.get("opening_cash_start") is not None:
-        try:
-            opening_cash = float(settings["opening_cash_start"])
-        except Exception:
-            opening_cash = None
+    payroll_by_week: dict[int, float] = {}
+    for i, ws in enumerate(week_starts):
+        month_bucket = ws.to_period("M").to_timestamp()
+        monthly_payroll = float(payroll_by_month.get(month_bucket, 0.0))
+        payroll_by_week[i] = monthly_payroll / 4.0  # simple spread
 
-    # (b) If still None, try KPI cash_balance for focus month
-    if opening_cash is None:
-        kpi_row = fetch_kpis_for_client_month(client_id, start_date)
-        if kpi_row and "cash_balance" in kpi_row:
-            try:
-                opening_cash = float(kpi_row["cash_balance"])
-            except Exception:
-                opening_cash = None
+    # -------------------------------
+    # 4) Starting cash (from KPI row for Focus Month)
+    # -------------------------------
+    kpis = fetch_kpis_for_client_month(client_id, focus_start)
+    opening_cash = 0.0
+    if kpis:
+        opening_cash = float(kpis.get("cash_balance") or 0.0)
 
-    # (c) Final fallback
-    if opening_cash is None:
-        opening_cash = 0.0  # or whatever default you actually want
-
-
-    # 5) Build 14 weekly buckets
-    week_starts = [start_date + timedelta(weeks=i) for i in range(14)]
-
-    current_cash = opening_cash
+    # -------------------------------
+    # 5) Build weekly rows with closing cash roll-forward
+    # -------------------------------
     rows = []
+    closing = opening_cash
 
-    for w_start in week_starts:
-        w_end = w_start + timedelta(days=6)
+    for idx, ws in enumerate(week_starts):
+        cash_in_ar = float(cash_in_by_week.get(idx, 0.0))
+        cash_out_ap = float(cash_out_by_week.get(idx, 0.0))
+        cash_out_payroll = float(payroll_by_week.get(idx, 0.0))
 
-        # --- Cash in from AR for this week ---
-        if not df_ar.empty:
-            ar_mask = df_ar["expected_date"].between(w_start, w_end)
-            cash_in_ar = float(df_ar.loc[ar_mask, "amount"].sum())
-        else:
-            cash_in_ar = 0.0
-
-        # --- Cash out from AP for this week ---
-        if not df_ap.empty:
-            ap_mask = df_ap["pay_expected_date"].between(w_start, w_end)
-            cash_out_ap = float(df_ap.loc[ap_mask, "amount"].sum())
-        else:
-            cash_out_ap = 0.0
-
-        # --- Payroll for this week (approximation) ---
-        month_key = w_start.replace(day=1)
-        month_ts = pd.to_datetime(month_key)
-
-        month_payroll = float(payroll_by_month.get(month_ts, 0.0))
-
-        days_in_month = calendar.monthrange(month_key.year, month_key.month)[1]
-        payroll_per_day = month_payroll / days_in_month if days_in_month else 0.0
-        cash_out_payroll = payroll_per_day * 7.0  # 7 days per week bucket
-
-        # --- Operating, Investing, Financing ---
         operating_cf = cash_in_ar - cash_out_ap - cash_out_payroll
-        investing_cf = 0.0
-        financing_cf = 0.0
+        investing_cf = 0.0  # wire to investing_flows later
+        financing_cf = 0.0  # wire to financing_flows later
 
         net_cash = operating_cf + investing_cf + financing_cf
-        closing_cash = current_cash + net_cash
-        danger_flag = closing_cash <= 0
+        closing = closing + net_cash
 
         rows.append(
             {
-                "week_start": w_start,
-                "week_label": f"Week of {w_start.strftime('%d %b %Y')}",
-                "cash_in_ar": round(cash_in_ar, 2),
-                "cash_out_ap": round(cash_out_ap, 2),
-                "cash_out_payroll": round(cash_out_payroll, 2),
-                "operating_cf": round(operating_cf, 2),
-                "investing_cf": round(investing_cf, 2),
-                "financing_cf": round(financing_cf, 2),
-                "net_cash": round(net_cash, 2),
-                "closing_cash": round(closing_cash, 2),
-                "danger_flag": danger_flag,
+                "week_start": ws,
+                "cash_in_ar": cash_in_ar,
+                "cash_out_ap": cash_out_ap,
+                "cash_out_payroll": cash_out_payroll,
+                "operating_cf": operating_cf,
+                "investing_cf": investing_cf,
+                "financing_cf": financing_cf,
+                "net_cash": net_cash,
+                "closing_cash": closing,
             }
         )
 
-        current_cash = closing_cash
+    week_df = pd.DataFrame(rows)
+    week_df["week_start"] = pd.to_datetime(week_df["week_start"], errors="coerce")
 
-    df_weeks = pd.DataFrame(rows)
-    df_weeks["week_start"] = pd.to_datetime(df_weeks["week_start"])
-    df_weeks = df_weeks.sort_values("week_start")
-
-    return df_weeks
+    return week_df
 
 
 
 # ---------- Page: Cash & Bills ----------
+
 def page_cash_bills():
     top_header("Cash & Bills")
 
@@ -11073,28 +11157,49 @@ def page_cash_bills():
     # Currency for formatting
     currency_code, currency_symbol = get_client_currency(selected_client_id)
 
+       # ==========================
+    # Anchor everything to Focus Month
+    # ==========================
+    # selected_month_start is already set by the sidebar:
+    #   e.g. July 2025 → date(2025, 7, 1)
+    focus_start = selected_month_start
+
+    # Ageing "as of" = end of the selected month
+    focus_end_ts = pd.to_datetime(focus_start) + MonthEnd(0)
+    as_of = focus_end_ts.date()
+
+    # 4-week working capital window: from start of focus month
+    horizon_4w_start = focus_start
+    horizon_4w_end = horizon_4w_start + timedelta(days=28)
+
     # Keep AR overdue alerts up to date (internally uses client settings)
-    ensure_overdue_ar_alert(selected_client_id, as_of=date.today(), min_days_overdue=0)
+    ensure_overdue_ar_alert(
+        selected_client_id,
+        as_of=as_of,           # 👈 end of selected month
+        min_days_overdue=0,
+    )
 
     # Load AR/AP + 14-week cash table once
     with st.spinner("Loading cash, invoices and commitments..."):
         df_ar, df_ap = fetch_ar_ap_for_client(selected_client_id)
         week_df = build_14_week_cash_table(selected_client_id, selected_month_start)
 
+    df_ar = normalise_ar_ap_for_cash(df_ar)
+    df_ap = normalise_ar_ap_for_cash(df_ap)
+
+
     # If settings exist, reuse their AR/AP default days for ageing helpers
     settings = get_client_settings(selected_client_id) or {}
     ar_days = int(settings.get("ar_default_days", 30))
     ap_days = int(settings.get("ap_default_days", 30))
 
-    today = date.today()
-    horizon_4w = today + timedelta(days=28)
 
     # --- Add ageing info for AR / AP if we have data ---
     if df_ar is not None and not df_ar.empty:
-        df_ar = add_ar_aging(df_ar, as_of=today, ar_default_days=ar_days)
+        df_ar = add_ar_aging(df_ar, as_of=as_of, ar_default_days=ar_days)
 
     if df_ap is not None and not df_ap.empty:
-        df_ap = add_ap_aging(df_ap, as_of=today, ap_default_days=ap_days)
+        df_ap = add_ap_aging(df_ap, as_of=as_of, ap_default_days=ap_days)
 
     # ------------------------------------------------------------------
     # 1) Top KPIs – Cash + AR/AP next 4 weeks
@@ -11108,28 +11213,35 @@ def page_cash_bills():
 
     if df_ar is not None and not df_ar.empty:
         ar_tmp = df_ar.copy()
-        # Choose expected date column
+
+        # 🔴 Use due_date as timing anchor
         date_col = None
-        if "expected_date" in ar_tmp.columns:
-            date_col = "expected_date"
-        elif "due_date" in ar_tmp.columns:
+        if "due_date" in ar_tmp.columns:
             date_col = "due_date"
+        elif "expected_date" in ar_tmp.columns:
+            date_col = "expected_date"
+
         if date_col is not None:
             ar_tmp[date_col] = pd.to_datetime(ar_tmp[date_col], errors="coerce")
-            mask_window = (ar_tmp[date_col].dt.date >= today) & (
-                ar_tmp[date_col].dt.date <= horizon_4w
-            )
 
             def _not_paid(row):
                 s = str(row.get("status", "")).lower()
                 return s not in ["paid", "closed", "settled"]
 
+            # 4-week window from Focus Month start
+            mask_window = (
+                (ar_tmp[date_col].dt.date >= horizon_4w_start)
+                & (ar_tmp[date_col].dt.date <= horizon_4w_end)
+            )
             mask_unpaid = ar_tmp.apply(_not_paid, axis=1)
+
+            amt_col = "effective_amount" if "effective_amount" in ar_tmp.columns else "amount"
             ar_next_4w = float(
-                ar_tmp.loc[mask_window & mask_unpaid, "amount"].fillna(0.0).sum()
+                ar_tmp.loc[mask_window & mask_unpaid, amt_col].fillna(0.0).sum()
             )
 
-        # Overdue AR
+
+        # Overdue AR (as of end of focus month)
         if "days_past_expected" in ar_tmp.columns:
             mask_overdue = (ar_tmp["days_past_expected"] > 0) & ar_tmp.apply(
                 _not_paid, axis=1
@@ -11138,45 +11250,52 @@ def page_cash_bills():
             ar_overdue_amt = float(overdue_rows["amount"].fillna(0.0).sum())
             ar_overdue_count = int(len(overdue_rows))
 
-    # Helper to get AP due next 4 weeks (unpaid)
+    # (AP side – only change is using due_date first)
     ap_next_4w = 0.0
     ap_overdue_amt = 0.0
     ap_overdue_count = 0
 
     if df_ap is not None and not df_ap.empty:
         ap_tmp = df_ap.copy()
-        # Choose expected pay date column
-        pay_col = None
-        if "pay_expected_date" in ap_tmp.columns:
-            pay_col = "pay_expected_date"
-        elif "expected_payment_date" in ap_tmp.columns:
-            pay_col = "expected_payment_date"
-        elif "due_date" in ap_tmp.columns:
-            pay_col = "due_date"
 
-        if pay_col is not None:
-            ap_tmp[pay_col] = pd.to_datetime(ap_tmp[pay_col], errors="coerce")
-            mask_window = (ap_tmp[pay_col].dt.date >= today) & (
-                ap_tmp[pay_col].dt.date <= horizon_4w
-            )
+        date_col = None
+        # 🔴 Prefer due_date
+        if "due_date" in ap_tmp.columns:
+            date_col = "due_date"
+        elif "expected_payment_date" in ap_tmp.columns:
+            date_col = "expected_payment_date"
+        elif "pay_expected_date" in ap_tmp.columns:
+            date_col = "pay_expected_date"
+
+        if date_col is not None:
+            ap_tmp[date_col] = pd.to_datetime(ap_tmp[date_col], errors="coerce")
 
             def _not_paid_ap(row):
                 s = str(row.get("status", "")).lower()
                 return s not in ["paid", "closed", "settled"]
 
-            mask_unpaid = ap_tmp.apply(_not_paid_ap, axis=1)
+            mask_window_ap = (
+                (ap_tmp[date_col].dt.date >= horizon_4w_start)
+                & (ap_tmp[date_col].dt.date <= horizon_4w_end)
+            )
+            mask_unpaid_ap = ap_tmp.apply(_not_paid_ap, axis=1)
+
             ap_next_4w = float(
-                ap_tmp.loc[mask_window & mask_unpaid, "amount"].fillna(0.0).sum()
+                ap_tmp.loc[mask_window_ap & mask_unpaid_ap, "amount"].fillna(0.0).sum()
             )
 
-        # Overdue AP
+        # Overdue AP (as of end of focus month)
         if "days_past_expected" in ap_tmp.columns:
             mask_overdue_ap = (ap_tmp["days_past_expected"] > 0) & ap_tmp.apply(
                 _not_paid_ap, axis=1
             )
             overdue_rows_ap = ap_tmp[mask_overdue_ap]
-            ap_overdue_amt = float(overdue_rows_ap["amount"].fillna(0.0).sum())
+            amt_col = "effective_amount" if "effective_amount" in overdue_rows_ap.columns else "amount"
+            ap_overdue_amt = float(overdue_rows_ap[amt_col].fillna(0.0).sum())
+
             ap_overdue_count = int(len(overdue_rows_ap))
+
+
 
     # Approximate "cash in bank now" from the 14-week table if available
     cash_now_label = "—"
@@ -11295,30 +11414,49 @@ def page_cash_bills():
         if df_ar is None or df_ar.empty:
             st.info("No AR records yet for this client.")
         else:
-            if "aging_bucket" in df_ar.columns and "amount" in df_ar.columns:
-                # Only non-paid invoices
-                def _not_paid(row):
-                    s = str(row.get("status", "")).lower()
-                    return s not in ["paid", "closed", "settled"]
+            # ------- Ageing summary using BALANCE DUE (effective_amount) -------
+            if "aging_bucket" in df_ar.columns:
+                def _is_cash_row(row):
+                    # after normalise, paid/cancelled/disputed already dropped
+                    if not bool(row.get("is_cash_relevant", True)):
+                        return False
+                    return float(row.get("effective_amount", 0.0)) > 0
 
-                df_not_paid = df_ar[df_ar.apply(_not_paid, axis=1)].copy()
+                df_age = df_ar[df_ar.apply(_is_cash_row, axis=1)].copy()
 
-                if df_not_paid.empty:
-                    st.caption("All customer invoices appear to be paid or closed.")
+                # Only invoices due on or before this month-end:
+                # i.e. days_past_expected >= 0
+                if "days_past_expected" in df_age.columns:
+                    df_age = df_age[df_age["days_past_expected"] >= 0]
+
+                if df_age.empty:
+                    st.caption("No open customer invoices due as of this month-end.")
                 else:
+                    amt_col = (
+                        "effective_amount"
+                        if "effective_amount" in df_age.columns
+                        else "amount"
+                    )
+
                     ageing_summary = (
-                        df_not_paid.groupby("aging_bucket", as_index=False)["amount"]
+                        df_age.groupby("aging_bucket", as_index=False)[amt_col]
                         .sum()
                         .rename(
                             columns={
                                 "aging_bucket": "Bucket",
-                                "amount": "Total amount",
+                                amt_col: "Total amount",
                             }
                         )
                     )
-                    st.dataframe(ageing_summary, width="stretch")
-                    st.caption("Unpaid customer invoices grouped by ageing bucket.")
 
+                    st.dataframe(ageing_summary, width="stretch")
+                    st.caption(
+                        "Open customer invoices due on or before this month-end, "
+                        "grouped by ageing bucket using **balance due** "
+                        "(after partial payments)."
+                    )
+
+            # ------- AR drilldown (shows original_amt, paid, balance) -------
             with st.expander("View AR invoice details (drilldown)", expanded=False):
                 ar_view = df_ar.copy()
                 cols = []
@@ -11330,6 +11468,10 @@ def page_cash_bills():
                     cols.append("expected_date")
                 if "amount" in ar_view.columns:
                     cols.append("amount")
+                if "amount_paid" in ar_view.columns:
+                    cols.append("amount_paid")
+                if "effective_amount" in ar_view.columns:
+                    cols.append("effective_amount")
                 if "due_date" in ar_view.columns:
                     cols.append("due_date")
                 if "status" in ar_view.columns:
@@ -11347,7 +11489,9 @@ def page_cash_bills():
                             "counterparty": "Customer",
                             "issued_date": "Issued",
                             "expected_date": "Expected",
-                            "amount": "Amount",
+                            "amount": "Original amount",
+                            "amount_paid": "Amount paid",
+                            "effective_amount": "Balance due",
                             "due_date": "Original due",
                             "status": "Status",
                             "days_past_expected": "Days overdue",
@@ -11364,20 +11508,115 @@ def page_cash_bills():
                     if filter_text:
                         ft = filter_text.lower()
                         mask = (
-                            ar_view["Customer"]
-                            .astype(str)
-                            .str.lower()
-                            .str.contains(ft)
-                            | ar_view["Status"]
-                            .astype(str)
-                            .str.lower()
-                            .str.contains(ft)
+                            ar_view["Customer"].astype(str).str.lower().str.contains(ft)
+                            | ar_view["Status"].astype(str).str.lower().str.contains(ft)
                         )
                         ar_view = ar_view[mask]
 
                     st.dataframe(ar_view, width="stretch")
                 else:
                     st.caption("AR table missing expected columns for detailed view.")
+
+        # 💳 Record AR payment
+    with st.expander("💳 Record a payment on an AR invoice", expanded=False):
+        ar_open = df_ar[
+            df_ar["is_cash_relevant"]
+            & (df_ar["effective_amount"] > 0)
+        ].copy()
+
+        if ar_open.empty:
+            st.caption("No open customer invoices to record payments against.")
+        else:
+            AR_TABLE_NAME = "ar_ap_tracker"  # 🔁 change to your real table name
+
+            # Build nice labels
+            label_map = {}
+            for _, r in ar_open.iterrows():
+                inv_id = r.get("id")
+                inv_no = r.get("invoice_number", inv_id)
+                cust = r.get("counterparty", "")
+                due = r.get("due_date", "")
+                bal = float(r.get("effective_amount") or 0.0)
+
+                try:
+                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
+                except Exception:
+                    due_txt = str(due)
+
+                label_map[inv_id] = (
+                    f"{inv_no} – {cust} – due {due_txt} – "
+                    f"bal {currency_symbol}{bal:,.0f}"
+                )
+
+            selected_id = st.selectbox(
+                "Select invoice to update",
+                options=list(label_map.keys()),
+                format_func=lambda x: label_map.get(x, str(x)),
+                key="ar_payment_invoice",
+            )
+
+            payment_type = st.radio(
+                "Payment type",
+                ["Full payment", "Partial payment"],
+                horizontal=True,
+                key="ar_payment_type",
+            )
+
+            current_row = ar_open[ar_open["id"] == selected_id].iloc[0]
+            current_balance = float(current_row.get("effective_amount") or 0.0)
+
+            default_amount = (
+                current_balance if payment_type == "Full payment" else 0.0
+            )
+
+            payment_amount = st.number_input(
+                "Amount paid",
+                min_value=0.0,
+                value=default_amount,
+                step=100.0,
+                key="ar_payment_amount",
+            )
+
+            payment_date = st.date_input(
+                "Payment date",
+                value=as_of,
+                key="ar_payment_date",
+            )
+
+            if st.button("Record AR payment", key="ar_payment_button"):
+                try:
+                    sb = get_supabase_client() or get_supabase_client()
+
+                    # How much was already paid?
+                    prev_paid = float(current_row.get("amount_paid") or 0.0)
+                    new_paid_total = prev_paid + float(payment_amount)
+
+                    # New status
+                    if new_paid_total >= float(current_row.get("amount") or 0.0) - 0.01:
+                        new_status = "paid"
+                        partially_paid_flag = False
+                    else:
+                        new_status = "open"
+                        partially_paid_flag = True
+
+                    update_data = {
+                        "amount_paid": new_paid_total,
+                        "partially_paid": partially_paid_flag,
+                        "status": new_status,
+                        "payment_date": payment_date.isoformat(),
+                        "updated_at": pd.Timestamp.utcnow().isoformat(),
+                    }
+
+                    (
+                        sb.table(AR_TABLE_NAME)
+                        .update(update_data)
+                        .eq("id", selected_id)
+                        .execute()
+                    )
+
+                    st.success("Payment recorded. Rerun the page to refresh ageing & cash.")
+                except Exception as e:
+                    st.error(f"Failed to record payment: {e}")
 
     # ---------- AP ageing summary ----------
     with col_ap:
@@ -11386,29 +11625,45 @@ def page_cash_bills():
         if df_ap is None or df_ap.empty:
             st.info("No AP records yet for this client.")
         else:
-            if "aging_bucket" in df_ap.columns and "amount" in df_ap.columns:
-                def _not_paid_ap(row):
-                    s = str(row.get("status", "")).lower()
-                    return s not in ["paid", "closed", "settled"]
+            # ------- Ageing summary using BALANCE DUE -------
+            if "aging_bucket" in df_ap.columns:
+                def _is_cash_row_ap(row):
+                    if not bool(row.get("is_cash_relevant", True)):
+                        return False
+                    return float(row.get("effective_amount", 0.0)) > 0
 
-                df_not_paid_ap = df_ap[df_ap.apply(_not_paid_ap, axis=1)].copy()
+                df_age_ap = df_ap[df_ap.apply(_is_cash_row_ap, axis=1)].copy()
 
-                if df_not_paid_ap.empty:
-                    st.caption("All supplier bills appear to be paid or closed.")
+                if "days_past_expected" in df_age_ap.columns:
+                    df_age_ap = df_age_ap[df_age_ap["days_past_expected"] >= 0]
+
+                if df_age_ap.empty:
+                    st.caption("No open supplier bills due as of this month-end.")
                 else:
+                    amt_col_ap = (
+                        "effective_amount"
+                        if "effective_amount" in df_age_ap.columns
+                        else "amount"
+                    )
+
                     ap_ageing_summary = (
-                        df_not_paid_ap.groupby("aging_bucket", as_index=False)["amount"]
+                        df_age_ap.groupby("aging_bucket", as_index=False)[amt_col_ap]
                         .sum()
                         .rename(
                             columns={
                                 "aging_bucket": "Bucket",
-                                "amount": "Total amount",
+                                amt_col_ap: "Total amount",
                             }
                         )
                     )
-                    st.dataframe(ap_ageing_summary, width="stretch")
-                    st.caption("Unpaid supplier bills grouped by ageing bucket.")
 
+                    st.dataframe(ap_ageing_summary, width="stretch")
+                    st.caption(
+                        "Open supplier bills due on or before this month-end, "
+                        "grouped by ageing bucket using **balance due**."
+                    )
+
+            # ------- AP drilldown -------
             with st.expander("View AP bill details (drilldown)", expanded=False):
                 ap_view = df_ap.copy()
                 cols = []
@@ -11416,6 +11671,10 @@ def page_cash_bills():
                     cols.append("counterparty")
                 if "amount" in ap_view.columns:
                     cols.append("amount")
+                if "amount_paid" in ap_view.columns:
+                    cols.append("amount_paid")
+                if "effective_amount" in ap_view.columns:
+                    cols.append("effective_amount")
                 if "due_date" in ap_view.columns:
                     cols.append("due_date")
                 if "pay_expected_date" in ap_view.columns:
@@ -11435,7 +11694,9 @@ def page_cash_bills():
                     ap_view = ap_view[cols].rename(
                         columns={
                             "counterparty": "Supplier",
-                            "amount": "Amount",
+                            "amount": "Original amount",
+                            "amount_paid": "Amount paid",
+                            "effective_amount": "Balance due",
                             "due_date": "Original due",
                             "pay_expected_date": "Expected to pay",
                             "expected_payment_date": "Expected to pay",
@@ -11469,19 +11730,137 @@ def page_cash_bills():
                 else:
                     st.caption("AP table missing expected columns for detailed view.")
 
-    # ------------------------------------------------------------------
+    # 💳 Record AP payment
+    with st.expander("💳 Record a payment on an AP bill", expanded=False):
+        ap_open = df_ap[
+            df_ap["is_cash_relevant"]
+            & (df_ap["effective_amount"] > 0)
+        ].copy()
+
+        if ap_open.empty:
+            st.caption("No open supplier bills to record payments against.")
+        else:
+            AP_TABLE_NAME = "ar_ap_tracker"  # 🔁 change if AP lives in a different table
+
+            label_map_ap = {}
+            for _, r in ap_open.iterrows():
+                bill_id = r.get("id")
+                bill_no = r.get("invoice_number", bill_id)
+                supp = r.get("counterparty", "")
+                due = r.get("due_date", "")
+                bal = float(r.get("effective_amount") or 0.0)
+
+                try:
+                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
+                except Exception:
+                    due_txt = str(due)
+
+                label_map_ap[bill_id] = (
+                    f"{bill_no} – {supp} – due {due_txt} – "
+                    f"bal {currency_symbol}{bal:,.0f}"
+                )
+
+            selected_bill_id = st.selectbox(
+                "Select bill to update",
+                options=list(label_map_ap.keys()),
+                format_func=lambda x: label_map_ap.get(x, str(x)),
+                key="ap_payment_bill",
+            )
+
+            payment_type_ap = st.radio(
+                "Payment type",
+                ["Full payment", "Partial payment"],
+                horizontal=True,
+                key="ap_payment_type",
+            )
+
+            current_ap_row = ap_open[ap_open["id"] == selected_bill_id].iloc[0]
+            current_balance_ap = float(current_ap_row.get("effective_amount") or 0.0)
+
+            default_amount_ap = (
+                current_balance_ap if payment_type_ap == "Full payment" else 0.0
+            )
+
+            payment_amount_ap = st.number_input(
+                "Amount paid",
+                min_value=0.0,
+                value=default_amount_ap,
+                step=100.0,
+                key="ap_payment_amount",
+            )
+
+            payment_date_ap = st.date_input(
+                "Payment date",
+                value=as_of,
+                key="ap_payment_date",
+            )
+
+            if st.button("Record AP payment", key="ap_payment_button"):
+                try:
+                    sb = get_supabase_client() or get_supabase_client()
+
+                    prev_paid_ap = float(current_ap_row.get("amount_paid") or 0.0)
+                    new_paid_total_ap = prev_paid_ap + float(payment_amount_ap)
+
+                    if new_paid_total_ap >= float(current_ap_row.get("amount") or 0.0) - 0.01:
+                        new_status_ap = "paid"
+                        partially_paid_flag_ap = False
+                    else:
+                        new_status_ap = "open"
+                        partially_paid_flag_ap = True
+
+                    update_data_ap = {
+                        "amount_paid": new_paid_total_ap,
+                        "partially_paid": partially_paid_flag_ap,
+                        "status": new_status_ap,
+                        "payment_date": payment_date_ap.isoformat(),
+                        "updated_at": pd.Timestamp.utcnow().isoformat(),
+                    }
+
+                    (
+                        sb.table(AP_TABLE_NAME)
+                        .update(update_data_ap)
+                        .eq("id", selected_bill_id)
+                        .execute()
+                    )
+
+                    st.success("Payment recorded. Rerun the page to refresh ageing & cash.")
+                except Exception as e:
+                    st.error(f"Failed to record payment: {e}")
+
+# ------------------------------------------------------------------
     # 3) Cash commitments (near-term list)
     # ------------------------------------------------------------------
     st.markdown("---")
     st.subheader("🔍 Cash commitments coming up")
 
-    commitments = build_cash_commitments(df_ar, df_ap, limit=7)
+    commitments = build_cash_commitments(
+        df_ar,
+        df_ap,
+        as_of=as_of,        # 👈 end of selected month (e.g. 31 Jul 2025)
+        horizon_days=60,    # near-term view, tweak if you like
+        limit=7,
+    )
 
     if commitments.empty:
         st.info("No upcoming cash movements found yet.")
     else:
-        st.dataframe(commitments, width="stretch")
-        st.caption("Top upcoming customer receipts and supplier payments.")
+        display_commitments = commitments.rename(
+            columns={
+                "direction": "Direction",
+                "who": "Customer / Supplier",
+                "amount": "Amount",
+                "date": "Planned date",
+                "original_due": "Original due",
+                "overdue": "Overdue?",
+            }
+        )
+
+        st.dataframe(display_commitments, width="stretch")
+        st.caption(
+            "Top upcoming customer receipts and supplier payments. "
+            "`Overdue? = Yes` means the original due date was before this Focus Month and is still unpaid."
+        )
 
     # ------------------------------------------------------------------
     # 4) 14-week cashflow – chart + table + narrative
@@ -11496,7 +11875,13 @@ def page_cash_bills():
         )
     else:
         view = week_df.copy()
+
+        # Ensure week_start is datetime before using .dt
+        if "week_start" in view.columns:
+            view["week_start"] = pd.to_datetime(view["week_start"], errors="coerce")
+
         view["Week"] = view["week_start"].dt.strftime("%d %b %Y")
+
 
         cols = [
             "Week",
@@ -11706,19 +12091,352 @@ def page_cash_bills():
 
     st.info("\n".join([f"• {a}" for a in actions]))
 
-    # ------------------------------------------------------------------
-    # 5) Collaboration: comments + tasks (bottom-right)
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    col_comments, col_tasks = st.columns([3, 1])
+     
 
-    with col_comments:
-        comments_block("cash_bills")
+def recompute_cashflow_from_ar_ap(
+    client_id,
+    base_month: date,
+    n_months: int = 12,
+    opening_cash_hint: float | None = None,
+) -> bool:
+    if client_id is None or base_month is None:
+        return False
 
-    with col_tasks:
-        with st.expander("✅ Tasks for this page", expanded=False):
-            tasks_block("cash_bills")
+    try:
+        # Normalise base_month to first of month
+        base_month_ts = pd.to_datetime(base_month).replace(day=1)
+        as_of_date = base_month_ts.date()  # 👈 this will be our as_of_month
 
+        # Treat "as-of" as end of that Focus Month (still naive)
+        as_of_cutoff = base_month_ts + pd.offsets.MonthEnd(0)
+
+        # Month index for forecast horizon
+        month_index = pd.date_range(start=base_month_ts, periods=n_months, freq="MS")
+
+        # ---------- Settings ----------
+        settings = get_client_settings(client_id)
+        ar_days = int(settings.get("ar_default_days", 30))
+        ap_days = int(settings.get("ap_default_days", 30))
+
+        # ---------- AR / AP invoices ----------
+        df_ar, df_ap = fetch_ar_ap_for_client(client_id)
+
+        # ----- AR -----
+        if df_ar is not None and not df_ar.empty:
+            df_ar = df_ar.copy()
+            df_ar = add_ar_aging(df_ar, as_of=as_of_date, ar_default_days=ar_days)
+            df_ar["expected_date"] = pd.to_datetime(
+                df_ar.get("expected_date"), errors="coerce"
+            )
+            df_ar["amount"] = pd.to_numeric(
+                df_ar.get("amount"), errors="coerce"
+            ).fillna(0.0)
+        else:
+            df_ar = pd.DataFrame(columns=["id", "expected_date", "amount"])
+
+        # ----- AP -----
+        if df_ap is not None and not df_ap.empty:
+            df_ap = df_ap.copy()
+            df_ap = add_ap_aging(df_ap, as_of=as_of_date, ap_default_days=ap_days)
+
+            if "pay_expected_date" in df_ap.columns:
+                pay_col = "pay_expected_date"
+            elif "expected_payment_date" in df_ap.columns:
+                pay_col = "expected_payment_date"
+            else:
+                pay_col = "due_date"
+
+            df_ap[pay_col] = pd.to_datetime(df_ap.get(pay_col), errors="coerce")
+            df_ap["amount"] = pd.to_numeric(
+                df_ap.get("amount"), errors="coerce"
+            ).fillna(0.0)
+        else:
+            df_ap = pd.DataFrame(columns=["id", "due_date", "amount"])
+            pay_col = "due_date"
+
+        # ---------- Payments (for partial payments + actual timing) ----------
+        df_pay = fetch_ar_ap_payments_for_client(client_id)
+        ar_cash_map, ap_cash_map = build_monthly_ar_ap_cash_maps(
+            df_ar=df_ar,
+            df_ap=df_ap,
+            df_payments=df_pay,
+            month_index=month_index,
+        )
+
+        # ---------- Opex ----------
+        try:
+            df_opex = fetch_opex_for_client(client_id)
+            if df_opex is not None and not df_opex.empty:
+                df_opex = df_opex.copy()
+                df_opex["month_bucket"] = (
+                    pd.to_datetime(df_opex["month_date"], errors="coerce")
+                    .dt.to_period("M")
+                    .dt.to_timestamp()
+                )
+            else:
+                df_opex = pd.DataFrame(columns=["month_bucket", "amount"])
+        except Exception as e:
+            print("Error fetching operating_opex:", e)
+            df_opex = pd.DataFrame(columns=["month_bucket", "amount"])
+
+        # ---------- Operating other income (cash-in by month) ----------
+        try:
+            df_oinc = fetch_operating_other_income_for_client(client_id)
+        except Exception as e:
+            print("Error fetching operating_other_income:", e)
+            df_oinc = pd.DataFrame()
+
+        if df_oinc is None or df_oinc.empty:
+            df_oinc = pd.DataFrame(columns=["month_bucket", "cash_in"])
+
+        if not df_oinc.empty:
+            # Ensure month_bucket + numeric cash_in
+            if "month_bucket" not in df_oinc.columns:
+                df_oinc["month_bucket"] = (
+                    pd.to_datetime(df_oinc["month_date"], errors="coerce")
+                    .dt.to_period("M")
+                    .dt.to_timestamp()
+                )
+            df_oinc["cash_in"] = pd.to_numeric(
+                df_oinc.get("cash_in"), errors="coerce"
+            ).fillna(0.0)
+
+            oinc_agg = (
+                df_oinc.groupby("month_bucket", as_index=False)["cash_in"]
+                .sum()
+                .rename(columns={"month_bucket": "month_date"})
+            )
+            other_income_by_month: dict[pd.Timestamp, float] = {
+                row["month_date"]: float(row["cash_in"] or 0.0)
+                for _, row in oinc_agg.iterrows()
+            }
+
+            print("[DEBUG] other_operating_income by month:")
+            for k, v in other_income_by_month.items():
+                print(f"  {k.strftime('%Y-%m-%d')}: {v:.2f}")
+        else:
+            other_income_by_month = {}
+
+        # ---------- Investing & Financing moves ----------
+        try:
+            df_inv = fetch_investing_flows_for_client(client_id)
+        except Exception as e:
+            print("Error fetching investing_flows:", e)
+            df_inv = None
+
+        try:
+            df_fin = fetch_financing_flows_for_client(client_id)
+        except Exception as e:
+            print("Error fetching financing_flows:", e)
+            df_fin = None
+
+        inv_by_month: dict[pd.Timestamp, float] = {}
+        if df_inv is not None and not df_inv.empty:
+            # Keep a copy WITHOUT filtering for fallback
+            orig_df_inv = df_inv.copy()
+            df_inv = df_inv.copy()
+
+            # Optional versioning by created_at – but only if it actually works
+            if "created_at" in df_inv.columns:
+                df_inv["created_at"] = pd.to_datetime(
+                    df_inv["created_at"], errors="coerce"
+                )
+                # Drop timezone if present
+                try:
+                    df_inv["created_at"] = df_inv["created_at"].dt.tz_convert(None)
+                except TypeError:
+                    pass  # already naive
+
+                before_len = len(df_inv)
+                df_inv = df_inv[df_inv["created_at"] <= as_of_cutoff]
+                after_len = len(df_inv)
+                print(
+                    f"[DEBUG] investing_flows created_at filter: "
+                    f"{before_len} -> {after_len} rows (as_of_cutoff={as_of_cutoff.date()})"
+                )
+
+                # 🔁 Fallback: if everything got filtered out, ignore created_at for now
+                if after_len == 0:
+                    print(
+                        "[WARN] investing_flows all filtered out by created_at; "
+                        "falling back to using all investing rows without versioning."
+                    )
+                    df_inv = orig_df_inv
+
+            # Now aggregate by month_date
+            df_inv["month_bucket"] = (
+                pd.to_datetime(df_inv["month_date"], errors="coerce")
+                .dt.to_period("M")
+                .dt.to_timestamp()
+            )
+            inv_agg = (
+                df_inv.groupby("month_bucket", as_index=False)["amount"]
+                .sum()
+                .rename(columns={"month_bucket": "month_date"})
+            )
+            inv_by_month = {
+                row["month_date"]: float(row["amount"] or 0.0)
+                for _, row in inv_agg.iterrows()
+            }
+
+
+        fin_by_month: dict[pd.Timestamp, float] = {}
+        if df_fin is not None and not df_fin.empty:
+            df_fin = df_fin.copy()
+
+            # ⬇️ NEW: same timezone-normalisation as investing
+            if "created_at" in df_fin.columns:
+                df_fin["created_at"] = pd.to_datetime(
+                    df_fin["created_at"], errors="coerce"
+                )
+                try:
+                    df_fin["created_at"] = df_fin["created_at"].dt.tz_convert(None)
+                except TypeError:
+                    pass
+
+                df_fin = df_fin[df_fin["created_at"] <= as_of_cutoff]
+
+            df_fin["month_bucket"] = (
+                pd.to_datetime(df_fin["month_date"], errors="coerce")
+                .dt.to_period("M")
+                .dt.to_timestamp()
+            )
+            fin_agg = (
+                df_fin.groupby("month_bucket", as_index=False)["amount"]
+                .sum()
+                .rename(columns={"month_bucket": "month_date"})
+            )
+            fin_by_month = {
+                row["month_date"]: float(row["amount"] or 0.0)
+                for _, row in fin_agg.iterrows()
+            }
+
+        # ---------- Payroll by month ----------
+        payroll_by_month = compute_payroll_by_month(client_id, month_index)
+
+        # ---------- Opening cash ----------
+        if opening_cash_hint is not None:
+            opening_cash_0 = float(opening_cash_hint)
+        else:
+            kpi_row = fetch_kpis_for_client_month(client_id, as_of_date)
+            opening_cash_0 = 0.0
+            if kpi_row and "cash_balance" in kpi_row:
+                try:
+                    opening_cash_0 = float(kpi_row["cash_balance"])
+                except Exception:
+                    opening_cash_0 = 0.0
+
+        rows = []
+        current_closing = opening_cash_0
+
+        for m in month_index:
+            m_key = pd.to_datetime(m).to_period("M").to_timestamp()
+            opening_cash = current_closing
+
+            cash_in_ar = float(ar_cash_map.get(m_key, 0.0))
+            cash_out_ap = float(ap_cash_map.get(m_key, 0.0))
+            payroll_cash = float(payroll_by_month.get(m_key, 0.0))
+
+            if df_opex is not None and not df_opex.empty:
+                mask_ox = df_opex["month_bucket"] == m_key
+                opex_cash = float(df_opex.loc[mask_ox, "amount"].sum())
+            else:
+                opex_cash = 0.0
+
+            other_income_cash = float(other_income_by_month.get(m_key, 0.0))
+            investing_cf = float(inv_by_month.get(m_key, 0.0))
+            financing_cf = float(fin_by_month.get(m_key, 0.0))
+
+            operating_cf = (
+                cash_in_ar
+                + other_income_cash
+                - cash_out_ap
+                - payroll_cash
+                - opex_cash
+            )
+            free_cf = operating_cf + investing_cf + financing_cf
+            closing_cash = opening_cash + free_cf
+            cash_danger_flag = closing_cash <= 0.0
+
+            print(
+                f"[ENGINE] {m_key.strftime('%Y-%m')} | "
+                f"open={opening_cash:.2f}, ar_in={cash_in_ar:.2f}, "
+                f"other_in={other_income_cash:.2f}, ap_out={cash_out_ap:.2f}, "
+                f"payroll={payroll_cash:.2f}, opex={opex_cash:.2f}, "
+                f"inv={investing_cf:.2f}, fin={financing_cf:.2f}, "
+                f"free_cf={free_cf:.2f}, close={closing_cash:.2f}"
+            )
+
+            rows.append(
+                {
+                    "client_id": str(client_id),
+                    "month_date": m_key.date().isoformat(),
+                    "as_of_month": as_of_date.isoformat(),   # plan version stays
+                    "opening_cash": round(opening_cash, 2),
+                    "operating_cf": round(operating_cf, 2),
+                    "investing_cf": round(investing_cf, 2),
+                    "financing_cf": round(financing_cf, 2),
+                    "free_cash_flow": round(free_cf, 2),
+                    "closing_cash": round(closing_cash, 2),
+                    "cash_danger_flag": cash_danger_flag,
+                    "notes": None,
+                }
+            )
+
+            current_closing = closing_cash
+
+            # end for m in month_index
+
+        if not rows:
+            print("No rows computed for cashflow_summary recompute.")
+            return False
+
+        # ---------- Persist: replace ALL rows for this client ----------
+        try:
+            supabase.table("cashflow_summary") \
+                .delete() \
+                .eq("client_id", str(client_id)) \
+                .execute()
+        except Exception as e:
+            print("Warning deleting old cashflow_summary rows:", e)
+
+        try:
+            resp = supabase.table("cashflow_summary").insert(rows).execute()
+        except Exception as e:
+            print("Error recomputing cashflow_summary:", e)
+            return False
+
+        if isinstance(resp, dict) and resp.get("error"):
+            print("Error recomputing cashflow_summary:", resp["error"])
+            return False
+
+        print(
+            f"Recomputed {len(rows)} rows into cashflow_summary "
+            f"for as_of_month={as_of_date}"
+        )
+
+        # 🔁 Clear cached cashflow + alerts so UI sees fresh data
+        try:
+            fetch_cashflow_summary_for_client.clear()
+        except Exception:
+            pass
+
+        try:
+            fetch_alerts_for_client.clear()
+        except Exception:
+            pass
+
+        # 🚨 Run alerts for all months in this engine horizon
+        try:
+            run_all_alerts_for_client_months(client_id, month_index)
+        except Exception as e:
+            print(f"Warning running alerts after cashflow recompute: {e}")
+
+        return True
+
+    except Exception as e:
+        print("Error recomputing cashflow_summary:", e)
+        return False
 
 
 def cash_flows_editor_block():
