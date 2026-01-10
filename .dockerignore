@@ -1,0 +1,39 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Streamlit / logs
+.streamlit/
+*.log
+
+# Data / outputs (customize as needed)
+*.csv
+*.parquet
+*.db
+*.sqlite
+*.zip
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

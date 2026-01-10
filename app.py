@@ -15,12 +15,37 @@ import io
 from postgrest.exceptions import APIError
 import matplotlib.pyplot as plt
 from pandas.tseries.offsets import MonthEnd
+from ui.plotly_charts import (
+    PLOTLY_CONFIG_MINIMAL,
+    fig_cashflow_outlook_12m,
+    fig_revenue_trend,
+    fig_payroll_vs_other_cost,
+)
+from ui.layout import apply_global_layout
+
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
 
 #import Fundtion for Board Reportinf
 from io import BytesIO
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN
+
+
+
+#####------Booting the page------####
+import streamlit as st
+
+BOOT_STEPS = [
+    "Initialising workspace",
+    "Loading client profile",
+    "Fetching cashflow summary",
+    "Preparing charts",
+]
+
+
 
 # ---------- Supabase config ----------
 
@@ -35,7 +60,7 @@ def get_supabase_client():
 supabase = get_supabase_client()
 
 st.set_page_config(page_title="Matfina – Founder Financial Intelligence", layout="wide")
-
+apply_global_layout()
 #......Month Seection.......$
 
 
@@ -701,8 +726,8 @@ def get_task_page_options(client_id: str) -> List[str]:
         "sales_deals",
         "team_spending",
         "cash_bills",
-        "alerts_todos",
-        "collaboration_hub",
+        "investing_financing",
+        "configuration",
     ]
 
     resp = (
@@ -2597,86 +2622,237 @@ def _build_scenario_impact_bullet(
     # Single bullet, board-grade, no fluff
     return "Scenario impact: " + " | ".join(parts)
 
+
+def _months_until_cliff_start(cliff_ts_exact: pd.Timestamp | None) -> pd.Timestamp | None:
+    """
+    Fundraising should begin ~3 months before the cliff (buffer breach).
+    """
+    if cliff_ts_exact is None:
+        return None
+    return (pd.to_datetime(cliff_ts_exact) - pd.DateOffset(months=3)).to_period("M").to_timestamp()
+
+
+def _is_funding_required(
+    *,
+    runway_months_to_buffer: float | None,
+    cliff_ts_exact: pd.Timestamp | None,
+    cash_buffer: float,
+    # thresholds are CFO-tunable; keep conservative
+    urgent_threshold_m: float = 9.0,
+) -> bool:
+    """
+    CFO definition: funding is "required" when execution risk becomes material within planning horizon.
+    Default threshold: < 9 months runway-to-buffer OR a visible cliff inside window.
+    """
+    if cash_buffer <= 0:
+        # If no buffer, we can't defend "not required" confidently
+        return True
+    if cliff_ts_exact is not None:
+        return True
+    if runway_months_to_buffer is not None and runway_months_to_buffer < urgent_threshold_m:
+        return True
+    return False
+
+
+# ============================================================
+# What this means (5 roles, structurally enforced)
+# ============================================================
 def _build_what_this_means_bullets(
     *,
     runway_months_to_buffer: float | None,
     cliff_ts_exact: pd.Timestamp | None,
     cash_buffer: float,
     debt_used: bool,
-    scenario_summaries: list[dict] | None = None,   # ✅ NEW
+    scenario_summaries: list[dict] | None = None,
 ) -> list[str]:
-    bullets: list[str] = []
+    """
+    CFO STRUCTURE (exact roles; max 5 bullets):
+      1) Liquidity outcome (buffer/cliff state)
+      2) Time available (runway)
+      3) Decision deadline (raise start date)
+      4) Scenario update (what founder explored + impact) OR trade-off clarity fallback
+      5) Primary decision implication (singular)
+    """
+    bullets_by_role: dict[str, str] = {}
 
-    # 1) Survival risk
+    funding_required = _is_funding_required(
+        runway_months_to_buffer=runway_months_to_buffer,
+        cliff_ts_exact=cliff_ts_exact,
+        cash_buffer=cash_buffer,
+        urgent_threshold_m=9.0,
+    )
+
+    # 1) Liquidity outcome
     if cash_buffer > 0:
         if cliff_ts_exact is not None:
-            bullets.append(
-                f"Survival risk: Under the base case, cash stress (below buffer) occurs around **{_fmt_month(cliff_ts_exact)}**."
+            bullets_by_role["liquidity_outcome"] = (
+                f"Liquidity outcome: Under the base case, cash stress (below buffer) occurs around {_fmt_month(cliff_ts_exact)}."
             )
         else:
-            bullets.append(
-                "Survival risk: Under the base case, cash stays above the safety buffer across the current 12-month window."
+            bullets_by_role["liquidity_outcome"] = (
+                "Liquidity outcome: Under the base case, cash stays above the safety buffer across the current 12-month window."
             )
     else:
-        bullets.append(
-            "Survival risk: No safety buffer is set, so an ‘operationally unsafe’ cliff cannot be assessed defensibly."
+        bullets_by_role["liquidity_outcome"] = (
+            "Liquidity outcome: No safety buffer is set, so an ‘operationally unsafe’ cliff cannot be assessed defensibly."
         )
 
-    # 2) Timing pressure
-    if cash_buffer > 0 and cliff_ts_exact is not None:
-        start_raise_ts = (pd.to_datetime(cliff_ts_exact) - pd.DateOffset(months=3)).to_period("M").to_timestamp()
-        bullets.append(
-            f"Timing pressure: If a raise is required, fundraising should begin no later than **{_fmt_month(start_raise_ts)}** to stay ahead of the buffer breach."
-        )
-    else:
-        bullets.append(
-            "Timing pressure: Even when a cliff is not visible in-window, funding cycles and documentation lead times still create timing risk."
-        )
-
-    # 3) Funding sufficiency
+    # 2) Time available
     if cash_buffer > 0:
         if runway_months_to_buffer is not None:
-            bullets.append(
-                f"Funding sufficiency: Runway to buffer breach is **{runway_months_to_buffer:.1f} months** under the base case."
+            bullets_by_role["time_available"] = (
+                f"Time available: Runway to buffer breach is {runway_months_to_buffer:.1f} months under the base case."
             )
         else:
-            bullets.append(
-                "Funding sufficiency: Runway to buffer breach is not available yet — validate inputs and rebuild the 14-week cash table."
+            bullets_by_role["time_available"] = (
+                "Time available: Runway to buffer breach is not available yet — validate inputs and rebuild the cashflow engine outputs."
             )
     else:
-        bullets.append(
-            "Funding sufficiency: Set a cash safety buffer to measure runway in a board-defensible way (buffer breach, not zero cash)."
+        bullets_by_role["time_available"] = (
+            "Time available: Set a cash safety buffer to measure runway in a board-defensible way (buffer breach, not zero cash)."
         )
 
-    # 4) Trade-off clarity OR Scenario impact (replacement rule)
+    # 3) Decision deadline (fundraising start date)
+    if cash_buffer > 0 and cliff_ts_exact is not None:
+        start_raise_ts = _months_until_cliff_start(cliff_ts_exact)
+        bullets_by_role["decision_deadline"] = (
+            f"Decision deadline: If funding is required, fundraising should begin no later than {_fmt_month(start_raise_ts)} to stay ahead of the buffer breach."
+        )
+    else:
+        # Still CFO-true even in Optionality Mode
+        bullets_by_role["decision_deadline"] = (
+            "Decision deadline: Even when a cliff is not visible in-window, funding cycles and documentation lead times still require a defined trigger and timeline."
+        )
+
+    # 4) Scenario update OR trade-off clarity fallback
     scenario_bullet = _build_scenario_impact_bullet(
         scenario_summaries=scenario_summaries,
         base_runway=runway_months_to_buffer,
         base_cliff=cliff_ts_exact,
     )
     if scenario_bullet:
-        bullets.append(scenario_bullet)
+        bullets_by_role["scenario_update"] = f"Scenario update: {scenario_bullet}"
     else:
+        # Fallback must still be CFO-useful and non-repetitive
         if debt_used:
-            bullets.append(
-                "Trade-off clarity: Debt improves near-term liquidity but introduces repayment/covenant risk that must be stress-tested before committing."
+            bullets_by_role["scenario_update"] = (
+                "Scenario update: Debt can improve near-term liquidity, but repayment/covenant risk must be stress-tested before committing."
             )
         else:
-            bullets.append(
-                "Trade-off clarity: Runway is primarily a function of burn control and the timing/size of funding — small timing shifts can materially change outcomes."
+            bullets_by_role["scenario_update"] = (
+                "Scenario update: Outcomes are most sensitive to burn control and funding timing; small timing shifts can materially change the buffer trajectory."
             )
 
-    # 5) Decision priority
-    if cash_buffer > 0 and runway_months_to_buffer is not None and runway_months_to_buffer < 6:
-        bullets.append(
-            "Decision priority: The most defensible path is to **start fundraising immediately** while tightening burn levers to protect runway."
+    # 5) Primary decision implication (singular, mode-aware)
+    if funding_required:
+        bullets_by_role["decision_implication"] = (
+            "Decision implication: The most defensible path is to initiate fundraising now (amount + instrument) while tightening burn levers to protect runway."
+            if (cash_buffer > 0 and runway_months_to_buffer is not None and runway_months_to_buffer < 6)
+            else
+            "Decision implication: Confirm the funding plan (amount + timing + instrument) and align spend/hiring guardrails to runway protection."
         )
     else:
-        bullets.append(
-            "Decision priority: Lock a funding plan (amount + timing + instrument) and align spend/hiring decisions to runway protection."
+        bullets_by_role["decision_implication"] = (
+            "Decision implication: No immediate funding is required under the base case — preserve optionality (ready-to-raise posture) while enforcing runway guardrails."
         )
 
-    return bullets[:5]
+    # Enforced order (roles)
+    ordered_roles = [
+        "liquidity_outcome",
+        "time_available",
+        "decision_deadline",
+        "scenario_update",
+        "decision_implication",
+    ]
+
+    out = [bullets_by_role[r] for r in ordered_roles if bullets_by_role.get(r)]
+    return out[:5]
+
+
+# ============================================================
+# Action plan (two-mode: Funding Required vs Optionality Mode)
+# ============================================================
+def _build_action_plan_30_90(
+    *,
+    runway_months_to_buffer: float | None,
+    cliff_ts_exact: pd.Timestamp | None,
+    cash_buffer: float,
+    debt_used: bool,
+) -> list[str]:
+    """
+    TWO MODE ACTION PLAN (CFO):
+      Mode A: Funding Required (4–6 bullets)
+      Mode B: Optionality Mode (3–4 bullets)
+
+    Uses your same inputs. No new params required.
+    """
+    funding_required = _is_funding_required(
+        runway_months_to_buffer=runway_months_to_buffer,
+        cliff_ts_exact=cliff_ts_exact,
+        cash_buffer=cash_buffer,
+        urgent_threshold_m=9.0,
+    )
+
+    # -----------------------------
+    # Mode B: Optionality Mode
+    # -----------------------------
+    if not funding_required:
+        actions: list[str] = []
+
+        actions.append(
+            "Within 30 days: Confirm the board’s funding trigger policy (e.g., raise starts if runway to buffer falls below 9 months or a cliff appears in-window)."
+        )
+        actions.append(
+            "Within 30 days: Maintain a ready-to-raise posture (deck + model + use-of-funds + investor target list kept current)."
+        )
+        actions.append(
+            "Within 60–90 days: Approve runway guardrails for spend/hiring (thresholds + approval gates) to prevent silent runway erosion."
+        )
+        actions.append(
+            "Ongoing: Review runway to buffer, scenario deltas, and funding triggers at each board meeting (monthly cadence)."
+        )
+
+        # Keep Optionality Mode tight (3–4 bullets)
+        return actions[:4]
+
+    # -----------------------------
+    # Mode A: Funding Required
+    # -----------------------------
+    actions: list[str] = []
+
+    # If buffer not set, force it first (board-defensible)
+    if cash_buffer <= 0:
+        actions.append("Within 7 days: Set a formal cash safety buffer in Client Settings and re-run runway/cliff analysis.")
+        actions.append("Within 14 days: Validate the cashflow engine inputs driving burn (payroll, opex, AR assumptions).")
+
+    # Urgency tiering
+    if runway_months_to_buffer is not None and runway_months_to_buffer < 6:
+        actions.append("Within 7 days: Begin fundraising immediately (confirm target amount, instrument, and investor list).")
+        actions.append("Within 14 days: Prepare investor pack (deck, model, use-of-funds, milestones) and schedule first meetings.")
+        actions.append("Within 30 days: Tighten burn controls (freeze non-critical spend; require approval gates for new commitments).")
+        actions.append("Within 30 days: Secure bridge options (SAFE/convertible/credit line) to remove timing failure risk.")
+    elif (cliff_ts_exact is not None) or (runway_months_to_buffer is not None and runway_months_to_buffer < 9):
+        actions.append("Within 14 days: Set a board-approved fundraising start date and lock the raise plan (amount + instrument).")
+        actions.append("Within 30 days: Finalise investor materials and launch outreach (pipeline + meeting targets).")
+        actions.append("Within 30 days: Build a bridge contingency plan (terms, counterparties, documentation readiness).")
+        actions.append("Within 30 days: Tighten runway guardrails (approval gates; defer non-essential commitments).")
+    else:
+        # Funding required due to cliff visibility even if runway looks long, or buffer unset, etc.
+        actions.append("Within 30 days: Confirm funding strategy (raise amount + timing + instrument) and align it to milestones.")
+        actions.append("Within 60 days: Finalise investor materials and pre-wire a shortlist of priority investors/partners.")
+        actions.append("Within 60–90 days: Run base/downside/raise-now scenarios and approve spend/hiring guardrails to protect runway.")
+
+    # Debt-specific risk removal
+    if debt_used:
+        actions.append("Within 14 days: Stress-test repayments and confirm covenant compliance under downside scenarios.")
+
+    # Enforce 4–6 actions, avoid vagueness
+    actions = actions[:6]
+    if len(actions) < 4:
+        actions.append("Within 30 days: Confirm the earliest board decision deadline for funding (lead time + legal + investor cycle).")
+
+    return actions[:6]
+
 
 def _get_saved_scenario_summaries_safe(selected_client_id, selected_month_start) -> list[dict]:
     """
@@ -2701,53 +2877,7 @@ def _get_saved_scenario_summaries_safe(selected_client_id, selected_month_start)
 
     return []
 
-
-def _build_action_plan_30_90(
-    *,
-    runway_months_to_buffer: float | None,
-    cliff_ts_exact: pd.Timestamp | None,
-    cash_buffer: float,
-    debt_used: bool,
-) -> list[str]:
-    """
-    4–6 time-bound, board-defensible actions.
-    """
-    actions: list[str] = []
-
-    # If buffer not set, force it first (otherwise cliff/runway is not defensible)
-    if cash_buffer <= 0:
-        actions.append("Within 7 days: Set a formal cash safety buffer in Client Settings and re-run runway/cliff analysis.")
-        actions.append("Within 14 days: Validate the cashflow engine inputs driving burn (payroll, opex, AR assumptions).")
-
-    # Cash cliff < 6 months
-    if runway_months_to_buffer is not None and runway_months_to_buffer < 6:
-        actions.append("Within 7 days: Begin fundraising immediately (define target amount, instrument, and investor list).")
-        actions.append("Within 14 days: Prepare investor pack (deck, model, use-of-funds, milestones) and schedule first meetings.")
-        actions.append("Within 30 days: Tighten burn controls (freeze non-critical spend; require approval gates for new commitments).")
-        actions.append("Within 30 days: Secure bridge options (SAFE/convertible/credit line) to remove timing failure risk.")
-
-    # Funding timing risk exists (conservative: cliff exists OR runway < 9 months)
-    elif (cliff_ts_exact is not None) or (runway_months_to_buffer is not None and runway_months_to_buffer < 9):
-        actions.append("Within 14 days: Bring forward fundraising timeline and set a board-approved raise start date.")
-        actions.append("Within 30 days: Build a bridge contingency plan (terms, counterparties, documentation readiness).")
-        actions.append("Within 30 days: Accelerate collections (tighten payment terms, follow-ups, and invoicing cadence).")
-
-    else:
-        actions.append("Within 30 days: Define funding strategy (raise amount + timing) even if not urgent, and align it to milestones.")
-        actions.append("Within 60–90 days: Run at least 3 scenarios (base, downside, raise-now) and approve guardrails for spend/hiring.")
-
-    # If debt used
-    if debt_used:
-        actions.append("Within 14 days: Stress-test repayments and confirm covenant compliance under downside scenarios.")
-
-    # Enforce 4–6 actions
-    actions = actions[:6]
-    if len(actions) < 4:
-        # pad safely without vagueness
-        actions.append("Within 30 days: Confirm the earliest ‘decision deadline’ for funding (lead time + legal + investor cycle).")
-    return actions[:6]
-
-    
+  
 @st.cache_data(ttl=120, show_spinner=False)
 def _fetch_cash_balance_kpi_fast(client_id: str, focus_month: date) -> float | None:
     """
@@ -2783,43 +2913,75 @@ def _fetch_cash_balance_kpi_fast(client_id: str, focus_month: date) -> float | N
 # =========================
 # 1) Funding Strategy: REMOVE performance tracking
 # =========================
-def page_investing_financing():
-    # perf_start_page("Funding Strategy")  # ❌ removed
 
-    # with perf_step("ui: header + guards"):  # ❌ removed
-    top_header("Funding Strategy")
+def page_investing_financing():
 
     if not selected_client_id:
         st.info("Select a business from the sidebar to see funding strategy.")
-        # perf_end_page()  # ❌ removed
         return
-
     if not selected_month_start:
         st.info("Pick a focus month in the navbar to analyse funding strategy.")
-        # perf_end_page()  # ❌ removed
         return
 
-    # with perf_step("fetch: client settings + currency"):  # ❌ removed
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+    import plotly.io as pio
+
+    from component.funding_strategy_component import (
+        render_funding_strategy_top,
+        render_funding_strategy_bottom,
+    )
+    from ui.plotly_charts import apply_nordic_plotly_theme, PLOTLY_CONFIG_MINIMAL
+
+    # Global Nordic typography
+    st.markdown("""
+    <style>
+      .stApp, .stApp * {
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
+      }
+      .stMarkdown, .stText, label, p, li { color: #3A454B; }
+      div.block-container { padding-top: 1.2rem; }
+      /* Nordic “card” wrapper for Streamlit-native scenario section */
+      .nordic-card {
+        max-width: 1100px;
+        margin: 0 auto 32px auto;
+        background: #FFFFFF;
+        border: 1px solid #E5E7EB;
+        border-radius: 12px;
+        padding: 20px;
+      }
+      .nordic-title {
+        font-size: 14px;
+        line-height: 22px;
+        font-weight: 600;
+        color: #0F172A;
+        margin-bottom: 8px;
+      }
+      .nordic-sub {
+        font-size: 12px;
+        line-height: 18px;
+        color: #64748B;
+        margin-bottom: 12px;
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
     currency_code, currency_symbol = get_client_currency(selected_client_id)
     settings = get_client_settings(selected_client_id) or {}
     cash_buffer = float(settings.get("min_cash_buffer") or 0.0)
 
-    # with perf_step("fetch: engine_df as_of focus month"):  # ❌ removed
     as_of_month = get_active_as_of_month(selected_client_id, selected_month_start)
     engine_df = fetch_cashflow_summary_for_client_as_of(selected_client_id, as_of_month)
 
     if engine_df is None:
         st.error("Could not load cashflow engine (Supabase disconnected). Please refresh.")
-        # perf_end_page()  # ❌ removed
         return
     if engine_df.empty:
         st.info("No cashflow engine rows yet. Rebuild cashflow from Business at a Glance.")
-        # perf_end_page()  # ❌ removed
         return
 
-    # -------------------------------
-    # Helpers (kept as-is)
-    # -------------------------------
+    # Helpers
     def _month_start(x):
         return pd.to_datetime(x).to_period("M").to_timestamp()
 
@@ -2841,33 +3003,27 @@ def page_investing_financing():
 
         if "closing_cash" not in ef.columns:
             ef["closing_cash"] = np.nan
-
         return ef
 
     def _recompute_closing_cash_series(ef: pd.DataFrame, opening_cash: float) -> pd.DataFrame:
         ef2 = ef.copy().sort_values("month_date")
         closes, opens = [], []
         o = float(opening_cash)
-
         for _, r in ef2.iterrows():
             opens.append(o)
             net = float(r.get("net_cash", 0.0) or 0.0)
             c = o + net
             closes.append(c)
             o = c
-
         ef2["opening_cash_sim"] = opens
         ef2["closing_cash_sim"] = closes
         return ef2
 
     def _compute_cash_cliff_and_lowest(base_series: pd.DataFrame, buffer_amt: float):
-        if base_series is None or base_series.empty:
+        if base_series is None or base_series.empty or "closing_cash_sim" not in base_series.columns:
             return None, None, None
 
         s = base_series.copy()
-        if "closing_cash_sim" not in s.columns:
-            return None, None, None
-
         s["closing_cash_sim"] = pd.to_numeric(s["closing_cash_sim"], errors="coerce")
         s = s[s["closing_cash_sim"].notna()].copy()
         if s.empty:
@@ -2875,20 +3031,15 @@ def page_investing_financing():
 
         idx_min = s["closing_cash_sim"].idxmin()
         lowest_ts = s.loc[idx_min, "month_date"]
-        min_cash = float(s.loc[idx_min, "closing_cash_sim"])
 
         cliff_ts = None
-        if buffer_amt is not None:
-            breach = s[s["closing_cash_sim"] <= float(buffer_amt)]
-            if not breach.empty:
-                cliff_ts = breach["month_date"].iloc[0]
+        breach = s[s["closing_cash_sim"] <= float(buffer_amt or 0.0)]
+        if not breach.empty:
+            cliff_ts = breach["month_date"].iloc[0]
 
-        return cliff_ts, lowest_ts, min_cash
+        return cliff_ts, lowest_ts, float(s.loc[idx_min, "closing_cash_sim"])
 
-    # -------------------------------
-    # Prepare engine window (12m)
-    # -------------------------------
-    # with perf_step("compute: prepare engine window (12m)"):  # ❌ removed
+    # Engine window
     ef = _prep_engine_monthly(engine_df)
     focus_ts = _month_start(selected_month_start)
     ef_12 = ef[(ef["month_date"] >= focus_ts) & (ef["month_date"] < (focus_ts + pd.DateOffset(months=12)))].copy()
@@ -2896,27 +3047,19 @@ def page_investing_financing():
         st.info("No cashflow engine data in the next 12 months for this focus month.")
         return
 
-    # -------------------------------
-    # Actual cash for week0 anchor
-    # -------------------------------
-    # with perf_step("fetch: KPIs for focus month (cash)"):  # ❌ removed
+    # Cash anchor
     kpis = fetch_kpis_for_client_month(selected_client_id, selected_month_start)
     actual_cash = float(kpis.get("cash_balance") or 0.0) if kpis else 0.0
 
-    # with perf_step("compute: base_series (closing cash sim)"):  # ❌ removed
     base_series = _recompute_closing_cash_series(ef_12, opening_cash=actual_cash)
 
-    # with perf_step("compute: runway + effective burn"):  # ❌ removed
     runway_from_engine, effective_burn = compute_runway_and_effective_burn_from_df(engine_df, selected_month_start)
     if runway_from_engine is None or effective_burn is None:
         st.info("Not enough cashflow engine data yet. Rebuild cashflow from Business at a Glance.")
         return
     current_burn = float(effective_burn)
 
-    # -------------------------------
-    # Stress KPIs (CACHED)
-    # -------------------------------
-    # with perf_step("compute: stress KPIs (weekly table + cliff)"):  # ❌ removed
+    # Stress KPIs
     cache_buster = f"{selected_client_id}|{as_of_month}|{selected_month_start}|{cash_buffer}"
     stress_kpis = _cached_compute_cash_stress_kpis(
         client_id=str(selected_client_id),
@@ -2928,115 +3071,214 @@ def page_investing_financing():
 
     runway_display = stress_kpis.get("runway_months")
     cliff_date_exact = stress_kpis.get("stress_date_exact")
-
     cliff_label = pd.to_datetime(cliff_date_exact) if cliff_date_exact is not None else None
     cliff_month_ts = cliff_label.to_period("M").to_timestamp() if cliff_label is not None else None
 
-    _, lowest_ts, _ = _compute_cash_cliff_and_lowest(
-        base_series,
-        buffer_amt=cash_buffer if cash_buffer > 0 else 0.0
-    )
+    _, lowest_ts, _ = _compute_cash_cliff_and_lowest(base_series, buffer_amt=cash_buffer if cash_buffer > 0 else 0.0)
 
-    # -------------------------------
-    # Decision panel
-    # -------------------------------
-    # with perf_step("ui: decision panel metrics"):  # ❌ removed
-    st.subheader("🚀 Funding decision panel")
-    cA, cB, cC, cD = st.columns(4)
-    with cA:
-        st.metric("Current cash balance", f"{currency_symbol}{actual_cash:,.0f}")
-        st.caption("Actual cash (KPIs), not forecast.")
-    with cB:
-        st.metric("Net monthly burn (base)", f"{currency_symbol}{current_burn:,.0f} / month")
-    with cC:
+    # Plotly chart
+    plotly_html = ""
+    if base_series is not None and not base_series.empty:
+        s = base_series.copy()
+        s["month_date"] = pd.to_datetime(s["month_date"], errors="coerce")
+        s["closing_cash_sim"] = pd.to_numeric(s["closing_cash_sim"], errors="coerce").fillna(0.0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=s["month_date"],
+            y=s["closing_cash_sim"],
+            mode="lines+markers",
+            name="Closing cash",
+            hovertemplate="%{x|%b %Y}<br>Closing: " + currency_symbol + "%{y:,.0f}<extra></extra>",
+        ))
+
         if cash_buffer and cash_buffer > 0:
-            st.metric(
-                "Runway (to buffer breach)",
-                f"{runway_display:.1f} months" if runway_display is not None else "≥ 12m"
+            fig.add_hline(
+                y=float(cash_buffer),
+                line_dash="dash",
+                annotation_text="Safety buffer",
+                annotation_position="top left",
             )
-        else:
-            st.metric(
-                "Runway (forward)",
-                f"{float(runway_from_engine):.1f} months" if runway_from_engine is not None else "—"
-            )
-    with cD:
-        st.metric(
-            "Cash cliff date",
-            cliff_label.strftime("%b %Y") if cliff_label is not None else "No cliff in forecast",
+
+        if lowest_ts is not None:
+            low_df = s[s["month_date"] == pd.to_datetime(lowest_ts)]
+            if not low_df.empty:
+                fig.add_trace(go.Scatter(
+                    x=low_df["month_date"],
+                    y=low_df["closing_cash_sim"],
+                    mode="markers",
+                    name="Lowest cash",
+                    marker=dict(size=10),
+                ))
+
+        if cliff_month_ts is not None:
+            cliff_df = s[s["month_date"] == pd.to_datetime(cliff_month_ts)]
+            if not cliff_df.empty:
+                fig.add_trace(go.Scatter(
+                    x=cliff_df["month_date"],
+                    y=cliff_df["closing_cash_sim"],
+                    mode="markers",
+                    name="Buffer breach",
+                    marker=dict(size=10),
+                ))
+
+        fig.update_layout(
+            height=300,
+            margin=dict(l=88, r=28, t=22, b=74),
+            showlegend=False,
+            xaxis=dict(title="Month", automargin=True, tickformat="%b %Y"),
+            yaxis=dict(title=f"Projected closing cash ({currency_code})", automargin=True, tickformat=",.0f"),
         )
 
+        fig = apply_nordic_plotly_theme(fig)
+
+        plotly_html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn",
+            full_html=False,
+            config=PLOTLY_CONFIG_MINIMAL,
+        )
+
+    # Status strip
     if cash_buffer and cash_buffer > 0:
         if cliff_label is not None:
-            st.warning(f"Cash becomes operationally unsafe (below buffer) around **{cliff_label.strftime('%b %Y')}**.")
+            state = "warning"
+            status_msg = f"Cash becomes operationally unsafe (below buffer) around {cliff_label.strftime('%b %Y')}."
         else:
-            st.success("Cash stays above your safety buffer in the current forecast window.")
+            state = "success"
+            status_msg = "Cash stays above your safety buffer in the current forecast window."
     else:
-        st.info("Cash safety buffer is not set (or is 0). Set it in Client Settings to get a true ‘operationally unsafe’ cliff.")
+        state = "warning"
+        status_msg = "Cash safety buffer is not set (or is 0). Set it in Client Settings to get a true ‘operationally unsafe’ cliff."
 
-    st.markdown("---")
-
-    # -------------------------------
-    # Cash cliff chart
-    # -------------------------------
-    # with perf_step("ui+compute: cash cliff chart"):  # ❌ removed
-    st.subheader("📉 Cash cliff chart (base case)")
-
-    plot_base = base_series[["month_date", "closing_cash_sim"]].copy()
-    plot_base = plot_base.rename(columns={"closing_cash_sim": "Closing cash"})
-
-    base_line = (
-        alt.Chart(plot_base)
-        .mark_line()
-        .encode(
-            x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
-            y=alt.Y(
-                "Closing cash:Q",
-                title=f"Projected closing cash ({currency_code})",
-                axis=alt.Axis(tickMinStep=500_000, format=",.0f"),
-            ),
-            tooltip=[
-                alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                alt.Tooltip("Closing cash:Q", title="Closing cash", format=",.0f"),
-            ],
-        )
+    runway_txt = (
+        f"{runway_display:.1f} months" if (cash_buffer and cash_buffer > 0 and runway_display is not None)
+        else ("≥ 12m" if (cash_buffer and cash_buffer > 0) else (f"{float(runway_from_engine):.1f} months" if runway_from_engine is not None else "—"))
     )
+    cliff_txt = cliff_label.strftime("%b %Y") if cliff_label is not None else "No cliff in forecast"
 
-    layers = [base_line]
+    
 
-    if cash_buffer and cash_buffer > 0:
-        buffer_rule = (
-            alt.Chart(pd.DataFrame({"y": [cash_buffer]}))
-            .mark_rule(strokeDash=[6, 6])
-            .encode(y="y:Q")
-        )
-        layers.append(buffer_rule)
-
-    if lowest_ts is not None:
-        low_df = plot_base[plot_base["month_date"] == lowest_ts]
-        if not low_df.empty:
-            layers.append(alt.Chart(low_df).mark_point(size=120).encode(x="month_date:T", y="Closing cash:Q"))
-
-    if cliff_month_ts is not None:
-        cliff_df = plot_base[plot_base["month_date"] == cliff_month_ts]
-        if not cliff_df.empty:
-            layers.append(alt.Chart(cliff_df).mark_point(size=120).encode(x="month_date:T", y="Closing cash:Q"))
-
-    st.altair_chart(alt.layer(*layers).interactive(), width="stretch")
-    st.caption("Dashed line = safety buffer. Markers = lowest cash and first cliff month.")
-
-    # -------------------------------
-    # Scenarios (true lazy gate)
-    # -------------------------------
-    # with perf_step("ui: scenarios (true lazy gate)"):  # ❌ removed
-    st.markdown("---")
-    st.subheader("🧪 Scenarios")
-
+    # Scenario summaries default
     scenario_summaries = _get_saved_scenario_summaries_safe(selected_client_id, selected_month_start) or []
 
-    if "run_scenarios_now" not in st.session_state:
-        st.session_state["run_scenarios_now"] = False
+    # TOP render (A+B only)
+        # TOP render (A+B only)
+    render_funding_strategy_top(
+        {
+            "header": {"title": "Funding Strategy", "subtitle": "Runway, cash cliff timing, and what-if scenarios"},
+            "cards": {
+                "runway_burn_health": {
+                    "title": "Runway & Burn Health",
+                    "subtitle": "Current cash position and sustainability under existing assumptions",
+                    "kpis": [
+                        {"label": "Current cash balance", "value": f"{currency_symbol}{actual_cash:,.0f}", "note": "Actual cash (KPIs), not forecast."},
+                        {"label": "Net monthly burn (base)", "value": f"{currency_symbol}{current_burn:,.0f} / month"},
+                        {"label": "Runway (months)", "value": runway_txt, "note": "Runway is to buffer breach when a buffer is set."},
+                        {"label": "Cash cliff date", "value": cliff_txt},
+                    ],
+                    "status_strip": {"state": state, "message": status_msg},
+                },
+                "cash_cliff_risk": {
+                    "title": "Cash cliff & timing risk",
+                    "subtitle": "Projected cash balance highlighting lowest cash and buffer breach risk",
+                    "chart": {"plotly_html": plotly_html, "empty_text": "Cash cliff chart unavailable (missing forecast series)."},
+                    "caption": "Dashed line = safety buffer. Markers show lowest cash and first buffer-breach month.",
+                },
+            },
+        },
+        height=780,
+    )
+    st.markdown("""
+    <style>
+    /* Reduce ONLY the gap ABOVE the Scenario section */
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) {
+        margin-top: -40px !important;   /* key line */
+    }
 
-    with st.expander("Run what-if scenarios (slower)", expanded=False):
+    /* Ensure no extra spacing is added by the previous HTML iframe */
+    iframe + div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) {
+        margin-top: -40px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # ---------- Scenario card styling (single source of truth; no conflicts) ----------
+    st.markdown("""
+    <style>
+      /* Target ONLY the scenario bordered container (via anchor inside it) */
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) {
+        max-width: 1100px !important;
+        margin: auto auto auto auto !important;   /* ✅ consistent gap after Cash Cliff */
+        width: 100% !important;                   /* ✅ align with other components */
+        background: #FFFFFF !important;
+        border: 1px solid #E5E7EB !important;
+        border-radius: 12px !important;
+      }
+
+      /* Reduce Streamlit’s inner padding inside that border wrapper */
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) > div {
+        padding: 14px 18px !important;
+      }
+
+      /* Scenario typography matches component card-title + subtitle */
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) .scenario-title {
+        font-size: 14px !important;
+        line-height: 22px !important;
+        font-weight: 600 !important;
+        color: #0F172A !important;
+        margin: 0 0 8px 0 !important;
+      }
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) .scenario-sub {
+        font-size: 12px !important;
+        line-height: 18px !important;
+        color: #64748B !important;
+        margin: 0 0 12px 0 !important;
+      }
+
+      /* Calm checkbox label */
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(#scenario_anchor) label {
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
+        font-size: 13px !important;
+        color: #3A454B !important;
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <style>
+    /* Force scenario header to look exactly like component card headers */
+    .scenario-title{
+    font-size: 14px !important;
+    line-height: 22px !important;
+    font-weight: 600 !important;
+    color: #0F172A !important;
+    margin-bottom: 8px !important;
+    }
+    .scenario-sub{
+    font-size: 12px !important;
+    line-height: 18px !important;
+    color: #64748B !important;
+    margin-bottom: 12px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # -------------------------------
+    # Scenario card (Streamlit-native, sits between top & bottom)
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div id='scenario_anchor'></div>", unsafe_allow_html=True)
+
+        # Use the SAME classes as the component cards
+        st.markdown("""
+        <div class="card-title scenario-title">Scenario Builder</div>
+        <div class="sub scenario-sub">Run what-if scenarios to compare runway and cash cliff under changes.</div>
+        """, unsafe_allow_html=True)
+
+        if "run_scenarios_now" not in st.session_state:
+            st.session_state["run_scenarios_now"] = False
+
         st.session_state["run_scenarios_now"] = st.checkbox(
             "Open the Scenario Module",
             value=st.session_state["run_scenarios_now"],
@@ -3044,19 +3286,13 @@ def page_investing_financing():
         )
 
         if st.session_state["run_scenarios_now"]:
-            # with perf_step("ui+compute: scenarios module"):  # ❌ removed
             scenario_summaries = render_scenarios_what_if(
                 selected_client_id=selected_client_id,
                 selected_month_start=selected_month_start,
             ) or scenario_summaries
 
-    # -------------------------------
-    # Board narrative + action plan
-    # -------------------------------
-    # with perf_step("ui+compute: board narrative + action plan"):  # ❌ removed
-    st.markdown("---")
-    st.subheader("🧭 Board-level summary")
 
+    # Board narrative (computed AFTER scenario module run)
     debt_used = _fetch_debt_used_flag_light(str(selected_client_id), selected_month_start)
 
     what_this_means = _build_what_this_means_bullets(
@@ -3065,111 +3301,34 @@ def page_investing_financing():
         cash_buffer=cash_buffer,
         debt_used=debt_used,
         scenario_summaries=scenario_summaries,
-    )
+    ) or []
 
     action_plan = _build_action_plan_30_90(
         runway_months_to_buffer=runway_display,
         cliff_ts_exact=cliff_label,
         cash_buffer=cash_buffer,
         debt_used=debt_used,
+    ) or []
+
+    # BOTTOM render (D+E only)
+    render_funding_strategy_bottom(
+        {
+            "cards": {
+                "what_this_means": {
+                    "title": "What this means",
+                    "bullets": what_this_means[:5],
+                    "fallback": "Run scenarios to generate narrative.",
+                },
+                "action_plan_30_90": {
+                    "title": "Action plan — next 30–90 days",
+                    "items": action_plan[:6],
+                    "fallback": "Run scenarios to generate actions.",
+                },
+            }
+        },
+        height=520,
     )
 
-    colW, colP = st.columns([1, 1])
-    with colW:
-        st.markdown("### ✅ WHAT THIS MEANS")
-        for b in what_this_means[:5]:
-            st.markdown(f"- {b}")
-
-    with colP:
-        st.markdown("### 📌 ACTION PLAN — NEXT 30–90 DAYS")
-        for a in action_plan[:6]:
-            st.markdown(f"- {a}")
-
-    # -------------------------------
-    # Admin area (lazy)
-    # -------------------------------
-    # with perf_step("ui: admin expander + forms (lazy gate)"):  # ❌ removed
-    st.markdown("---")
-    load_admin = st.toggle("Load detailed investing & financing entries (admin)", value=False, key="fund_admin_load")
-
-    if load_admin:
-        with st.expander("📚 Detailed investing & financing entries (admin)", expanded=True):
-            # with perf_step("fetch: investing + financing flows (admin only)"):  # ❌ removed
-            df_inv = _cached_fetch_investing_flows(selected_client_id)
-            if df_inv is None:
-                df_inv = pd.DataFrame()
-
-            df_fin = _cached_fetch_financing_flows(selected_client_id)
-            if df_fin is None:
-                df_fin = pd.DataFrame()
-
-            col_left_admin, col_right_admin = st.columns([2, 1])
-
-            with col_left_admin:
-                st.markdown("### Investing flows")
-                if df_inv.empty:
-                    st.caption("No investing flows yet.")
-                else:
-                    inv_view = df_inv.copy()
-                    inv_view["month_date"] = pd.to_datetime(inv_view["month_date"], errors="coerce")
-                    inv_view = inv_view.sort_values("month_date")
-                    inv_view["Month"] = inv_view["month_date"].dt.strftime("%b %Y")
-                    cols = ["id", "Month"] + [c for c in ["amount", "category", "notes"] if c in inv_view.columns]
-                    st.dataframe(inv_view[cols], width="stretch")
-
-                st.markdown("### Financing flows")
-                if df_fin.empty:
-                    st.caption("No financing flows yet.")
-                else:
-                    fin_view = df_fin.copy()
-                    fin_view["month_date"] = pd.to_datetime(fin_view["month_date"], errors="coerce")
-                    fin_view = fin_view.sort_values("month_date")
-                    fin_view["Month"] = fin_view["month_date"].dt.strftime("%b %Y")
-                    cols = ["id", "Month"] + [c for c in ["amount", "category", "notes"] if c in fin_view.columns]
-                    st.dataframe(fin_view[cols], width="stretch")
-
-            with col_right_admin:
-                st.markdown("### ➕ Add investing flow")
-                with st.form(key="new_investing_flow_form"):
-                    inv_date = st.date_input("Month", value=selected_month_start, key="inv_date")
-                    inv_amount = st.number_input("Amount", value=0.0, step=1000.0, key="inv_amount")
-                    inv_category = st.selectbox(
-                        "Category",
-                        ["Capex", "R&D / product build", "Equipment & tools", "Fitout / leasehold", "Software / intangibles", "Other"],
-                        key="inv_category",
-                    )
-                    inv_notes = st.text_area("Notes", value="", key="inv_notes")
-                    if st.form_submit_button("Save investing flow"):
-                        ok = create_investing_flow(
-                            selected_client_id, month_date=inv_date, amount=inv_amount, category=inv_category, notes=inv_notes
-                        )
-                        if ok:
-                            st.success("Saved. Rebuild cashflow to refresh projections.")
-                            st.rerun()
-                        else:
-                            st.error("Could not save investing flow.")
-
-                st.markdown("### ➕ Add financing flow")
-                with st.form(key="new_financing_flow_form"):
-                    fin_date = st.date_input("Month", value=selected_month_start, key="fin_date")
-                    fin_amount = st.number_input("Amount", value=0.0, step=1000.0, key="fin_amount")
-                    fin_category = st.selectbox(
-                        "Category",
-                        ["Equity raise", "SAFE / convertible", "Loan drawdown", "Loan repayment", "Interest payment", "Dividend", "Other"],
-                        key="fin_category",
-                    )
-                    fin_notes = st.text_area("Notes", value="", key="fin_notes")
-                    if st.form_submit_button("Save financing flow"):
-                        ok = create_financing_flow(
-                            selected_client_id, month_date=fin_date, amount=fin_amount, category=fin_category, notes=fin_notes
-                        )
-                        if ok:
-                            st.success("Saved. Rebuild cashflow to refresh projections.")
-                            st.rerun()
-                        else:
-                            st.error("Could not save financing flow.")
-
-    # perf_end_page()  # ❌ removed
 
 
 def month_bucket_utc_ts(x) -> datetime | None:
@@ -3194,6 +3353,7 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 ## Pipeline health panel (UPDATED: removed weighted closing in ~90 days)
+
 def build_pipeline_health_panel(df_pipeline, focus_month, currency_symbol):
     if df_pipeline is None or df_pipeline.empty:
         return ("warning", ["No deals yet. Add your top 5–10 active deals to see pipeline health."], [])
@@ -3300,6 +3460,7 @@ def build_pipeline_data_checks(df_pipeline):
         issues.append("Some **Closed lost** deals still have probability > 0. Set to 0% to avoid confusion.")
 
     return issues
+
 
 def build_recognised_revenue_debug_tables(
     client_id,
@@ -3613,11 +3774,7 @@ def render_monthly_targets_section(
     Safe to embed in any page (Configuration, Client Settings, etc.)
     because all widget keys are namespaced with page_key_prefix.
     """
-    st.subheader("🎯 Monthly targets & budgets")
-    st.caption(
-        "Set internal targets for each month. These are used to compare **actual vs plan** "
-        "across revenue, payroll, and headcount. (Always editable — no locking.)"
-    )
+
 
     targets_df = fetch_client_monthly_targets(selected_client_id)
 
@@ -3753,551 +3910,661 @@ def render_monthly_targets_section(
 
 def page_configuration():
     """
-    Configuration page (NEW)
+    Configuration page (UPDATED NORDIC UI)
 
     Contains:
     1) Revenue recognition business default + Save (+ optional apply to all deals)
-    2) Create / update deal editor (moved from Sales & Deals)
+    2) Create / update deal editor
+    3) AR/AP record payments
+    4) Monthly targets
+    5) Admin investing/financing entries
 
     Does NOT change any external function signatures.
-    Reuses your existing save/bulk-update helpers.
+    Reuses your existing helpers.
     """
 
-    top_header("Configuration")
+    from datetime import datetime, timezone
+    import pandas as pd
+    from pandas.tseries.offsets import MonthEnd
 
+    from component.configuration_component import (
+        inject_configuration_css,
+        render_configuration_header,
+        card_header,
+    )
+
+    inject_configuration_css()
+
+    # --- Guard rails ---
     if not selected_client_id:
         st.info("Select a client from the sidebar to view this page.")
+        return
+    if not selected_month_start:
+        st.info("Pick a focus month in the sidebar to configure items for that period.")
         return
 
     settings = get_client_settings(selected_client_id) or {}
     currency_code, currency_symbol = get_client_currency(selected_client_id)
 
-    # ============================================================
-    # 1) Revenue recognition method (business default)
-    # ============================================================
-    st.subheader("🧾 Revenue recognition settings")
-
-    current_method = (settings.get("revenue_recognition_method") or "saas").lower()
-
-    method_labels = {
-        "saas": "SaaS subscription (spread over contract term)",
-        "milestone": "Milestone / project (milestones by month)",
-        "poc": "Percentage-of-completion (true-up by month)",
-        "straight_line": "Straight-line service (start–end months)",
-        "usage": "Usage-based (placeholder spreading)",
-        "point_in_time": "Point-in-time goods delivery (lump on delivery month)",
-    }
-
-    method_display_map = {
-        "saas": "SaaS subscription",
-        "milestone": "Milestone project",
-        "poc": "Percentage-of-completion",
-        "straight_line": "Straight-line service",
-        "usage": "Usage-based",
-        "point_in_time": "Point-in-time goods",
-    }
-
-    method_options = list(method_labels.keys())
-    default_index = method_options.index(current_method) if current_method in method_options else 0
-
-    selected_method_label = st.selectbox(
-        "Business default method",
-        options=[method_labels[m] for m in method_options],
-        index=default_index,
-        help=(
-            "Default method for this business. Deals can override this individually. "
-            "The engine uses deal.method first, then falls back to this business default."
-        ),
-        key="cfg_rev_method_select",
+    # --- Page header (consistent everywhere) ---
+    render_configuration_header(
+        title="Configuration",
+        subtitle="Set revenue rules, manage deals, and record payments (AR/AP).",
     )
 
-    reverse_map = {v: k for k, v in method_labels.items()}
-    selected_method_code = reverse_map[selected_method_label]
+    # ============================================================
+    # CARD A — Revenue recognition settings
+    # ============================================================
+    with st.container(border=True):
+        card_header(
+            "Revenue recognition settings",
+            "Set the business default method. Deals can override this individually.",
+        )
 
-    apply_to_all = st.checkbox(
-        "Apply this method to ALL existing deals (overwrite per-deal overrides)",
-        value=False,
-        help="Use this if you want business default to drive the numbers across all deals.",
-        key="cfg_apply_to_all",
-    )
+        current_method = (settings.get("revenue_recognition_method") or "saas").lower()
 
-    cA, cB = st.columns([1, 3])
-    with cA:
-        if st.button("Save method", key="cfg_save_method"):
-            ok = save_revenue_method(selected_client_id, selected_method_code)
+        method_labels = {
+            "saas": "SaaS subscription (spread over contract term)",
+            "milestone": "Milestone / project (milestones by month)",
+            "poc": "Percentage-of-completion (true-up by month)",
+            "straight_line": "Straight-line service (start–end months)",
+            "usage": "Usage-based (placeholder spreading)",
+            "point_in_time": "Point-in-time goods delivery (lump on delivery month)",
+        }
 
-            if ok and apply_to_all:
-                ok2 = bulk_update_deal_methods_for_client(
-                    selected_client_id,
-                    method_display=method_display_map.get(selected_method_code, "Straight-line service"),
+        method_display_map = {
+            "saas": "SaaS subscription",
+            "milestone": "Milestone project",
+            "poc": "Percentage-of-completion",
+            "straight_line": "Straight-line service",
+            "usage": "Usage-based",
+            "point_in_time": "Point-in-time goods",
+        }
+
+        method_options = list(method_labels.keys())
+        default_index = method_options.index(current_method) if current_method in method_options else 0
+
+        selected_method_label = st.selectbox(
+            "Business default method",
+            options=[method_labels[m] for m in method_options],
+            index=default_index,
+            help=(
+                "Default method for this business. Deals can override this individually. "
+                "The engine uses deal.method first, then falls back to this business default."
+            ),
+            key="cfg_rev_method_select",
+        )
+
+        reverse_map = {v: k for k, v in method_labels.items()}
+        selected_method_code = reverse_map[selected_method_label]
+
+        apply_to_all = st.checkbox(
+            "Apply this method to ALL existing deals (overwrite per-deal overrides)",
+            value=False,
+            help="Use this if you want business default to drive the numbers across all deals.",
+            key="cfg_apply_to_all",
+        )
+
+        cA, cB = st.columns([1, 3])
+        with cA:
+            if st.button("Save method", key="cfg_save_method"):
+                ok = save_revenue_method(selected_client_id, selected_method_code)
+
+                if ok and apply_to_all:
+                    ok2 = bulk_update_deal_methods_for_client(
+                        selected_client_id,
+                        method_display=method_display_map.get(selected_method_code, "Straight-line service"),
+                    )
+                    ok = ok and ok2
+
+                if ok:
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Revenue recognition method updated.")
+                    st.rerun()
+                else:
+                    st.error("Could not update method. Please try again.")
+
+    # ============================================================
+    # CARD B — Create / update a deal
+    # ============================================================
+    with st.container(border=True):
+        card_header(
+            "Create / update a deal",
+            "Maintain your pipeline here (moved from Sales & Deals).",
+        )
+
+        try:
+            df_pipeline = fetch_pipeline_for_client(selected_client_id)
+        except Exception as e:
+            st.error("Could not load pipeline from Supabase (revenue_pipeline table).")
+            st.caption(f"{type(e).__name__}: {e}")
+            df_pipeline = pd.DataFrame()
+
+        if df_pipeline is None:
+            df_pipeline = pd.DataFrame()
+
+        def _parse_month_input(maybe_date) -> pd.Timestamp | None:
+            if maybe_date is None or str(maybe_date).strip() == "":
+                return None
+            ts = pd.to_datetime(maybe_date, errors="coerce")
+            if pd.isna(ts):
+                return None
+            return ts.to_period("M").to_timestamp()
+
+        def _save_deal(row: dict) -> bool:
+            try:
+                supabase.table("revenue_pipeline").upsert(row).execute()
+                return True
+            except Exception as e:
+                st.error("Save failed (Supabase upsert).")
+                st.caption(f"{type(e).__name__}: {e}")
+                return False
+
+        def _delete_deal(deal_id: str) -> bool:
+            if not deal_id:
+                return False
+            try:
+                supabase.table("revenue_pipeline") \
+                    .delete() \
+                    .eq("id", deal_id) \
+                    .eq("client_id", selected_client_id) \
+                    .execute()
+                return True
+            except Exception as e:
+                st.error("Delete failed (Supabase delete).")
+                st.caption(f"{type(e).__name__}: {e}")
+                return False
+
+        deal_id_col = "id" if ("id" in df_pipeline.columns) else None
+        deal_choices = ["➕ New deal"]
+        deal_map = {}
+
+        if not df_pipeline.empty and deal_id_col:
+            tmp = df_pipeline.copy()
+            tmp["deal_name"] = tmp.get("deal_name", "").astype(str).fillna("")
+            tmp["customer_name"] = tmp.get("customer_name", "").astype(str).fillna("")
+            tmp["label"] = tmp.apply(
+                lambda r: f"{r.get('deal_name','').strip() or 'Unnamed'}  —  {r.get('customer_name','').strip() or 'Unknown'}",
+                axis=1,
+            )
+            tmp = tmp.sort_values(["label"])
+            deal_choices = ["➕ New deal"] + tmp["label"].tolist()
+            deal_map = {row["label"]: row for _, row in tmp.iterrows()}
+
+        selected_label = st.selectbox("Select deal", deal_choices, index=0, key="cfg_deal_select")
+        editing_existing = selected_label != "➕ New deal"
+        row0 = deal_map.get(selected_label) if editing_existing else {}
+
+        def _d(key, fallback=""):
+            return row0.get(key, fallback) if isinstance(row0, dict) else fallback
+
+        stage_options = ["idea", "demo", "proposal", "contract", "closed_won", "closed_lost"]
+        default_stage = str(_d("stage", "idea") or "idea").lower()
+        if default_stage not in stage_options:
+            default_stage = "idea"
+
+        method_display_map = {
+            "saas": "SaaS subscription",
+            "milestone": "Milestone project",
+            "poc": "Percentage-of-completion",
+            "straight_line": "Straight-line service",
+            "usage": "Usage-based",
+            "point_in_time": "Point-in-time goods",
+        }
+        # business default display (fallback)
+        selected_method_code = (settings.get("revenue_recognition_method") or "saas").lower()
+        current_method_display = method_display_map.get(selected_method_code, "SaaS subscription")
+        method_options_display = list(method_display_map.values())
+
+        default_method_display = str(_d("method", "") or "").strip()
+        if default_method_display not in method_options_display:
+            default_method_display = current_method_display
+
+        with st.form("cfg_deal_form", clear_on_submit=False):
+            deal_name = st.text_input("Deal name", value=str(_d("deal_name", "") or ""))
+            customer_name = st.text_input("Customer", value=str(_d("customer_name", "") or ""))
+
+            c1, c2 = st.columns(2)
+            with c1:
+                stage = st.selectbox("Stage", stage_options, index=stage_options.index(default_stage))
+            with c2:
+                probability_pct = st.number_input(
+                    "Win chance (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(pd.to_numeric(_d("probability_pct", 0.0), errors="coerce") or 0.0),
+                    step=5.0,
                 )
-                ok = ok and ok2
 
-            if ok:
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                st.success("Revenue recognition method updated.")
-                st.rerun()
+            value_total = st.number_input(
+                f"Contract value (total) ({currency_code})",
+                min_value=0.0,
+                value=float(pd.to_numeric(_d("value_total", 0.0), errors="coerce") or 0.0),
+                step=1000.0,
+            )
+
+            method_display = st.selectbox(
+                "Revenue recognition (deal override)",
+                options=method_options_display,
+                index=method_options_display.index(default_method_display),
+                help="Overrides the business default above for this deal.",
+            )
+
+            c3, c4 = st.columns(2)
+            with c3:
+                start_month_in = st.text_input(
+                    "Expected close / start month (e.g., 2025-12-01 or Dec 2025)",
+                    value=str(_d("start_month", "") or ""),
+                )
+            with c4:
+                end_month_in = st.text_input(
+                    "End month (optional; for service term)",
+                    value=str(_d("end_month", "") or ""),
+                )
+
+            contract_months_default = pd.to_numeric(_d("contract_months", 0), errors="coerce")
+            contract_months_default = int(contract_months_default) if pd.notna(contract_months_default) else 0
+            contract_months = st.number_input(
+                "Contract months (optional)",
+                min_value=0,
+                value=int(contract_months_default),
+                step=1,
+            )
+
+            stage_entry_default = _d("stage_entry_date", None)
+            stage_entry_default = pd.to_datetime(stage_entry_default, errors="coerce")
+            stage_entry_date = st.date_input(
+                "Stage entry date",
+                value=stage_entry_default.date() if pd.notna(stage_entry_default) else datetime.now(timezone.utc).date(),
+                help="Used for ageing rules. Keep updated when stage changes.",
+            )
+
+            notes = st.text_area("Notes (optional)", value=str(_d("notes", "") or ""), height=120)
+
+            submitted = st.form_submit_button("Save deal")
+
+        if submitted:
+            if not str(deal_name).strip():
+                st.error("Deal name is required.")
             else:
-                st.error("Could not update method. Please try again.")
+                start_ts = _parse_month_input(start_month_in)
+                end_ts = _parse_month_input(end_month_in)
 
-    st.markdown("---")
+                payload = {
+                    "client_id": selected_client_id,
+                    "deal_name": str(deal_name).strip(),
+                    "customer_name": str(customer_name).strip() if customer_name is not None else "",
+                    "stage": str(stage).lower().strip(),
+                    "probability_pct": float(probability_pct or 0.0),
+                    "value_total": float(value_total or 0.0),
+                    "method": str(method_display).strip(),
+                    "contract_months": int(contract_months or 0),
+                    "stage_entry_date": pd.to_datetime(stage_entry_date).strftime("%Y-%m-%d") if stage_entry_date else None,
+                    "notes": str(notes).strip() if notes is not None else "",
+                    "start_month": start_ts.strftime("%Y-%m-%d") if start_ts is not None else None,
+                    "end_month": end_ts.strftime("%Y-%m-%d") if end_ts is not None else None,
+                }
 
-    # ============================================================
-    # 2) Create / update deal editor (moved here)
-    # ============================================================
-    st.subheader("✍️ Create / update a deal")
+                if editing_existing and deal_id_col and isinstance(row0, dict) and row0.get(deal_id_col):
+                    payload["id"] = row0.get(deal_id_col)
 
-    # Load pipeline for editing list
-    try:
-        df_pipeline = fetch_pipeline_for_client(selected_client_id)
-    except Exception as e:
-        st.error("Could not load pipeline from Supabase (revenue_pipeline table).")
-        st.caption(f"{type(e).__name__}: {e}")
-        df_pipeline = pd.DataFrame()
-
-    if df_pipeline is None:
-        df_pipeline = pd.DataFrame()
-
-    # ---- Helpers (same ones you had) ----
-    def _parse_month_input(maybe_date) -> pd.Timestamp | None:
-        if maybe_date is None or str(maybe_date).strip() == "":
-            return None
-        ts = pd.to_datetime(maybe_date, errors="coerce")
-        if pd.isna(ts):
-            return None
-        return ts.to_period("M").to_timestamp()
-
-    def _supabase_upsert_revenue_pipeline(row: dict) -> bool:
-        try:
-            sb = supabase  # ✅ uses your global
-            sb.table("revenue_pipeline").upsert(row).execute()
-            return True
-        except Exception as e:
-            st.error("Save failed (Supabase upsert).")
-            st.caption(f"{type(e).__name__}: {e}")
-            return False
-
-    def _save_deal(row: dict) -> bool:
-        try:
-            supabase.table("revenue_pipeline").upsert(row).execute()
-            return True
-        except Exception as e:
-            st.error("Save failed (Supabase upsert).")
-            st.caption(f"{type(e).__name__}: {e}")
-            return False
-
-
-    def _delete_deal(deal_id: str) -> bool:
-        if not deal_id:
-            return False
-
-        # If you truly have no delete helper, skip searching globals and delete directly
-        try:
-            supabase.table("revenue_pipeline") \
-                .delete() \
-                .eq("id", deal_id) \
-                .eq("client_id", selected_client_id) \
-                .execute()
-            return True
-        except Exception as e:
-            st.error("Delete failed (Supabase delete).")
-            st.caption(f"{type(e).__name__}: {e}")
-            return False
-
-
-    # ---- Deal selector ----
-    deal_id_col = "id" if ("id" in df_pipeline.columns) else None
-    deal_choices = ["➕ New deal"]
-    deal_map = {}
-
-    if not df_pipeline.empty and deal_id_col:
-        tmp = df_pipeline.copy()
-        tmp["deal_name"] = tmp.get("deal_name", "").astype(str).fillna("")
-        tmp["customer_name"] = tmp.get("customer_name", "").astype(str).fillna("")
-        tmp["label"] = tmp.apply(
-            lambda r: f"{r.get('deal_name','').strip() or 'Unnamed'}  —  {r.get('customer_name','').strip() or 'Unknown'}",
-            axis=1,
-        )
-        tmp = tmp.sort_values(["label"])
-        deal_choices = ["➕ New deal"] + tmp["label"].tolist()
-        deal_map = {row["label"]: row for _, row in tmp.iterrows()}
-
-    selected_label = st.selectbox("Select deal", deal_choices, index=0, key="cfg_deal_select")
-    editing_existing = selected_label != "➕ New deal"
-    row0 = deal_map.get(selected_label) if editing_existing else {}
-
-    def _d(key, fallback=""):
-        return row0.get(key, fallback) if isinstance(row0, dict) else fallback
-
-    stage_options = ["idea", "demo", "proposal", "contract", "closed_won", "closed_lost"]
-    default_stage = str(_d("stage", "idea") or "idea").lower()
-    if default_stage not in stage_options:
-        default_stage = "idea"
-
-    # Use same display map as Sales page
-    current_method_display = method_display_map.get(selected_method_code, "SaaS subscription")
-    method_options_display = list(method_display_map.values())
-    default_method_display = str(_d("method", "") or "").strip()
-    if default_method_display not in method_options_display:
-        default_method_display = current_method_display
-
-    with st.form("cfg_deal_form", clear_on_submit=False):
-        deal_name = st.text_input("Deal name", value=str(_d("deal_name", "") or ""))
-        customer_name = st.text_input("Customer", value=str(_d("customer_name", "") or ""))
-
-        c1, c2 = st.columns(2)
-        with c1:
-            stage = st.selectbox("Stage", stage_options, index=stage_options.index(default_stage))
-        with c2:
-            probability_pct = st.number_input(
-                "Win chance (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(pd.to_numeric(_d("probability_pct", 0.0), errors="coerce") or 0.0),
-                step=5.0,
-            )
-
-        value_total = st.number_input(
-            f"Contract value (total) ({currency_code})",
-            min_value=0.0,
-            value=float(pd.to_numeric(_d("value_total", 0.0), errors="coerce") or 0.0),
-            step=1000.0,
-        )
-
-        method_display = st.selectbox(
-            "Revenue recognition (deal override)",
-            options=method_options_display,
-            index=method_options_display.index(default_method_display),
-            help="Overrides the business default above for this deal.",
-        )
-
-        c3, c4 = st.columns(2)
-        with c3:
-            start_month_in = st.text_input(
-                "Expected close / start month (e.g., 2025-12-01 or Dec 2025)",
-                value=str(_d("start_month", "") or ""),
-            )
-        with c4:
-            end_month_in = st.text_input(
-                "End month (optional; for service term)",
-                value=str(_d("end_month", "") or ""),
-            )
-
-        contract_months_default = pd.to_numeric(_d("contract_months", 0), errors="coerce")
-        contract_months_default = int(contract_months_default) if pd.notna(contract_months_default) else 0
-        contract_months = st.number_input(
-            "Contract months (optional)",
-            min_value=0,
-            value=int(contract_months_default),
-            step=1,
-        )
-
-        stage_entry_default = _d("stage_entry_date", None)
-        stage_entry_default = pd.to_datetime(stage_entry_default, errors="coerce")
-        stage_entry_date = st.date_input(
-            "Stage entry date",
-            value=stage_entry_default.date() if pd.notna(stage_entry_default) else datetime.now(timezone.utc).date(),
-            help="Used for ageing rules. Keep updated when stage changes.",
-        )
-
-        notes = st.text_area("Notes (optional)", value=str(_d("notes", "") or ""), height=120)
-
-        submitted = st.form_submit_button("Save deal")
-
-    if submitted:
-        if not str(deal_name).strip():
-            st.error("Deal name is required.")
-        else:
-            start_ts = _parse_month_input(start_month_in)
-            end_ts = _parse_month_input(end_month_in)
-
-            payload = {
-                "client_id": selected_client_id,
-                "deal_name": str(deal_name).strip(),
-                "customer_name": str(customer_name).strip() if customer_name is not None else "",
-                "stage": str(stage).lower().strip(),
-                "probability_pct": float(probability_pct or 0.0),
-                "value_total": float(value_total or 0.0),
-                "method": str(method_display).strip(),
-                "contract_months": int(contract_months or 0),
-                "stage_entry_date": pd.to_datetime(stage_entry_date).strftime("%Y-%m-%d") if stage_entry_date else None,
-                "notes": str(notes).strip() if notes is not None else "",
-                "start_month": start_ts.strftime("%Y-%m-%d") if start_ts is not None else None,
-                "end_month": end_ts.strftime("%Y-%m-%d") if end_ts is not None else None,
-            }
-
-            if editing_existing and deal_id_col and isinstance(row0, dict) and row0.get(deal_id_col):
-                payload["id"] = row0.get(deal_id_col)
-
-            ok = _save_deal(payload)
-            if ok:
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                st.success("Deal saved.")
-                st.rerun()
-
-    if editing_existing and deal_id_col and isinstance(row0, dict) and row0.get(deal_id_col):
-        st.markdown("---")
-        if st.button("🗑️ Delete deal", type="secondary", key="cfg_delete_deal"):
-            did = str(row0.get(deal_id_col))
-            if _delete_deal(did):
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                st.success("Deal deleted.")
-                st.rerun()
-
-        # ============================================================
-    # 1B) AR/AP: Record payments (moved from Cash & Bills)
-    # ============================================================
-    st.markdown("---")
-    st.subheader("💳 AR/AP — record payments")
-
-    # Load AR/AP (normalised) so the payment widgets have clean data
-    try:
-        df_ar_cfg, df_ap_cfg = fetch_ar_ap_for_client(selected_client_id)
-    except Exception as e:
-        st.error(f"Failed to load AR/AP: {e}")
-        df_ar_cfg, df_ap_cfg = pd.DataFrame(), pd.DataFrame()
-
-    # Normalise (safe)
-    try:
-        df_ar_cfg = normalise_ar_ap_for_cash(df_ar_cfg)
-    except Exception:
-        pass
-    try:
-        df_ap_cfg = normalise_ar_ap_for_cash(df_ap_cfg)
-    except Exception:
-        pass
-
-    # Use Focus Month month-end as default payment date
-    focus_start_cfg = selected_month_start
-    focus_end_cfg = (pd.to_datetime(focus_start_cfg) + MonthEnd(0)).date()
-
-    currency_code_cfg, currency_symbol_cfg = get_client_currency(selected_client_id)
-
-    # ----------------------------
-    # AR Payment
-    # ----------------------------
-    with st.expander("💳 Record a payment on an AR invoice", expanded=False):
-        ar_open = (
-            df_ar_cfg[df_ar_cfg.get("is_cash_relevant", True) & (df_ar_cfg.get("effective_amount", 0) > 0)].copy()
-            if df_ar_cfg is not None and not df_ar_cfg.empty
-            else pd.DataFrame()
-        )
-
-        if ar_open.empty:
-            st.caption("No open customer invoices to record payments against.")
-        else:
-            AR_TABLE_NAME = "ar_ap_tracker"  # 🔁 adjust if needed
-
-            label_map = {}
-            for _, r in ar_open.iterrows():
-                inv_id = r.get("id")
-                inv_no = r.get("invoice_number", inv_id)
-                cust = r.get("counterparty", "")
-                due = r.get("due_date", "")
-                bal = float(r.get("effective_amount") or 0.0)
-
-                try:
-                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
-                except Exception:
-                    due_txt = str(due)
-
-                label_map[inv_id] = f"{inv_no} – {cust} – due {due_txt} – bal {currency_symbol_cfg}{bal:,.0f}"
-
-            selected_id = st.selectbox(
-                "Select invoice to update",
-                options=list(label_map.keys()),
-                format_func=lambda x: label_map.get(x, str(x)),
-                key="cfg_ar_payment_invoice",
-            )
-
-            payment_type = st.radio(
-                "Payment type",
-                ["Full payment", "Partial payment"],
-                horizontal=True,
-                key="cfg_ar_payment_type",
-            )
-
-            current_row = ar_open[ar_open["id"] == selected_id].iloc[0]
-            current_balance = float(current_row.get("effective_amount") or 0.0)
-
-            default_amount = current_balance if payment_type == "Full payment" else 0.0
-
-            payment_amount = st.number_input(
-                "Amount paid",
-                min_value=0.0,
-                value=float(default_amount),
-                step=100.0,
-                key="cfg_ar_payment_amount",
-            )
-
-            payment_date = st.date_input(
-                "Payment date",
-                value=focus_end_cfg,
-                key="cfg_ar_payment_date",
-            )
-
-            if st.button("Record AR payment", key="cfg_ar_payment_button"):
-                try:
-                    # Prefer your existing authed client if available
-                    sb = None
-                    if "get_supabase_authed" in globals():
-                        sb = get_supabase_authed()
-                    if sb is None and "get_supabase_client" in globals():
-                        sb = get_supabase_client()
-                    if sb is None:
-                        raise RuntimeError("No Supabase client available.")
-
-                    prev_paid = float(current_row.get("amount_paid") or 0.0)
-                    new_paid_total = prev_paid + float(payment_amount)
-
-                    total_amt = float(current_row.get("amount") or 0.0)
-                    if new_paid_total >= total_amt - 0.01:
-                        new_status = "paid"
-                        partially_paid_flag = False
-                    else:
-                        new_status = "open"
-                        partially_paid_flag = True
-
-                    update_data = {
-                        "amount_paid": new_paid_total,
-                        "partially_paid": partially_paid_flag,
-                        "status": new_status,
-                        "payment_date": payment_date.isoformat(),
-                        "updated_at": pd.Timestamp.utcnow().isoformat(),
-                    }
-
-                    sb.table(AR_TABLE_NAME).update(update_data).eq("id", selected_id).execute()
-
+                ok = _save_deal(payload)
+                if ok:
                     try:
                         st.cache_data.clear()
                     except Exception:
                         pass
-
-                    st.success("AR payment recorded.")
+                    st.success("Deal saved.")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to record payment: {e}")
 
-    # ----------------------------
-    # AP Payment
-    # ----------------------------
-    with st.expander("💳 Record a payment on an AP bill", expanded=False):
-        ap_open = (
-            df_ap_cfg[df_ap_cfg.get("is_cash_relevant", True) & (df_ap_cfg.get("effective_amount", 0) > 0)].copy()
-            if df_ap_cfg is not None and not df_ap_cfg.empty
-            else pd.DataFrame()
-        )
-
-        if ap_open.empty:
-            st.caption("No open supplier bills to record payments against.")
-        else:
-            AP_TABLE_NAME = "ar_ap_tracker"  # 🔁 adjust if AP lives in a different table
-
-            label_map_ap = {}
-            for _, r in ap_open.iterrows():
-                bill_id = r.get("id")
-                bill_no = r.get("invoice_number", bill_id)
-                supp = r.get("counterparty", "")
-                due = r.get("due_date", "")
-                bal = float(r.get("effective_amount") or 0.0)
-
-                try:
-                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
-                except Exception:
-                    due_txt = str(due)
-
-                label_map_ap[bill_id] = f"{bill_no} – {supp} – due {due_txt} – bal {currency_symbol_cfg}{bal:,.0f}"
-
-            selected_bill_id = st.selectbox(
-                "Select bill to update",
-                options=list(label_map_ap.keys()),
-                format_func=lambda x: label_map_ap.get(x, str(x)),
-                key="cfg_ap_payment_bill",
-            )
-
-            payment_type_ap = st.radio(
-                "Payment type",
-                ["Full payment", "Partial payment"],
-                horizontal=True,
-                key="cfg_ap_payment_type",
-            )
-
-            current_ap_row = ap_open[ap_open["id"] == selected_bill_id].iloc[0]
-            current_balance_ap = float(current_ap_row.get("effective_amount") or 0.0)
-
-            default_amount_ap = current_balance_ap if payment_type_ap == "Full payment" else 0.0
-
-            payment_amount_ap = st.number_input(
-                "Amount paid",
-                min_value=0.0,
-                value=float(default_amount_ap),
-                step=100.0,
-                key="cfg_ap_payment_amount",
-            )
-
-            payment_date_ap = st.date_input(
-                "Payment date",
-                value=focus_end_cfg,
-                key="cfg_ap_payment_date",
-            )
-
-            if st.button("Record AP payment", key="cfg_ap_payment_button"):
-                try:
-                    sb = None
-                    if "get_supabase_authed" in globals():
-                        sb = get_supabase_authed()
-                    if sb is None and "get_supabase_client" in globals():
-                        sb = get_supabase_client()
-                    if sb is None:
-                        raise RuntimeError("No Supabase client available.")
-
-                    prev_paid_ap = float(current_ap_row.get("amount_paid") or 0.0)
-                    new_paid_total_ap = prev_paid_ap + float(payment_amount_ap)
-
-                    total_amt_ap = float(current_ap_row.get("amount") or 0.0)
-                    if new_paid_total_ap >= total_amt_ap - 0.01:
-                        new_status_ap = "paid"
-                        partially_paid_flag_ap = False
-                    else:
-                        new_status_ap = "open"
-                        partially_paid_flag_ap = True
-
-                    update_data_ap = {
-                        "amount_paid": new_paid_total_ap,
-                        "partially_paid": partially_paid_flag_ap,
-                        "status": new_status_ap,
-                        "payment_date": payment_date_ap.isoformat(),
-                        "updated_at": pd.Timestamp.utcnow().isoformat(),
-                    }
-
-                    sb.table(AP_TABLE_NAME).update(update_data_ap).eq("id", selected_bill_id).execute()
-
+        if editing_existing and deal_id_col and isinstance(row0, dict) and row0.get(deal_id_col):
+            st.markdown("---")
+            if st.button("🗑️ Delete deal", type="secondary", key="cfg_delete_deal"):
+                did = str(row0.get(deal_id_col))
+                if _delete_deal(did):
                     try:
                         st.cache_data.clear()
                     except Exception:
                         pass
-
-                    st.success("AP payment recorded.")
+                    st.success("Deal deleted.")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to record payment: {e}")
 
-    st.markdown("---")
-    render_monthly_targets_section(
-        selected_client_id,
-        selected_month_start,
-        page_key_prefix="cfg",  # prevents key collisions
-    )
+    # ============================================================
+    # CARD C — AR/AP record payments
+    # ============================================================
+    with st.container(border=True):
+        card_header(
+            "AR/AP — record payments",
+            "Update invoice/bill payments so cashflow projections stay accurate.",
+        )
 
+        try:
+            df_ar_cfg, df_ap_cfg = fetch_ar_ap_for_client(selected_client_id)
+        except Exception as e:
+            st.error(f"Failed to load AR/AP: {e}")
+            df_ar_cfg, df_ap_cfg = pd.DataFrame(), pd.DataFrame()
+
+        try:
+            df_ar_cfg = normalise_ar_ap_for_cash(df_ar_cfg)
+        except Exception:
+            pass
+        try:
+            df_ap_cfg = normalise_ar_ap_for_cash(df_ap_cfg)
+        except Exception:
+            pass
+
+        focus_end_cfg = (pd.to_datetime(selected_month_start) + MonthEnd(0)).date()
+        currency_code_cfg, currency_symbol_cfg = get_client_currency(selected_client_id)
+
+        # ---- AR Payment ----
+        with st.expander("💳 Record a payment on an AR invoice", expanded=False):
+            ar_open = (
+                df_ar_cfg[df_ar_cfg.get("is_cash_relevant", True) & (df_ar_cfg.get("effective_amount", 0) > 0)].copy()
+                if df_ar_cfg is not None and not df_ar_cfg.empty
+                else pd.DataFrame()
+            )
+
+            if ar_open.empty:
+                st.caption("No open customer invoices to record payments against.")
+            else:
+                AR_TABLE_NAME = "ar_ap_tracker"
+
+                label_map = {}
+                for _, r in ar_open.iterrows():
+                    inv_id = r.get("id")
+                    inv_no = r.get("invoice_number", inv_id)
+                    cust = r.get("counterparty", "")
+                    due = r.get("due_date", "")
+                    bal = float(r.get("effective_amount") or 0.0)
+
+                    try:
+                        due_txt = pd.to_datetime(due).strftime("%d %b %Y")
+                    except Exception:
+                        due_txt = str(due)
+
+                    label_map[inv_id] = f"{inv_no} – {cust} – due {due_txt} – bal {currency_symbol_cfg}{bal:,.0f}"
+
+                selected_id = st.selectbox(
+                    "Select invoice to update",
+                    options=list(label_map.keys()),
+                    format_func=lambda x: label_map.get(x, str(x)),
+                    key="cfg_ar_payment_invoice",
+                )
+
+                payment_type = st.radio(
+                    "Payment type",
+                    ["Full payment", "Partial payment"],
+                    horizontal=True,
+                    key="cfg_ar_payment_type",
+                )
+
+                current_row = ar_open[ar_open["id"] == selected_id].iloc[0]
+                current_balance = float(current_row.get("effective_amount") or 0.0)
+                default_amount = current_balance if payment_type == "Full payment" else 0.0
+
+                payment_amount = st.number_input(
+                    "Amount paid",
+                    min_value=0.0,
+                    value=float(default_amount),
+                    step=100.0,
+                    key="cfg_ar_payment_amount",
+                )
+
+                payment_date = st.date_input(
+                    "Payment date",
+                    value=focus_end_cfg,
+                    key="cfg_ar_payment_date",
+                )
+
+                if st.button("Record AR payment", key="cfg_ar_payment_button"):
+                    try:
+                        sb = None
+                        if "get_supabase_authed" in globals():
+                            sb = get_supabase_authed()
+                        if sb is None and "get_supabase_client" in globals():
+                            sb = get_supabase_client()
+                        if sb is None:
+                            raise RuntimeError("No Supabase client available.")
+
+                        prev_paid = float(current_row.get("amount_paid") or 0.0)
+                        new_paid_total = prev_paid + float(payment_amount)
+
+                        total_amt = float(current_row.get("amount") or 0.0)
+                        if new_paid_total >= total_amt - 0.01:
+                            new_status = "paid"
+                            partially_paid_flag = False
+                        else:
+                            new_status = "open"
+                            partially_paid_flag = True
+
+                        update_data = {
+                            "amount_paid": new_paid_total,
+                            "partially_paid": partially_paid_flag,
+                            "status": new_status,
+                            "payment_date": payment_date.isoformat(),
+                            "updated_at": pd.Timestamp.utcnow().isoformat(),
+                        }
+
+                        sb.table(AR_TABLE_NAME).update(update_data).eq("id", selected_id).execute()
+
+                        try:
+                            st.cache_data.clear()
+                        except Exception:
+                            pass
+
+                        st.success("AR payment recorded.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to record payment: {e}")
+
+        # ---- AP Payment ----
+        with st.expander("💳 Record a payment on an AP bill", expanded=False):
+            ap_open = (
+                df_ap_cfg[df_ap_cfg.get("is_cash_relevant", True) & (df_ap_cfg.get("effective_amount", 0) > 0)].copy()
+                if df_ap_cfg is not None and not df_ap_cfg.empty
+                else pd.DataFrame()
+            )
+
+            if ap_open.empty:
+                st.caption("No open supplier bills to record payments against.")
+            else:
+                AP_TABLE_NAME = "ar_ap_tracker"
+
+                label_map_ap = {}
+                for _, r in ap_open.iterrows():
+                    bill_id = r.get("id")
+                    bill_no = r.get("invoice_number", bill_id)
+                    supp = r.get("counterparty", "")
+                    due = r.get("due_date", "")
+                    bal = float(r.get("effective_amount") or 0.0)
+
+                    try:
+                        due_txt = pd.to_datetime(due).strftime("%d %b %Y")
+                    except Exception:
+                        due_txt = str(due)
+
+                    label_map_ap[bill_id] = f"{bill_no} – {supp} – due {due_txt} – bal {currency_symbol_cfg}{bal:,.0f}"
+
+                selected_bill_id = st.selectbox(
+                    "Select bill to update",
+                    options=list(label_map_ap.keys()),
+                    format_func=lambda x: label_map_ap.get(x, str(x)),
+                    key="cfg_ap_payment_bill",
+                )
+
+                payment_type_ap = st.radio(
+                    "Payment type",
+                    ["Full payment", "Partial payment"],
+                    horizontal=True,
+                    key="cfg_ap_payment_type",
+                )
+
+                current_ap_row = ap_open[ap_open["id"] == selected_bill_id].iloc[0]
+                current_balance_ap = float(current_ap_row.get("effective_amount") or 0.0)
+                default_amount_ap = current_balance_ap if payment_type_ap == "Full payment" else 0.0
+
+                payment_amount_ap = st.number_input(
+                    "Amount paid",
+                    min_value=0.0,
+                    value=float(default_amount_ap),
+                    step=100.0,
+                    key="cfg_ap_payment_amount",
+                )
+
+                payment_date_ap = st.date_input(
+                    "Payment date",
+                    value=focus_end_cfg,
+                    key="cfg_ap_payment_date",
+                )
+
+                if st.button("Record AP payment", key="cfg_ap_payment_button"):
+                    try:
+                        sb = None
+                        if "get_supabase_authed" in globals():
+                            sb = get_supabase_authed()
+                        if sb is None and "get_supabase_client" in globals():
+                            sb = get_supabase_client()
+                        if sb is None:
+                            raise RuntimeError("No Supabase client available.")
+
+                        prev_paid_ap = float(current_ap_row.get("amount_paid") or 0.0)
+                        new_paid_total_ap = prev_paid_ap + float(payment_amount_ap)
+
+                        total_amt_ap = float(current_ap_row.get("amount") or 0.0)
+                        if new_paid_total_ap >= total_amt_ap - 0.01:
+                            new_status_ap = "paid"
+                            partially_paid_flag_ap = False
+                        else:
+                            new_status_ap = "open"
+                            partially_paid_flag_ap = True
+
+                        update_data_ap = {
+                            "amount_paid": new_paid_total_ap,
+                            "partially_paid": partially_paid_flag_ap,
+                            "status": new_status_ap,
+                            "payment_date": payment_date_ap.isoformat(),
+                            "updated_at": pd.Timestamp.utcnow().isoformat(),
+                        }
+
+                        sb.table(AP_TABLE_NAME).update(update_data_ap).eq("id", selected_bill_id).execute()
+
+                        try:
+                            st.cache_data.clear()
+                        except Exception:
+                            pass
+
+                        st.success("AP payment recorded.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to record payment: {e}")
+
+    # ============================================================
+    # CARD D — Monthly targets section (your existing function)
+    # ============================================================
+    with st.container(border=True):
+        card_header(
+            "Monthly targets",
+            "Set targets that appear in dashboards and variance narrative.",
+        )
+        render_monthly_targets_section(
+            selected_client_id,
+            selected_month_start,
+            page_key_prefix="cfg",  # prevents key collisions
+        )
+
+    # ============================================================
+    # CARD E — Admin: Investing & financing entries
+    # ============================================================
+    with st.container(border=True):
+        card_header(
+            "Investing & Financing entries",
+    
+        )
+
+        load_admin = st.toggle(
+            "Load detailed investing & financing entries (admin)",
+            value=False,
+            key="fund_admin_load",
+        )
+
+        if load_admin:
+            with st.expander("📚 Detailed investing & financing entries (admin)", expanded=True):
+                df_inv = _cached_fetch_investing_flows(selected_client_id)
+                if df_inv is None:
+                    df_inv = pd.DataFrame()
+
+                df_fin = _cached_fetch_financing_flows(selected_client_id)
+                if df_fin is None:
+                    df_fin = pd.DataFrame()
+
+                col_left_admin, col_right_admin = st.columns([2, 1])
+
+                with col_left_admin:
+                    st.markdown("### Investing flows")
+                    if df_inv.empty:
+                        st.caption("No investing flows yet.")
+                    else:
+                        inv_view = df_inv.copy()
+                        inv_view["month_date"] = pd.to_datetime(inv_view["month_date"], errors="coerce")
+                        inv_view = inv_view.sort_values("month_date")
+                        inv_view["Month"] = inv_view["month_date"].dt.strftime("%b %Y")
+                        cols = ["id", "Month"] + [c for c in ["amount", "category", "notes"] if c in inv_view.columns]
+                        st.dataframe(inv_view[cols], width="stretch")
+
+                    st.markdown("### Financing flows")
+                    if df_fin.empty:
+                        st.caption("No financing flows yet.")
+                    else:
+                        fin_view = df_fin.copy()
+                        fin_view["month_date"] = pd.to_datetime(fin_view["month_date"], errors="coerce")
+                        fin_view = fin_view.sort_values("month_date")
+                        fin_view["Month"] = fin_view["month_date"].dt.strftime("%b %Y")
+                        cols = ["id", "Month"] + [c for c in ["amount", "category", "notes"] if c in fin_view.columns]
+                        st.dataframe(fin_view[cols], width="stretch")
+
+                with col_right_admin:
+                    st.markdown("### ➕ Add investing flow")
+                    with st.form(key="new_investing_flow_form"):
+                        inv_date = st.date_input("Month", value=selected_month_start, key="inv_date")
+                        inv_amount = st.number_input("Amount", value=0.0, step=1000.0, key="inv_amount")
+                        inv_category = st.selectbox(
+                            "Category",
+                            ["Capex", "R&D / product build", "Equipment & tools", "Fitout / leasehold", "Software / intangibles", "Other"],
+                            key="inv_category",
+                        )
+                        inv_notes = st.text_area("Notes", value="", key="inv_notes")
+                        if st.form_submit_button("Save investing flow"):
+                            ok = create_investing_flow(
+                                selected_client_id, month_date=inv_date, amount=inv_amount, category=inv_category, notes=inv_notes
+                            )
+                            if ok:
+                                st.success("Saved. Rebuild cashflow to refresh projections.")
+                                st.rerun()
+                            else:
+                                st.error("Could not save investing flow.")
+
+                    st.markdown("### ➕ Add financing flow")
+                    with st.form(key="new_financing_flow_form"):
+                        fin_date = st.date_input("Month", value=selected_month_start, key="fin_date")
+                        fin_amount = st.number_input("Amount", value=0.0, step=1000.0, key="fin_amount")
+                        fin_category = st.selectbox(
+                            "Category",
+                            ["Equity raise", "SAFE / convertible", "Loan drawdown", "Loan repayment", "Interest payment", "Dividend", "Other"],
+                            key="fin_category",
+                        )
+                        fin_notes = st.text_area("Notes", value="", key="fin_notes")
+                        if st.form_submit_button("Save financing flow"):
+                            ok = create_financing_flow(
+                                selected_client_id, month_date=fin_date, amount=fin_amount, category=fin_category, notes=fin_notes
+                            )
+                            if ok:
+                                st.success("Saved. Rebuild cashflow to refresh projections.")
+                                st.rerun()
+                            else:
+                                st.error("Could not save financing flow.")
 
 
 def get_supabase_public():
@@ -4418,27 +4685,8 @@ def _get_actual_recognised_for_month_from_schedule_df(schedule_df: pd.DataFrame,
 
 
 
-
 def page_sales_deals():
-    """
-    Sales & Deals — UPDATED (Create/update deal REMOVED)
-
-    ✅ Pipeline overview KPIs
-    ✅ Pipeline health panel
-    ✅ Data checks warning
-    ✅ “View full pipeline list” expander (kept)
-    ✅ Waterfall chart (TABLE REMOVED)
-    ✅ Revenue / Risk / What this means / Action plan (NO tables)
-
-    REMOVED from this page:
-    ❌ Revenue recognition method selector + save
-    ❌ Create / update deal editor (moved to Configuration page)
-
-    GUARANTEE:
-    - Does NOT change any existing external function signatures.
-    """
-
-    top_header("Sales & Deals")
+  
 
     if not selected_client_id:
         st.info("Select a client from the sidebar to view this page.")
@@ -4449,7 +4697,7 @@ def page_sales_deals():
     # ---------------------------------------------------------------------
     settings = get_client_settings(selected_client_id) or {}
     currency_code, currency_symbol = get_client_currency(selected_client_id)
-
+    month_label = pd.to_datetime(selected_month_start).strftime("%B%Y")
     st.markdown("---")
 
     # ---------------------------------------------------------------------
@@ -4821,102 +5069,180 @@ def page_sales_deals():
         secured_schedule_df: pd.DataFrame,
         currency_symbol: str,
     ) -> dict:
+        """
+        Revenue risk section — CFO-structured output (NO signature changes)
+
+        Guarantees:
+        - Returns same keys: risks, data_issues, what_this_means, actions
+        - what_this_means: max 4 bullets, 1 idea per bullet, consistent order
+        - actions: max 4 bullets, 1 action per bullet, consistent priority order
+        - Uses existing helper functions only (no new external dependencies)
+        """
         risks = []
         data_issues = _data_issues(df_pipe)
 
+        # ----------------------------
+        # Risks (keep existing codes)
+        # ----------------------------
         if _pipeline_ageing_risk_exists(df_pipe, settings):
-            risks.append({"code": "A", "message": "Pipeline ageing detected — expected conversion may be delayed."})
+            risks.append(
+                {"code": "A", "message": "Pipeline ageing detected — expected conversion may be delayed."}
+            )
 
         weighted_now = _compute_weighted_pipeline(df_pipe)
         weighted_prev = _weighted_pipeline_last_month(df_pipe, focus_month)
 
-        rec_this = _get_actual_recognised_for_month_from_schedule_df(secured_schedule_df, focus_month)
-        prev_month = (pd.to_datetime(focus_month).to_period("M").to_timestamp() - pd.DateOffset(months=1)).date()
-        rec_prev = _get_actual_recognised_for_month_from_schedule_df(secured_schedule_df, prev_month)
+        rec_this = _get_actual_recognised_for_month_from_schedule_df(
+            secured_schedule_df, focus_month
+        )
+        prev_month = (
+            pd.to_datetime(focus_month).to_period("M").to_timestamp() - pd.DateOffset(months=1)
+        ).date()
+        rec_prev = _get_actual_recognised_for_month_from_schedule_df(
+            secured_schedule_df, prev_month
+        )
 
         if weighted_now > weighted_prev and rec_this <= rec_prev:
-            risks.append({"code": "B", "message": "Pipeline growth not converting into recognised revenue."})
+            risks.append(
+                {"code": "B", "message": "Pipeline growth not converting into recognised revenue."}
+            )
 
         cash_this, cash_prev = _cash_received_this_prev_month(client_id, focus_month)
-        rev_to_cash_line = _rev_to_cash_one_liner(client_id, focus_month, settings, secured_schedule_df)
-        lag_deteriorating = ("lag increasing" in rev_to_cash_line.lower()) or ("collection risk" in rev_to_cash_line.lower())
+        rev_to_cash_line = _rev_to_cash_one_liner(
+            client_id, focus_month, settings, secured_schedule_df
+        )
+        lag_deteriorating = ("lag increasing" in (rev_to_cash_line or "").lower()) or (
+            "collection risk" in (rev_to_cash_line or "").lower()
+        )
 
         if (rec_this > rec_prev and cash_this < cash_prev) or lag_deteriorating:
-            risks.append({"code": "C", "message": "Revenue recognised, but cash conversion is slower than expected."})
+            risks.append(
+                {"code": "C", "message": "Revenue recognised, but cash conversion is slower than expected."}
+            )
 
         top2_share, top2_names = _concentration_top2_weighted(df_pipe)
         conc_threshold = float(settings.get("pipeline_concentration_threshold", 0.50) or 0.50)
         if top2_share >= conc_threshold and top2_share > 0:
-            risks.append({"code": "D", "message": f"Revenue outlook dependent on a small number of deals (Top 2 ~{top2_share*100:,.0f}%: {top2_names})."})
+            risks.append(
+                {
+                    "code": "D",
+                    "message": f"Revenue outlook dependent on a small number of deals (Top 2 ~{top2_share*100:,.0f}%: {top2_names}).",
+                }
+            )
 
+        # Helper flags
+        has_A = any(r["code"] == "A" for r in risks)
+        has_B = any(r["code"] == "B" for r in risks)
+        has_C = any(r["code"] == "C" for r in risks)
+        has_D = any(r["code"] == "D" for r in risks)
+
+        # ----------------------------
+        # WHAT THIS MEANS (max 4, 1 idea per bullet, fixed order)
+        # Revenue / Conversion / Cash / Fragility
+        # ----------------------------
         bullets = []
-        if rec_this >= rec_prev:
-            bullets.append("Recognised revenue is stable vs last month, but forward growth depends on late-stage conversion.")
+
+        # 1) Revenue reality (recognised)
+        if rec_this > rec_prev:
+            bullets.append(
+                "Recognised revenue increased vs last month, driven by scheduled recognition rather than pipeline size."
+            )
+        elif rec_this == rec_prev:
+            bullets.append(
+                "Recognised revenue is flat vs last month, with no material uplift locked in from existing schedules."
+            )
         else:
-            bullets.append("Recognised revenue is down vs last month, increasing reliance on pipeline conversion to recover.")
+            bullets.append(
+                "Recognised revenue declined vs last month, increasing reliance on near-term pipeline conversion."
+            )
 
-        if any(r["code"] == "A" for r in risks):
-            bullets.append("Aging pipeline suggests near-term revenue may slip if deals do not progress.")
-
-        if any(r["code"] == "C" for r in risks):
-            bullets.append("Cash impact from recognised revenue is deteriorating, implying higher working-capital pressure.")
+        # 2) Conversion quality (pipeline → recognised revenue)
+        if has_B:
+            bullets.append(
+                "Pipeline value has grown, but conversion into recognised revenue is lagging, indicating timing or win-rate pressure."
+            )
         else:
-            bullets.append(rev_to_cash_line.replace("ℹ️ ", "").replace("⚠️ ", "").replace("🔴 ", ""))
+            bullets.append(
+                "Pipeline conversion into recognised revenue is broadly tracking expectations."
+            )
 
-        if any(r["code"] == "D" for r in risks):
-            bullets.append("Revenue outcomes are concentrated; slippage in one major deal will materially move results.")
+        # 3) Cash conversion / working-capital
+        if has_C:
+            bullets.append(
+                "Cash collection is slower than revenue recognition, increasing near-term working-capital and runway pressure."
+            )
+        else:
+            # Keep your one-liner when healthy, but strip emojis for board-grade tone
+            clean_line = (rev_to_cash_line or "").replace("ℹ️ ", "").replace("⚠️ ", "").replace("🔴 ", "")
+            bullets.append(
+                clean_line if clean_line.strip()
+                else "Revenue is converting into cash without material deterioration in collection timing."
+            )
 
+        # 4) Forecast fragility (concentration + ageing) — include only if relevant
+        if has_D and has_A:
+            bullets.append(
+                "Revenue outlook is fragile, with outcomes dependent on a small number of ageing late-stage deals."
+            )
+        elif has_D:
+            bullets.append(
+                "Revenue outlook is concentrated, where slippage in one major deal would materially impact results."
+            )
+        elif has_A:
+            bullets.append(
+                "Pipeline ageing increases the risk of near-term revenue slippage without active deal progression."
+            )
+        # else: no 4th bullet
+
+        what_this_means = bullets[:4]
+
+        # ----------------------------
+        # ACTION PLAN (next 7 days) (max 4, fixed priority order)
+        # 1) Forecast truth  2) Conversion  3) Cash  4) Contingency
+        # ----------------------------
         actions = []
 
-        if any(r["code"] == "A" for r in risks):
-            actions += [
-                "Push stalled deals to decision or exit (book a buyer next-step within 72 hours).",
-                "Revalidate deal status with the buyer and update stage_entry_date if it changed.",
-            ]
-        if any(r["code"] == "B" for r in risks):
-            actions += [
-                "Focus sales effort on late-stage (contract/demo) deals; deprioritise early-stage outreach for 7 days.",
-                "Reassess conversion assumptions (win rate + cycle time) and adjust forecast expectations.",
-            ]
-        if any(r["code"] == "C" for r in risks):
-            actions += [
-                "Review payment terms on recent wins; tighten terms on any new contracts signed this week.",
-                "Accelerate invoicing milestones and escalate collections on overdue invoices.",
-            ]
-        if any(r["code"] == "D" for r in risks):
-            actions += ["Create a contingency plan: identify 3 next-best deals to advance if a top deal slips."]
-
+        # 1) Forecast integrity (always first)
         if data_issues:
-            actions += [
-                "Fix missing deal metadata (close month, method, value) and enforce pipeline hygiene immediately.",
-                "Add a simple rule: no stage move without stage_entry_date update (and reason if moving backwards).",
-            ]
+            actions.append(
+                "Fix missing or stale deal data immediately and enforce stage-date hygiene before further forecasting."
+            )
+        else:
+            actions.append(
+                "Confirm forecast inputs are clean and reflect current buyer-deal reality."
+            )
 
+        # 2) Force conversion decisions (only if A or B)
+        if has_A or has_B:
+            actions.append(
+                "Push late-stage deals to a clear decision within 72 hours (advance, re-scope, or exit)."
+            )
+
+        # 3) Protect cash flow (only if C)
+        if has_C:
+            actions.append(
+                "Tighten payment terms on new wins and accelerate invoicing and collections this week."
+            )
+
+        # 4) De-risk concentration (only if D)
+        if has_D:
+            actions.append(
+                "Advance 2–3 backup deals this week to reduce dependency on top opportunities."
+            )
+
+        # Ensure max 4 actions and no duplicates (paranoia-safe)
         seen = set()
-        deduped = []
+        deduped_actions = []
         for a in actions:
-            if a not in seen:
-                deduped.append(a)
+            if a and a not in seen:
+                deduped_actions.append(a)
                 seen.add(a)
-
-        if len(deduped) < 3:
-            deduped += [
-                "Confirm next 7-day sales target is tied to contract-stage progression (not new leads).",
-                "Remove dead deals from pipeline to avoid false confidence in weighted totals.",
-            ]
-            seen = set()
-            tmp = []
-            for a in deduped:
-                if a not in seen:
-                    tmp.append(a)
-                    seen.add(a)
-            deduped = tmp
 
         return {
             "risks": risks,
             "data_issues": data_issues,
-            "what_this_means": bullets[:4],
-            "actions": deduped[:5],
+            "what_this_means": what_this_means[:4],
+            "actions": deduped_actions[:4],
         }
 
     def _render_pipeline_waterfall(df_pipe: pd.DataFrame, currency_symbol: str):
@@ -4993,142 +5319,55 @@ def page_sales_deals():
         ax.margins(x=0.02)
         st.pyplot(fig)
 
-    # ============================================================
-    # Pipeline overview (single-column now)
-    # ============================================================
-    st.subheader("📂 Pipeline overview")
+    # ----------------------------
+    # Secured revenue schedule (used by multiple cards)
+    # ----------------------------
+    snap_df = build_revenue_schedule_for_client(
+        selected_client_id,
+        base_month=selected_month_start,
+        n_months=12,
+        mode="secured",
+    )
+    rec_this = _get_actual_recognised_for_month_from_schedule_df(snap_df, selected_month_start)
+    rec_next3 = _get_next3_total_from_schedule_df(snap_df, selected_month_start)
 
-    if df_pipeline.empty:
-        st.info("No deals in the pipeline yet for this business.")
+    # Plan + vs plan
+    plan_rev = _get_plan_for_month(selected_client_id, selected_month_start)
+    rev_vs_plan_pct = (rec_this - plan_rev) / plan_rev if plan_rev else None
+
+    # Avg deal size
+    avg_deal = _avg_deal_size_active(df_pipeline)
+
+    # Weighted pipeline
+    weighted_pipeline = _compute_weighted_pipeline(df_pipeline)
+
+    # ----------------------------
+    # Pipeline health -> status strip state/message
+    # ----------------------------
+    sev, decisions, metrics = build_pipeline_health_panel(df_pipeline, selected_month_start, currency_symbol)
+
+    if sev == "error":
+        status_state = "risk"
+        status_msg = "Immediate attention: pipeline health signals indicate elevated slippage risk."
+    elif sev == "warning":
+        status_state = "warning"
+        status_msg = "Watch items present: pipeline conversion/ageing signals need review."
     else:
-        k1, k2 = st.columns(2)
-        with k1:
-            st.metric("Total pipeline", f"{currency_symbol}{total_pipeline:,.0f}")
-        with k2:
-            st.metric("Open deals", open_deals_count)
+        status_state = "success"
+        status_msg = "Stable: pipeline signals are within expected range for this month."
 
-        # Build secured schedule ONCE
-        snap_df = build_revenue_schedule_for_client(
-            selected_client_id,
-            base_month=selected_month_start,
-            n_months=12,
-            mode="secured",
-        )
+    # ----------------------------
+    # Helper text (prefer cash line cleaned)
+    # ----------------------------
+    cash_line = _rev_to_cash_one_liner(selected_client_id, selected_month_start, settings, snap_df)
+    helper_text_clean = (
+        cash_line.replace("ℹ️ ", "").replace("⚠️ ", "").replace("🔴 ", "").strip()
+        if isinstance(cash_line, str) else ""
+    )
 
-        rec_this = _get_actual_recognised_for_month_from_schedule_df(snap_df, selected_month_start)
-        rec_next3 = _get_next3_total_from_schedule_df(snap_df, selected_month_start)
-
-        rk1, rk2 = st.columns(2)
-        with rk1:
-            st.metric("Recognised revenue (this month)", f"{currency_symbol}{rec_this:,.0f}")
-        with rk2:
-            st.metric("Recognised revenue (next 3 months)", f"{currency_symbol}{rec_next3:,.0f}")
-
-        plan_rev = _get_plan_for_month(selected_client_id, selected_month_start)
-        rev_vs_plan_pct = (rec_this - plan_rev) / plan_rev if plan_rev else None
-        avg_deal = _avg_deal_size_active(df_pipeline)
-
-        kk1, kk2 = st.columns(2)
-        with kk1:
-            if plan_rev <= 0:
-                st.metric("Revenue vs Plan", "Plan not set")
-            else:
-                st.metric("Revenue vs Plan", f"{rev_vs_plan_pct*100:,.1f}%")
-        with kk2:
-            st.metric("Average deal size (Active only)", f"{currency_symbol}{avg_deal:,.0f}")
-
-        ageing_line = _pipeline_ageing_one_liner(df_pipeline, settings, currency_symbol)
-        if ageing_line:
-            st.caption(ageing_line)
-
-        cash_line = _rev_to_cash_one_liner(selected_client_id, selected_month_start, settings, snap_df)
-        st.caption(cash_line)
-
-        horizon_start = pd.to_datetime(selected_month_start).replace(day=1)
-        horizon_end = horizon_start + pd.DateOffset(months=12)
-        st.caption(
-            f"Views below use deals closing between "
-            f"{horizon_start.strftime('%b %Y')} and "
-            f"{(horizon_end - pd.DateOffset(days=1)).strftime('%b %Y')} "
-            "(next 12 months window)."
-        )
-
-        # Health panel (uses your updated build_pipeline_health_panel without the 90d KPI)
-        sev, decisions, metrics = build_pipeline_health_panel(df_pipeline, selected_month_start, currency_symbol)
-
-        if metrics:
-            mcols = st.columns(len(metrics))
-            for i, (label, val) in enumerate(metrics):
-                mcols[i].metric(label, val)
-
-        if sev == "error":
-            st.error("\n".join([f"• {d}" for d in decisions]))
-        elif sev == "warning":
-            st.warning("\n".join([f"• {d}" for d in decisions]))
-        else:
-            st.success("\n".join([f"• {d}" for d in decisions]))
-
-        # Data checks warning (external; unchanged)
-        issues = build_pipeline_data_checks(df_pipeline)
-        if issues:
-            st.warning("**Data checks**\n" + "\n".join([f"• {i}" for i in issues]))
-
-        # View full pipeline list expander (kept)
-        display_cols = [
-            c
-            for c in [
-                "deal_name",
-                "customer_name",
-                "stage",
-                "value_total",
-                "probability_pct",
-                "start_month",
-                "end_month",
-                "method",
-                "contract_months",
-                "stage_entry_date",
-            ]
-            if c in df_pipeline.columns
-        ]
-        if display_cols:
-            view = df_pipeline[display_cols].copy().rename(
-                columns={
-                    "deal_name": "Deal",
-                    "customer_name": "Customer",
-                    "stage": "Stage",
-                    "value_total": "Value",
-                    "probability_pct": "Win chance (%)",
-                    "start_month": "Start month",
-                    "end_month": "End month",
-                    "method": "Revenue type",
-                    "contract_months": "Contract months",
-                    "stage_entry_date": "Stage entry date",
-                }
-            )
-            with st.expander("View full pipeline list", expanded=False):
-                st.dataframe(view, width="stretch")
-
-    # ============================================================
-    # Waterfall chart (TABLE REMOVED)
-    # ============================================================
-    _render_pipeline_waterfall(df_pipeline, currency_symbol)
-
-    # ============================================================
-    # Revenue / Risk / What this means / Action plan (NO tables)
-    # ============================================================
-    st.markdown("---")
-    st.subheader("🚦 Revenue, Risk & data issues")
-
-    try:
-        snap_df
-    except NameError:
-        snap_df = build_revenue_schedule_for_client(
-            selected_client_id,
-            base_month=selected_month_start,
-            n_months=12,
-            mode="secured",
-        )
-
+    # ----------------------------
+    # Risk bundle (What this means / Action plan + issues)
+    # ----------------------------
     bundle = _build_revenue_risk_section(
         df_pipe=df_pipeline,
         settings=settings,
@@ -5138,26 +5377,230 @@ def page_sales_deals():
         currency_symbol=currency_symbol,
     )
 
-    if not bundle["risks"]:
-        st.success("No revenue risk triggers fired for this month based on current data.")
+    # ----------------------------
+    # Card D issues list rule (your exact ordering)
+    # ----------------------------
+    issue_rows = []
+
+    for r in (bundle.get("risks", []) or []):
+        code = r.get("code", "")
+        msg = r.get("message", "")
+        issue_rows.append({"icon": "alert-octagon", "text": f"Risk {code} — {msg}".strip()})
+
+    for di in (bundle.get("data_issues", []) or []):
+        issue_rows.append({"icon": "database", "text": str(di)})
+
+    for d in (decisions or []):
+        issue_rows.append({"icon": "activity", "text": str(d)})
+
+    issue_rows = issue_rows[:8]
+    if not issue_rows:
+        issue_rows = [{"icon": "check-circle", "text": "No risk or data integrity issues detected for this month."}]
+
+    # ----------------------------
+    # Pipeline horizon explainer
+    # ----------------------------
+    horizon_start = pd.to_datetime(selected_month_start).replace(day=1)
+    horizon_end = horizon_start + pd.DateOffset(months=12)
+    start_label = horizon_start.strftime("%b %Y")
+    end_label = (horizon_end - pd.DateOffset(days=1)).strftime("%b %Y")
+    chart_explainer_txt = f"Weighted pipeline shows expected value by stage for deals closing {start_label} to {end_label} (next 12 months)."
+
+        # ----------------------------
+    # Build Plotly WATERFALL (true waterfall) as HTML
+    # ----------------------------
+    waterfall_plotly_html = ""
+    if df_pipeline is not None and not df_pipeline.empty:
+        dfw = df_pipeline.copy()
+        stage_order = ["idea", "demo", "proposal", "contract", "closed_won"]
+        dfw = dfw[dfw["stage"].isin(stage_order)].copy()
+
+        if not dfw.empty:
+            def _pf(row) -> float:
+                stg = str(row.get("stage", "")).lower()
+                if stg == "closed_won":
+                    return 1.0
+                p = float(row.get("probability_pct", 0.0) or 0.0)
+                p = max(0.0, min(100.0, p))
+                return p / 100.0
+
+            dfw["value_total"] = pd.to_numeric(dfw.get("value_total"), errors="coerce").fillna(0.0)
+            dfw["probability_pct"] = pd.to_numeric(dfw.get("probability_pct"), errors="coerce").fillna(0.0)
+            dfw["weighted_value"] = dfw["value_total"] * dfw.apply(_pf, axis=1)
+
+            stage_sum = (
+                dfw.groupby("stage", as_index=False)[["weighted_value"]]
+                .sum()
+                .set_index("stage")
+                .reindex(stage_order)
+                .fillna(0.0)
+                .reset_index()
+            )
+
+            stage_sum["label"] = stage_sum["stage"].str.replace("_", " ").str.title()
+            labels = stage_sum["label"].tolist()
+            values = stage_sum["weighted_value"].astype(float).tolist()
+
+            total_expected = float(sum(values))
+
+            # ✅ Waterfall needs measures: each stage is "relative", last one is "total"
+            x = labels + ["Total expected"]
+            y = values + [total_expected]
+            measures = ["relative"] * len(values) + ["total"]
+
+            fig = go.Figure(
+                go.Waterfall(
+                    name="Weighted pipeline",
+                    x=x,
+                    y=y,
+                    measure=measures,
+                    connector={"line": {"width": 1}},
+                    # Optional: keep text simple to avoid clutter
+                    hovertemplate=f"%{{x}}<br>{currency_symbol}%{{y:,.0f}}<extra></extra>",
+                )
+            )
+
+            fig.update_layout(
+                height=320,
+                margin=dict(l=70, r=18, t=18, b=58),
+                showlegend=False,
+                yaxis=dict(
+                    title="Weighted pipeline value",
+                    automargin=True,
+                    tickformat=",",
+                    showgrid=True,
+                    zeroline=False,
+                ),
+                xaxis=dict(
+                    title="Stage",
+                    automargin=True,
+                    tickangle=0,
+                    showgrid=False,
+                ),
+            )
+
+            # Apply your theme (must not hide axes/ticks)
+            from ui.plotly_charts import apply_nordic_plotly_theme, PLOTLY_CONFIG_MINIMAL
+            fig = apply_nordic_plotly_theme(fig)
+
+            waterfall_plotly_html = pio.to_html(
+                fig,
+                include_plotlyjs="cdn",
+                full_html=False,
+                config=PLOTLY_CONFIG_MINIMAL,
+            )
+
+
+    # ----------------------------
+    # Formatting helpers (values as strings)
+    # ----------------------------
+    def m(x: float | None) -> str:
+        if x is None:
+            return "—"
+        try:
+            return f"{currency_symbol}{float(x):,.0f}"
+        except Exception:
+            return "—"
+
+    rev_this_txt = m(rec_this)
+    active_deals_txt = f"{open_deals_count:,}"
+    avg_deal_txt = m(avg_deal)
+
+    if plan_rev and plan_rev > 0 and rev_vs_plan_pct is not None:
+        rev_vs_plan_txt = f"{rev_vs_plan_pct*100:,.1f}%"
     else:
-        for r in bundle["risks"]:
-            st.error(f"🔴 Risk {r['code']} — {r['message']}")
+        rev_vs_plan_txt = "Plan not set"
 
-    if bundle["data_issues"]:
-        st.warning("⚠️ Data issues detected (hygiene):")
-        for di in bundle["data_issues"]:
-            st.write(f"• {di}")
-    else:
-        st.caption("No data hygiene issues detected based on available fields.")
+    rec_this_txt = m(rec_this)
+    rec_next3_txt = m(rec_next3)
 
-    st.markdown("#### What this means")
-    for b in bundle["what_this_means"][:4]:
-        st.write(f"• {b}")
+    total_pipeline_txt = m(total_pipeline)
+    weighted_pipeline_txt = m(weighted_pipeline)
+    open_deals_txt = f"{open_deals_count:,}"
 
-    st.markdown("#### Action plan (next 7 days)")
-    for i, a in enumerate(bundle["actions"][:5], start=1):
-        st.write(f"{i}. {a}")
+    what_this_means_bullets = (bundle.get("what_this_means", []) or [])[:5]
+    action_items = (bundle.get("actions", []) or [])[:5]
+
+    # ----------------------------
+    # FINAL mapping dict -> component
+    # ----------------------------
+    sales_deals_data = {
+        "header": {
+            "title": "Revenue & Deals",
+            "subtitle": f"Revenue and pipeline detail for {month_label}",
+            "icon": "handshake",
+        },
+
+        "card_a_revenue_health": {
+            "title": "Revenue health (this month)",
+            "subtitle": "Actual revenue performance versus expectations",
+            "icon": "activity",
+            "kpis": [
+                {"label": "Revenue this month", "value": rev_this_txt},
+                {"label": "Active deals", "value": active_deals_txt},
+                {"label": "Average deal size", "value": avg_deal_txt},
+                {"label": "Revenue vs plan", "value": rev_vs_plan_txt},
+            ],
+            "status_strip": {
+                "state": status_state,
+                "message": status_msg,
+            },
+        },
+
+        "card_b_revenue_now_next": {
+            "title": "Revenue now & next",
+            "subtitle": "Recognised revenue outlook (secured schedule)",
+            "icon": "calendar",
+            "kpis": [
+                {"label": "Recognised revenue – this month", "value": rec_this_txt},
+                {"label": "Recognised revenue – next 3 months", "value": rec_next3_txt},
+            ],
+            "helper_text": helper_text_clean,
+        },
+
+        "card_c_pipeline_reality": {
+            "title": "Pipeline Reality",
+            "subtitle": "Closed revenue and weighted pipeline for the next 12 months",
+            "icon": "bar-chart-3",
+            "kpis": [
+                {"label": "Total pipeline", "value": total_pipeline_txt},
+                {"label": "Weighted pipeline", "value": weighted_pipeline_txt},
+                {"label": "Open deals", "value": open_deals_txt},
+            ],
+            "chart": {
+                "title": "Waterfall Chart",
+                "plotly_html": waterfall_plotly_html,
+                "empty_text": "No pipeline data to display.",
+            },
+            "explanation": chart_explainer_txt,
+        },
+
+        "card_d_revenue_risk_data_issues": {
+            "title": "Revenue Risk & Data Issues",
+            "subtitle": "Potential issues that could impact revenue timing or accuracy",
+            "icon": "shield-alert",
+            "issues": issue_rows,
+            "inline_link": {"label": "Review pipeline data", "href": ""},
+        },
+
+        "card_e_what_this_means": {
+            "title": "What this means",
+            "icon": "sparkles",
+            "bullets": what_this_means_bullets,
+            "fallback": "No narrative insights available yet — add stage dates and revenue schedule inputs.",
+        },
+
+        "card_f_action_plan": {
+            "title": "Action plan – next 7 days",
+            "icon": "circle-check-big",
+            "items": action_items,
+            "fallback": "No actions triggered — maintain pipeline hygiene and update stage progress weekly.",
+        },
+    }
+
+    # Render component
+    from component.sales_deals_component import render_sales_deals
+    render_sales_deals(sales_deals_data, height=2250)
 
 
 
@@ -7312,6 +7755,124 @@ def compute_danger_month_from_cash(df: pd.DataFrame, amount_col: str = "closing_
     return None, None
 
 
+def inject_sidebar_css():
+    st.markdown(
+        """
+        <style>
+        /* ===============================
+           GLOBAL FONT
+        =============================== */
+        .stApp, .stApp * {
+          font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif !important;
+        }
+
+        /* ===============================
+           🔥 HIDE STREAMLIT AUTO PAGES NAV
+           (this removes app / component list)
+        =============================== */
+        section[data-testid="stSidebarNav"] {
+          display: none !important;
+        }
+
+        /* ===============================
+           SIDEBAR CANVAS
+        =============================== */
+        section[data-testid="stSidebar"] {
+          background: #FFFFFF !important;
+          border-right: 1px solid #E5E7EB !important;
+        }
+
+        section[data-testid="stSidebar"] > div {
+          padding: 14px 12px 18px 12px !important;
+        }
+
+        /* ===============================
+           SIDEBAR TITLE (Matfina)
+        =============================== */
+        section[data-testid="stSidebar"] .sidebar-title {
+          font-size: 12px;
+          font-weight: 600;
+          color: #0F172A;
+          margin: 4px 0 14px 2px;
+        }
+
+        /* ===============================
+           SELECTBOX (Client + Month)
+        =============================== */
+        section[data-testid="stSidebar"] div[data-testid="stSelectbox"] div[role="combobox"] {
+          background: #F8FAFC !important;
+          border: 1px solid #E5E7EB !important;
+          border-radius: 10px !important;
+          min-height: 36px !important;
+        }
+
+        section[data-testid="stSidebar"] div[data-testid="stSelectbox"] * {
+          font-size: 12px !important;
+          color: #0F172A !important;
+        }
+
+        /* ===============================
+           NAV RADIO GROUP (PILLS)
+        =============================== */
+        section[data-testid="stSidebar"] div[role="radiogroup"] {
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          margin-top: 6px;
+        }
+
+        /* Each nav item (unselected) */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+          background: #F8FAFC !important;
+          border: 1px solid #E5E7EB !important;
+          border-radius: 10px !important;
+          padding: 9px 12px !important;
+          cursor: pointer;
+          transition: background 120ms ease, border-color 120ms ease;
+        }
+
+        /* Nav text */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label p {
+          margin: 0 !important;
+          font-size: 12px !important;
+          font-weight: 500 !important;
+          line-height: 18px !important;
+          color: #334155 !important;
+        }
+
+        /* Hide native radio */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label input {
+          display: none !important;
+        }
+
+        /* Hover */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+          background: #F1F5F9 !important;
+        }
+
+        /* ===============================
+           SELECTED NAV ITEM
+        =============================== */
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {
+          background: #E5E7EB !important;
+          border-color: #E5E7EB !important;
+        }
+
+        section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) p {
+          color: #0F172A !important;
+          font-weight: 600 !important;
+        }
+
+        /* ===============================
+           CLEAN UP DEFAULTS
+        =============================== */
+        section[data-testid="stSidebar"] hr {
+          border-color: #E5E7EB !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def fetch_comments_for_client_page(client_id: str, page_name: str):
@@ -7350,16 +7911,25 @@ def create_comment_for_client_page(
         return False
 
 
-
 # ---------- Sidebar: global controls ----------
 
-st.sidebar.title("Matfina")
+inject_sidebar_css()
+
+st.sidebar.image(
+    "assets/matfina_logo.png",
+    width=64,   # adjust: 48–72 works well
+)
+st.sidebar.markdown("<div style='font-size:12px;font-weight:600;color:#0F172A;margin:4px 0 10px 0;'>MatFina</div>", unsafe_allow_html=True)
+
 
 # Client selector (multi-tenant ready)
 clients_data = load_clients()
 client_names = [c["name"] for c in clients_data]
 
-selected_client_name = st.sidebar.selectbox("Select business", client_names)
+selected_client_name = st.sidebar.selectbox(
+    "Select business",
+    client_names,
+)
 
 # Find the matching client_id
 selected_client_id = None
@@ -7380,7 +7950,7 @@ if not month_options:
 selected_month_label = st.sidebar.selectbox(
     "Focus month",
     month_options,
-    index=len(month_options) - 1,  # default to latest month with data
+    index=len(month_options) - 1,
 )
 
 selected_month_start = parse_month_label_to_date(selected_month_label)
@@ -7763,7 +8333,6 @@ def save_client_settings(client_id, ar_days=None, ap_days=None, **extra_fields):
         return False
 
 def render_currency_settings_section(client_id: str) -> None:
-    st.subheader("💱 Currency settings")
 
     if not client_id:
         st.info("Select a business first.")
@@ -8111,7 +8680,7 @@ def build_kpi_change_explanations(client_id, month_date: date) -> dict:
         return result
 
     this_month_dt = pd.to_datetime(month_date).date().replace(day=1)
-    prev_month_dt = (pd.to_datetime(this_month_dt) - pd.DateOffset(months=1)).date()
+    prev_month_dt = (pd.to_datetime(this_month_dt) - pd.DateOffset(months=1)).date().replace(day=1)
 
     # ✅ ONE DB call for both months (if rows exist)
     bulk = fetch_kpis_for_client_months_bulk(client_id, [this_month_dt, prev_month_dt])
@@ -8146,28 +8715,129 @@ def build_kpi_change_explanations(client_id, month_date: date) -> dict:
     result["deltas"]["cash"] = dc
     result["deltas"]["runway"] = dr
 
-    def _change_sentence(delta: float, label: str) -> str:
+    # ✅ UPDATED: adds % change (same style as _revenue_delta_caption)
+    def _change_sentence(delta: float, prev_value: float, label: str) -> str:
         if abs(delta) < 1e-6:
             return f"{label} is roughly flat vs last month."
+
         direction = "up" if delta > 0 else "down"
-        return f"{label} is {direction} by {abs(delta):,.0f} vs last month."
 
-    result["explanations"]["money_in"] = _change_sentence(di, "Money in")
-    result["explanations"]["money_out"] = _change_sentence(do, "Money out")
+        pct_txt = ""
+        if abs(prev_value) > 1e-6:
+            pct = (delta / prev_value) * 100.0
+            pct_txt = f" ({pct:+.0f}%)"
 
+        return f"{label} is {direction} by {abs(delta):,.0f} vs last month{pct_txt}."
+
+    # Money in/out now include % change
+    result["explanations"]["money_in"] = _change_sentence(di, prev_in, "Money in")
+    result["explanations"]["money_out"] = _change_sentence(do, prev_out, "Money out")
+
+    # Cash now includes % change too
     if abs(dc) < 1e-6:
         result["explanations"]["cash"] = "Cash in bank is roughly flat vs last month."
     else:
         direction = "higher" if dc > 0 else "lower"
-        result["explanations"]["cash"] = f"Cash in bank is {direction} by {abs(dc):,.0f} vs last month."
+        pct_txt = ""
+        if abs(prev_cash) > 1e-6:
+            pct = (dc / prev_cash) * 100.0
+            pct_txt = f" ({pct:+.0f}%)"
+        result["explanations"]["cash"] = (
+            f"Cash in bank is {direction} by {abs(dc):,.0f} vs last month{pct_txt}."
+        )
 
+    # Runway now includes % change too (only if prev_runway not ~0)
     if abs(dr) < 1e-3:
         result["explanations"]["runway"] = "Runway is about the same as last month."
     else:
         direction = "longer" if dr > 0 else "shorter"
-        result["explanations"]["runway"] = f"Runway is {direction} by {abs(dr):.1f} months vs last month."
+        pct_txt = ""
+        if abs(prev_runway) > 1e-6:
+            pct = (dr / prev_runway) * 100.0
+            pct_txt = f" ({pct:+.0f}%)"
+        result["explanations"]["runway"] = (
+            f"Runway is {direction} by {abs(dr):.1f} months vs last month{pct_txt}."
+        )
 
     return result
+
+
+def explain_rev_change_from_schedule(
+    client_id: str,
+    focus_month: date,
+    prev_month: date,
+) -> str | None:
+    """
+    Explain WHY recognised revenue changed using secured revenue schedule.
+
+    Conservative attribution:
+      - New deals starting recognition
+      - Deals ending / pausing recognition
+      - Mix of both
+      - Timing / milestone shifts (fallback)
+
+    Returns a short explanation sentence or None if attribution is unclear.
+    """
+    try:
+        sched = build_revenue_schedule_for_client(
+            client_id,
+            base_month=prev_month,
+            n_months=2,
+            mode="secured",
+        )
+        if sched is None or sched.empty:
+            return None
+
+        s = sched.copy()
+        if "month_date" not in s.columns:
+            return None
+
+        s["month_date"] = (
+            pd.to_datetime(s["month_date"], errors="coerce")
+            .dt.to_period("M")
+            .dt.to_timestamp()
+        )
+        s = s[s["month_date"].notna()].copy()
+
+        value_col = next(
+            (c for c in ["recognised_revenue", "revenue_amount", "amount"] if c in s.columns),
+            None,
+        )
+        if value_col is None:
+            return None
+
+        m_curr = _safe_month_start(focus_month)
+        m_prev = _safe_month_start(prev_month)
+
+        curr_df = s[s["month_date"] == m_curr]
+        prev_df = s[s["month_date"] == m_prev]
+
+        curr_total = float(pd.to_numeric(curr_df.get(value_col, 0.0), errors="coerce").fillna(0.0).sum())
+        prev_total = float(pd.to_numeric(prev_df.get(value_col, 0.0), errors="coerce").fillna(0.0).sum())
+
+        if abs(curr_total - prev_total) < 1e-6:
+            return None
+
+        # Deal-level attribution if deal_id exists
+        if "deal_id" in s.columns:
+            curr_deals = set(curr_df["deal_id"].dropna().astype(str).tolist())
+            prev_deals = set(prev_df["deal_id"].dropna().astype(str).tolist())
+
+            new_deals = curr_deals - prev_deals
+            ended_deals = prev_deals - curr_deals
+
+            if new_deals and not ended_deals:
+                return "The change is mainly from **new deals starting recognition** this month."
+            if ended_deals and not new_deals:
+                return "The change is mainly from **deals ending or pausing recognition** this month."
+            if new_deals and ended_deals:
+                return "The change reflects a **mix of new deals starting and others ending** recognition."
+
+        # Fallback: timing/milestones within existing deals
+        return "The change is mainly due to **timing or milestone recognition shifts** within existing deals."
+
+    except Exception:
+        return None
 
 
 def build_month_summary(
@@ -8273,240 +8943,190 @@ def build_month_summary(
     return " ".join(parts)
 
 
+# ==============================
+# 2) FIX YOUR build_month_summary_insight() BLOCK
+#    - remove globals inside
+#    - define prev_month (you used it but it's missing)
+#    - keep your WHY section but RETURN must include why_sentence
+# ==============================
+
+from datetime import date
+import pandas as pd
+
 def build_month_summary_insight(
     client_id: str,
     focus_month: date,
+    recognised_rev_this: float | None = None,
+    recognised_rev_prev: float | None = None,
+    currency_symbol: str = "$",
 ) -> str:
     """
-    Generate a short, opinionated 'CFO-style' summary for the focus month.
-
-    Uses cashflow_summary + computed runway/effective burn to answer:
-      - What kind of month was this? (strong / controlled burn / tight / critical)
-      - What mainly drove it? (operating vs investing vs financing)
-      - What should the founder pay attention to next?
+    Output rules (NO deviations):
+      - Return exactly 4 bullet points, fixed order: Revenue, Cash, Runway, Capital movements
+      - One sentence per bullet
+      - No recommendations/actions
+      - Board-ready, factual tone
+      - Rendering templates must match exactly (except dynamic values + negative handling on Revenue/Cash)
     """
     try:
-        as_of_month = get_active_as_of_month(selected_client_id, selected_month_start)
+        # -------------------------
+        # Month keys EXACTLY like build_kpi_change_explanations
+        # -------------------------
+        if client_id is None or focus_month is None:
+            raise ValueError("client_id/focus_month missing")
+
+        this_month_dt = pd.to_datetime(focus_month).date().replace(day=1)
+        prev_month_dt = (pd.to_datetime(this_month_dt) - pd.DateOffset(months=1)).date().replace(day=1)
+
+        # -------------------------
+        # KPI deltas EXACTLY like build_kpi_change_explanations (source of truth)
+        # -------------------------
+        bulk = fetch_kpis_for_client_months_bulk(client_id, [this_month_dt, prev_month_dt])
+        curr = bulk.get(this_month_dt.isoformat())
+        prev = bulk.get(prev_month_dt.isoformat())
+
+        if not curr:
+            curr = fetch_kpis_for_client_month(client_id, this_month_dt)
+        if not prev:
+            prev = fetch_kpis_for_client_month(client_id, prev_month_dt)
+
+        if not curr or not prev:
+            # Safe defaults (4 bullets later)
+            kpi_cash_delta = 0.0
+            kpi_runway = None
+            kpi_runway_driver = "insufficient cashflow engine history for a runway attribution"
+        else:
+            curr_cash = _safe_float(curr.get("cash_balance", 0.0))
+            prev_cash = _safe_float(prev.get("cash_balance", 0.0))
+            kpi_cash_delta = curr_cash - prev_cash
+
+            # Runway level can also come from KPI table (consistent with KPI logic)
+            kpi_runway = _safe_float(curr.get("runway_months", None))
+            if kpi_runway is None:
+                kpi_runway_driver = "insufficient runway history is available in the cashflow engine"
+            else:
+                kpi_runway_driver = "the recent burn rate remains the primary runway constraint"
+
+        cash_delta = float(kpi_cash_delta)
+
+        # -------------------------
+        # Engine df ONLY for driver words / capital narrative (not deltas)
+        # -------------------------
+        as_of_month = get_active_as_of_month(client_id, focus_month)
         engine_df = fetch_cashflow_summary_for_client_as_of(client_id, as_of_month)
-        if engine_df is None or engine_df.empty:
-            return (
-                "We don't have any cashflow engine rows yet for this business. "
-                "Once AR/AP, payroll and investing/financing flows are in and you've rebuilt "
-                "the cashflow, this summary will explain what drove the month."
-            )
 
-        df = engine_df.copy()
-        df["month_date"] = pd.to_datetime(
-            df["month_date"], errors="coerce"
-        ).dt.date
-        df = df.sort_values("month_date")
+        df = engine_df.copy() if engine_df is not None else pd.DataFrame()
+        if df.empty or "month_date" not in df.columns:
+            df = pd.DataFrame(columns=["month_date", "operating_cf", "investing_cf", "financing_cf"])
 
-        focus = pd.to_datetime(focus_month).date().replace(day=1)
+        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+        df = df[df["month_date"].notna()].sort_values("month_date")
+        df["month_key"] = df["month_date"].dt.to_period("M").dt.to_timestamp().dt.date
+        df = df.sort_values("month_date").drop_duplicates(subset=["month_key"], keep="last")
 
-        # ---- This month row ----
-        this_row = df[df["month_date"] == focus]
-        if this_row.empty:
-            return (
-                "We don't yet have a cashflow row for this month. "
-                "Rebuild the cashflow engine, or pick a month that has data."
-            )
+        this_row = df[df["month_key"] == this_month_dt]
 
-        closing_cash = float(this_row.get("closing_cash", 0.0).iloc[0] or 0.0)
-        free_cf_this = float(this_row.get("free_cash_flow", 0.0).iloc[0] or 0.0)
-        investing_cf_this = float(
-            this_row.get("investing_cf", 0.0).iloc[0] or 0.0
-        )
-        financing_cf_this = float(
-            this_row.get("financing_cf", 0.0).iloc[0] or 0.0
-        )
-        operating_cf_this = float(
-            this_row.get("operating_cf", 0.0).iloc[0] or 0.0
-        )
+        operating_cf = float(this_row["operating_cf"].iloc[0]) if (not this_row.empty and "operating_cf" in this_row.columns and pd.notna(this_row["operating_cf"].iloc[0])) else 0.0
+        investing_cf = float(this_row["investing_cf"].iloc[0]) if (not this_row.empty and "investing_cf" in this_row.columns and pd.notna(this_row["investing_cf"].iloc[0])) else 0.0
+        financing_cf = float(this_row["financing_cf"].iloc[0]) if (not this_row.empty and "financing_cf" in this_row.columns and pd.notna(this_row["financing_cf"].iloc[0])) else 0.0
 
-        # ---- Previous month (for comparison) ----
-        prev_row = df[df["month_date"] < focus].tail(1)
-        closing_prev = None
-        free_cf_prev = None
-        if not prev_row.empty:
-            closing_prev = float(
-                prev_row.get("closing_cash", 0.0).iloc[0] or 0.0
-            )
-            free_cf_prev = float(
-                prev_row.get("free_cash_flow", 0.0).iloc[0] or 0.0
-            )
+        # Cash driver (dominant component)
+        op_abs, inv_abs, fin_abs = abs(operating_cf), abs(investing_cf), abs(financing_cf)
+        biggest = max(op_abs, inv_abs, fin_abs)
 
-        # ---- Runway & effective burn ----
-        runway_months, effective_burn = compute_runway_and_effective_burn_from_df(
-        engine_df,
-        focus,
-    )
-
-        # ------------------------------------------------------------------
-        # 1) Classify the month
-        # ------------------------------------------------------------------
-        headline_parts: list[str] = []
-
-        # Cash movement this month
-        if free_cf_this > 0:
-            headline_parts.append("Cash **increased** this month.")
-        elif free_cf_this < 0:
-            headline_parts.append("Cash **decreased** this month.")
+        if biggest == fin_abs and fin_abs > 1e-6:
+            cash_driver = "financing activity rather than operating cash inflows"
+        elif biggest == op_abs and op_abs > 1e-6:
+            cash_driver = "operating cash inflows rather than capital movements"
+        elif biggest == inv_abs and inv_abs > 1e-6:
+            cash_driver = "investing activity rather than operating cash inflows"
         else:
-            headline_parts.append("Cash was **roughly flat** this month.")
+            cash_driver = "mixed drivers across operating, investing, and financing movements"
 
-        # Runway view
-        if runway_months is not None:
-            rm = runway_months
-            if rm < 3:
-                headline_parts.append(
-                    f"Runway is **critical** at about {rm:.1f} months."
-                )
-            elif rm < 6:
-                headline_parts.append(
-                    f"Runway is **tight**, around {rm:.1f} months."
-                )
-            elif rm < 12:
-                headline_parts.append(
-                    f"Runway is **comfortable** at about {rm:.1f} months, "
-                    "with a controlled burn."
-                )
+        # Runway (level from KPI table to match KPI logic)
+        runway_months = None if kpi_runway is None else float(kpi_runway)
+        runway_driver = kpi_runway_driver
+
+        # If cash driver is financing-heavy, keep your existing wording tweak
+        if runway_months is not None and "financing activity" in cash_driver:
+            runway_driver = "cash inflows this month were partly non-recurring"
+
+        # Capital movements
+        financing_summary = "equity raises, loan drawdowns or repayments, and dividends"
+        total_move = max(1e-9, abs(cash_delta))
+        investing_one_off_flag = bool(inv_abs > 0.3 * total_move and inv_abs > 1e-6)
+        investing_summary = "a one-off investing movement"
+
+        # Revenue delta (keep your current approach)
+        if recognised_rev_this is not None and recognised_rev_prev is not None:
+            rev_delta = float(recognised_rev_this) - float(recognised_rev_prev)
+
+            rev_why_sentence = explain_rev_change_from_schedule(
+                client_id=client_id,
+                focus_month=focus_month,
+                prev_month=prev_month_dt,
+            )
+            s = (rev_why_sentence or "").lower()
+            if "new deals" in s and ("start" in s or "starting" in s):
+                rev_driver = "new deals commencing revenue recognition this month"
+            elif "ending" in s or "end" in s:
+                rev_driver = "deals ending revenue recognition this month"
+            elif "milestone" in s:
+                rev_driver = "milestone recognition timing shifts this month"
             else:
-                headline_parts.append(
-                    f"Runway is **strong** at roughly {rm:.1f} months."
-                )
+                rev_driver = "timing shifts across the revenue recognition schedule"
         else:
-            if effective_burn and effective_burn > 0:
-                headline_parts.append(
-                    "You're burning cash, but there isn't enough history yet "
-                    "to estimate runway."
-                )
-            else:
-                headline_parts.append(
-                    "There isn't enough history yet to estimate runway."
-                )
+            rev_delta = 0.0
+            rev_driver = "insufficient recognised revenue history for a month-on-month attribution"
 
-        headline = " ".join(headline_parts)
-
-        # ------------------------------------------------------------------
-        # 2) Identify the main driver of the month
-        # ------------------------------------------------------------------
-        driver_parts: list[str] = []
-
-        # Magnitudes for attribution
-        total_movement = abs(free_cf_this)
-        inv_abs = abs(investing_cf_this)
-        fin_abs = abs(financing_cf_this)
-        op_abs = abs(operating_cf_this)
-
-        # If there's very little movement, keep this simple
-        if total_movement < 1e-6:
-            driver_parts.append(
-                "This month’s net cash movement was very small, so there "
-                "were no major cash drivers."
+        # -------------------------
+        # Rendering templates (NO deviations)
+        # -------------------------
+        if float(rev_delta) >= 0:
+            revenue_line = (
+                f"Revenue: Recognised revenue increased by {currency_symbol}{abs(float(rev_delta)):,.0f} vs last month, "
+                f"mainly due to {rev_driver}."
             )
         else:
-            # Decide which component is the biggest contributor
-            # (operating vs investing vs financing)
-            biggest = "operating"
-            biggest_val = op_abs
-
-            if inv_abs > biggest_val:
-                biggest = "investing"
-                biggest_val = inv_abs
-            if fin_abs > biggest_val:
-                biggest = "financing"
-                biggest_val = fin_abs
-
-            share = biggest_val / total_movement if total_movement > 0 else 0.0
-
-            if biggest == "operating":
-                if share > 0.6:
-                    driver_parts.append(
-                        "Most of the movement came from **operating cashflow** "
-                        "(revenue vs operating spend)."
-                    )
-                else:
-                    driver_parts.append(
-                        "Operating cashflow mattered, but **investing/financing "
-                        "moves also played a role**."
-                    )
-            elif biggest == "investing":
-                driver_parts.append(
-                    "The main driver was **investing activity** – things like "
-                    "capex, asset purchases or disposals."
-                )
-            else:  # financing
-                driver_parts.append(
-                    "The main driver was **financing activity** – equity raises, "
-                    "loan drawdowns/repayments or dividends."
-                )
-
-        # Also mention whether movement is a one-off vs recurring
-        if abs(investing_cf_this) > 0 and abs(investing_cf_this) > 0.3 * total_movement:
-            driver_parts.append(
-                "Part of this looks like a **one-off investing move** "
-                "(not a recurring monthly pattern)."
-            )
-        if abs(financing_cf_this) > 0 and abs(financing_cf_this) > 0.3 * total_movement:
-            driver_parts.append(
-                "There is also a **financing impact** this month "
-                "(funding or repayments)."
+            revenue_line = (
+                f"Revenue: Recognised revenue decreased by {currency_symbol}{abs(float(rev_delta)):,.0f} vs last month, "
+                f"mainly due to {rev_driver}."
             )
 
-        driver_sentence = " ".join(driver_parts)
-
-        # ------------------------------------------------------------------
-        # 3) Suggest next actions / focus areas
-        # ------------------------------------------------------------------
-        action_parts: list[str] = []
-
-        # If runway is short
-        if runway_months is not None and runway_months < 6:
-            action_parts.append(
-                "Priority should be **extending runway** – "
-                "review hiring pace, contractor spend and large supplier costs."
+        if float(cash_delta) >= 0:
+            cash_line = (
+                f"Cash: Cash balance increased by {currency_symbol}{abs(float(cash_delta)):,.0f} this month, "
+                f"driven primarily by {cash_driver}."
             )
-        elif runway_months is not None and runway_months >= 12:
-            action_parts.append(
-                "Given the healthy runway, focus can stay on **growth and ROI** "
-                "rather than immediate cost cutting."
+        else:
+            cash_line = (
+                f"Cash: Cash balance decreased by {currency_symbol}{abs(float(cash_delta)):,.0f} this month, "
+                f"driven primarily by {cash_driver}."
             )
 
-        # If burn is increasing vs last month
-        if free_cf_prev is not None and free_cf_prev < 0 and free_cf_this < free_cf_prev:
-            action_parts.append(
-                "Burn is **higher than last month** – it’s worth checking "
-                "for permanent step-ups in payroll or recurring vendor spend."
-            )
+        rm_txt = "—" if runway_months is None else f"{float(runway_months):.1f}"
+        runway_line = (
+            f"Runway: Runway stands at approximately {rm_txt} months, reflecting that {runway_driver}."
+        )
 
-        # If very little movement and strong cash
-        if total_movement < 1000 and closing_cash > 0:
-            action_parts.append(
-                "Cash movement is small relative to balance – it may be time "
-                "to decide whether to **deploy excess cash** or keep it as buffer."
-            )
+        optional_investing_clause = f", alongside {investing_summary}" if bool(investing_one_off_flag) else ""
+        capital_line = (
+            f"Capital: Non-operating capital movements impacted cash this month, including {financing_summary}"
+            f"{optional_investing_clause}."
+        )
 
-        if not action_parts:
-            # Fallback generic guidance
-            action_parts.append(
-                "Use this view to confirm whether the month behaved as planned – "
-                "if not, start with operating spend, then any large "
-                "investing or financing moves."
-            )
-
-        actions_sentence = " ".join(action_parts)
-
-        # ------------------------------------------------------------------
-        # Final combined summary (single paragraph)
-        # ------------------------------------------------------------------
-        return f"{headline} {driver_sentence} {actions_sentence}"
+        return "\n\n".join([revenue_line, cash_line, runway_line, capital_line])
 
     except Exception as e:
         print("Error building month summary insight:", e)
-        return (
-            "We hit an issue while building this month's summary. "
-            "Check that cashflow_summary has data for this client and month."
-        )
+        financing_summary = "equity raises, loan drawdowns or repayments, and dividends"
+        return "\n\n".join([
+            f"Revenue: Recognised revenue increased by {currency_symbol}0 vs last month, mainly due to insufficient recognised revenue history for a month-on-month attribution.",
+            f"Cash: Cash balance increased by {currency_symbol}0 this month, driven primarily by insufficient cashflow engine history for a month-on-month attribution.",
+            "Runway: Runway stands at approximately — months, reflecting that an error occurred while building the runway attribution.",
+            f"Capital: Non-operating capital movements impacted cash this month, including {financing_summary}."
+        ])
+
 
 
 def render_cash_engine_debug_tile(client_id: str, base_month: date):
@@ -8633,10 +9253,9 @@ def render_quick_scenario_block_for_overview():
     # RIGHT: presets + levers
     # ------------------------------------
     with col_controls:
-        st.markdown("#### Scenario type")
 
         preset = st.selectbox(
-            "Quick scenario preset",
+            "Select the Scenario",
             options=[
                 "Revenue push (+20%)",
                 "Hire 1 key role (+$15k/month)",
@@ -8659,7 +9278,7 @@ def render_quick_scenario_block_for_overview():
         }
 
         start_month_label = st.selectbox(
-            "Scenario starts from month",
+            "Starting Month",
             options=month_labels,
         )
         start_month_ts = month_label_map[start_month_label]
@@ -9313,6 +9932,7 @@ def _compute_primary_focus(
     # 4️⃣ OPTIMISATION / DISCIPLINE
     return "Maintain discipline and selectively optimise growth"
 
+
 def _build_main_actions(*, primary_focus: str) -> list[dict]:
     """
     Returns actions with:
@@ -9430,9 +10050,34 @@ def _build_main_actions(*, primary_focus: str) -> list[dict]:
 
     return clean[:5]
 
+
+
 def get_active_as_of_month(client_id: str, focus_month: date) -> date:
     return month_start(get_cashflow_active_base_month(str(client_id), fallback_month=focus_month))
 
+def _revenue_delta_caption(this_month_rev, prev_month_rev, currency_symbol: str) -> str:
+    if this_month_rev is None:
+        return "No recognised revenue data for this month yet."
+    if prev_month_rev is None:
+        return "First month tracked – no prior month to compare."
+
+    delta = float(this_month_rev) - float(prev_month_rev)
+
+    if abs(delta) < 1e-6:
+        return "Recognised revenue is roughly flat vs last month."
+
+    direction = "higher" if delta > 0 else "lower"
+
+    # Optional % (only if last month not zero)
+    pct_txt = ""
+    if abs(float(prev_month_rev)) > 1e-6:
+        pct = (delta / float(prev_month_rev)) * 100.0
+        pct_txt = f" ({pct:+.0f}%)"
+
+    return (
+        f"Recognised revenue is {direction} by {currency_symbol}{abs(delta):,.0f} "
+        f"vs last month{pct_txt}."
+    )
 
 
 ##------------This has to be replaced -----once the check done-----#
@@ -9440,10 +10085,15 @@ def get_active_as_of_month(client_id: str, focus_month: date) -> date:
 # - Performance tracker fully REMOVED (no perf_start_page / perf_step / perf_end_page)
 # - Logic/features unchanged — only wrappers removed
 
-def page_business_overview():
-    top_header("Business at a Glance")
 
+from component.business_overview_component import render_business_overview
+
+def page_business_overview():
+    # ----------------------------
+    # Guards / header (Streamlit-side)
+    # ----------------------------
     if not selected_client_id:
+        top_header("Business at a Glance")
         st.info("Select a client from the sidebar to view this page.")
         return
 
@@ -9454,24 +10104,15 @@ def page_business_overview():
     currency_code, currency_symbol = get_client_currency(selected_client_id)
 
     # ----------------------------
-    # Recognised revenue (this month & prev month)
+    # Recognised revenue (this & prev month)
     # ----------------------------
-    this_month_rev = get_recognised_revenue_for_month(
-        selected_client_id, selected_month_start
-    )
+    this_month_rev = get_recognised_revenue_for_month(selected_client_id, selected_month_start)
 
     prev_month_date = (
         pd.to_datetime(selected_month_start) - pd.DateOffset(months=1)
     ).to_period("M").to_timestamp().date()
 
-    prev_month_rev = get_recognised_revenue_for_month(
-        selected_client_id, prev_month_date
-    )
-
-    rev_delta_label = None
-    if prev_month_rev is not None:
-        diff = this_month_rev - prev_month_rev
-        rev_delta_label = f"{diff:+,.0f}"
+    prev_month_rev = get_recognised_revenue_for_month(selected_client_id, prev_month_date)
 
     # ----------------------------
     # KPIs (Supabase)
@@ -9493,26 +10134,20 @@ def page_business_overview():
         )
 
     # ---------- KPI deltas & explanations ----------
-    kpi_change = build_kpi_change_explanations(selected_client_id, selected_month_start)
+    kpi_change = build_kpi_change_explanations(selected_client_id, selected_month_start) or {}
     deltas = kpi_change.get("deltas", {}) or {}
     expl = kpi_change.get("explanations", {}) or {}
 
-    # Defaults for display
-    money_in_val = kpis.get("revenue", "—")
+    # Parse values
     money_out_val = kpis.get("burn", "—")
     cash_in_bank_val = kpis.get("cash_balance", "—")
     runway_months_val = kpis.get("runway_months", "—")
-
-    money_in_delta_label = f"{deltas['money_in']:+,.0f}" if deltas.get("money_in") is not None else None
-    money_out_delta_label = f"{deltas['money_out']:+,.0f}" if deltas.get("money_out") is not None else None
-    cash_delta_label = f"{deltas['cash']:+,.0f}" if deltas.get("cash") is not None else None
-    runway_delta_label = f"{deltas['runway']:+.1f} mo" if deltas.get("runway") is not None else None
 
     # Prefer engine runway if available
     if runway_from_engine is not None:
         runway_months_val = f"{runway_from_engine:.1f}"
 
-    # Define runway_num ONCE
+    # runway_num/cash_num/burn_num
     runway_num = None
     try:
         runway_num = float(runway_months_val) if runway_months_val not in (None, "—") else None
@@ -9525,285 +10160,12 @@ def page_business_overview():
     except Exception:
         cash_num = None
 
-    rev_num = _safe_float(money_in_val, 0.0) if money_in_val != "—" else 0.0
     burn_num = _safe_float(money_out_val, 0.0) if money_out_val != "—" else 0.0
 
-    # ---------- Top KPI row ----------
-    kpi_col1, kpi_col0, kpi_col2, kpi_col3, kpi_col4 = st.columns(5)
-
-    with kpi_col1:
-        st.metric(
-            f"💰 Expect Cash in ({currency_code})",
-            format_money(money_in_val, currency_symbol),
-            delta=money_in_delta_label,
-            help=(
-                f"Expected cash **in** this month from customers "
-                f"(unpaid AR with expected_date in this month, in {currency_code})."
-            ),
-        )
-        st.caption(expl.get("money_in", ""))
-
-    with kpi_col0:
-        st.metric(
-            f"📊 This month (recognised revenue, {currency_code})",
-            f"{currency_symbol}{this_month_rev:,.0f}",
-            delta=rev_delta_label,
-            help=(
-                "Recognised revenue for this month based on your Sales & Deals "
-                "revenue recognition schedule (SaaS / milestone / POC / etc)."
-            ),
-        )
-
-    with kpi_col2:
-        st.metric(
-            f"💸 Expect Cash out ({currency_code})",
-            format_money(money_out_val, currency_symbol),
-            delta=money_out_delta_label,
-            help=(
-                "Expected cash **out** this month: unpaid supplier bills due/expected this month "
-                "+ payroll cash for this month + opex for this month "
-                f"(in {currency_code})."
-            ),
-        )
-        st.caption(expl.get("money_out", ""))
-
-    with kpi_col3:
-        st.metric(
-            f"🏦 Cash in bank ({currency_code})",
-            format_money(cash_in_bank_val, currency_symbol),
-            delta=cash_delta_label,
-        )
-        st.caption(expl.get("cash", ""))
-
-    with kpi_col4:
-        st.metric(
-            "🧯 Runway (months)",
-            "—" if runway_months_val in (None, "—") else f"{float(runway_months_val):.1f}",
-            delta=runway_delta_label,
-        )
-        st.caption(expl.get("runway", ""))
-
-    # ---------- This month in 20 seconds ----------
-    st.subheader("📌 This month in 20 seconds")
-    summary_text = build_month_summary_insight(selected_client_id, selected_month_start)
-    st.info(summary_text)
-
-    # ---------- 6-month trends (revenue only) ----------
-    st.markdown("---")
-    st.subheader("📈 6-month trends – revenue")
-    rev_trend_df = _build_revenue_trend_df(selected_client_id, selected_month_start)
-
-    if rev_trend_df is None or rev_trend_df.empty:
-        st.caption("No recognised revenue data available for this 6-month window.")
-    else:
-        rev_chart = (
-            alt.Chart(rev_trend_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %y")),
-                y=alt.Y("Revenue:Q", title=f"Revenue ({currency_code})"),
-                tooltip=[
-                    alt.Tooltip("Month:N", title="Month"),
-                    alt.Tooltip("Revenue:Q", title="Revenue", format=",.0f"),
-                ],
-            )
-            .properties(height=220)
-        )
-        st.altair_chart(rev_chart.interactive(), width="stretch")
-
-    # ---------- Cashflow engine controls ----------
-    st.markdown("---")
-    st.subheader("🔁 Cashflow engine controls")
-
-    if st.button("Rebuild cashflow for next 12 months"):
-        ok = recompute_cashflow_from_ar_ap(
-            selected_client_id,
-            base_month=selected_month_start,
-            n_months=12,
-            opening_cash_hint=None,
-        )
-        if ok:
-            st.success("Cashflow updated from AR/AP, payroll, opex and investing/financing moves.")
-            st.rerun()
-        else:
-            st.error("Could not rebuild cashflow. Check AR/AP data and try again.")
-
-    # ---------------------------------------------
-    # Cashflow engine – 12-month breakdown (COMBO CHART)
-    # ---------------------------------------------
-    st.markdown("---")
-    st.subheader("🔍 Cashflow engine – 12-month breakdown (visual)")
-
-    if engine_df is None or engine_df.empty:
-        st.caption(
-            "No cashflow engine data yet for this Focus Month. "
-            "Hit **'Rebuild cashflow for next 12 months'** above to generate it."
-        )
-    else:
-        start = pd.to_datetime(selected_month_start).replace(day=1)
-        month_index = pd.date_range(start=start, periods=12, freq="MS")
-        grid = pd.DataFrame({"month_date": month_index})
-
-        df = engine_df.copy()
-        df["month_date"] = pd.to_datetime(df.get("month_date"), errors="coerce")
-        df = df[df["month_date"].notna()].copy()
-        df["month_date"] = df["month_date"].dt.to_period("M").dt.to_timestamp()
-
-        engine_window = df[df["month_date"].isin(month_index)].copy()
-        merged = grid.merge(engine_window, on="month_date", how="left")
-
-        for c in ["operating_cf", "investing_cf", "financing_cf", "closing_cash"]:
-            if c not in merged.columns:
-                merged[c] = 0.0
-            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
-
-        bar_df = merged[["month_date", "operating_cf", "investing_cf", "financing_cf"]].melt(
-            id_vars=["month_date"],
-            value_vars=["operating_cf", "investing_cf", "financing_cf"],
-            var_name="Component",
-            value_name="Amount",
-        )
-        bar_df["Component"] = bar_df["Component"].map({
-            "operating_cf": "Operating CF",
-            "investing_cf": "Investing CF",
-            "financing_cf": "Financing CF",
-        })
-
-        line_df = merged[["month_date", "closing_cash"]].copy()
-
-        x_enc = alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y"))
-
-        bars = alt.Chart(bar_df).mark_bar().encode(
-            x=x_enc,
-            y=alt.Y("Amount:Q", title=f"Cashflow movement ({currency_code})", axis=alt.Axis(format=",.0f")),
-            color=alt.Color("Component:N", title=""),
-            tooltip=[
-                alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                "Component:N",
-                alt.Tooltip("Amount:Q", title="Amount", format=",.0f"),
-            ],
-        )
-
-        bar_labels = alt.Chart(bar_df).mark_text(dy=-6).encode(
-            x=x_enc,
-            y="Amount:Q",
-            detail="Component:N",
-            text=alt.Text("Amount:Q", format=",.0f"),
-        )
-
-        line = alt.Chart(line_df).mark_line(point=True).encode(
-            x=x_enc,
-            y=alt.Y("closing_cash:Q", title=None, axis=alt.Axis(format=",.0f")),
-            tooltip=[
-                alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                alt.Tooltip("closing_cash:Q", title="Closing cash", format=",.0f"),
-            ],
-        )
-
-        line_labels = alt.Chart(line_df).mark_text(dy=-10).encode(
-            x=x_enc,
-            y="closing_cash:Q",
-            text=alt.Text("closing_cash:Q", format=",.0f"),
-        )
-
-        combo = alt.layer(bars, bar_labels, line, line_labels).resolve_scale(y="independent").properties(height=320)
-        st.altair_chart(combo.interactive(), width="stretch")
-        st.caption("Bars = Operating/Investing/Financing CF. Line = Closing cash. Hover for exact values.")
-
-    # ------------------------------------------------------------------
-    # Payroll vs bills vs Net operating cash (6-month view)
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("💼 Payroll vs bills vs Net operating cash")
-
-    window_months = pd.date_range(start=pd.to_datetime(selected_month_start), periods=6, freq="MS")
-
-    engine_df_all = fetch_cashflow_summary_for_client(selected_client_id)
-    df_ar, df_ap = fetch_ar_ap_for_client(selected_client_id)
-    payroll_by_month = compute_payroll_by_month(selected_client_id, window_months)
-
-    if engine_df_all is None or engine_df_all.empty:
-        st.caption("No cashflow engine data yet – rebuild cashflow first.")
-    else:
-        engine_df_all = engine_df_all.copy()
-        engine_df_all["month_date"] = pd.to_datetime(engine_df_all["month_date"], errors="coerce")
-
-        engine_window = engine_df_all[engine_df_all["month_date"].isin(window_months)][["month_date", "operating_cf"]].copy()
-
-        ap_monthly = pd.DataFrame({"month_date": window_months})
-        if df_ap is not None and not df_ap.empty:
-            df_ap = df_ap.copy()
-            df_ap["amount"] = pd.to_numeric(df_ap.get("amount"), errors="coerce").fillna(0.0)
-
-            pay_col = "expected_payment_date"
-            if pay_col not in df_ap.columns:
-                pay_col = "due_date" if "due_date" in df_ap.columns else None
-
-            if pay_col is not None:
-                df_ap[pay_col] = pd.to_datetime(df_ap[pay_col], errors="coerce")
-                df_ap["bucket_month"] = df_ap[pay_col].dt.to_period("M").dt.to_timestamp()
-
-                ap_agg = (
-                    df_ap.groupby("bucket_month", as_index=False)["amount"]
-                    .sum()
-                    .rename(columns={"bucket_month": "month_date", "amount": "ap_cash_out"})
-                )
-                ap_monthly = ap_monthly.merge(ap_agg, on="month_date", how="left")
-
-        ap_monthly["ap_cash_out"] = pd.to_numeric(ap_monthly.get("ap_cash_out"), errors="coerce").fillna(0.0)
-
-        payroll_series = (
-            pd.Series([float(payroll_by_month.get(m, 0.0)) for m in window_months], index=window_months, name="payroll_cash")
-            .reset_index()
-            .rename(columns={"index": "month_date"})
-        )
-
-        merged2 = pd.DataFrame({"month_date": window_months})
-        merged2 = merged2.merge(engine_window, on="month_date", how="left")
-        merged2 = merged2.merge(ap_monthly, on="month_date", how="left")
-        merged2 = merged2.merge(payroll_series, on="month_date", how="left")
-
-        merged2["operating_cf"] = pd.to_numeric(merged2.get("operating_cf"), errors="coerce").fillna(0.0)
-        merged2["ap_cash_out"] = pd.to_numeric(merged2.get("ap_cash_out"), errors="coerce").fillna(0.0)
-        merged2["payroll_cash"] = pd.to_numeric(merged2.get("payroll_cash"), errors="coerce").fillna(0.0)
-
-        merged2["month_date"] = pd.to_datetime(merged2["month_date"], errors="coerce")
-        merged2 = merged2.sort_values("month_date")
-
-        plot_df = merged2.melt(
-            id_vars="month_date",
-            value_vars=["operating_cf", "payroll_cash", "ap_cash_out"],
-            var_name="Series",
-            value_name="Amount",
-        )
-
-        series_labels = {
-            "operating_cf": "Net operating CF",
-            "payroll_cash": "Payroll (cash out)",
-            "ap_cash_out": "Bills / AP (cash out)",
-        }
-        plot_df["Series"] = plot_df["Series"].map(series_labels)
-
-        chart = alt.Chart(plot_df).mark_line().encode(
-            x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
-            y=alt.Y("Amount:Q", title=f"Amount (cash, {currency_code})"),
-            color=alt.Color("Series:N", title=""),
-            tooltip=[
-                alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                "Series:N",
-                alt.Tooltip("Amount:Q", title="Amount", format=",.0f"),
-            ],
-        )
-        st.altair_chart(chart.interactive(), width="stretch")
-
-    # ------------------------------------------------------------------
-    # Business Health + Primary Focus + Main Actions
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("🧭 Business summary")
-
+    # ------------------------------------------------------------
+    # BUSINESS HEALTH + PRIMARY FOCUS (your existing functions)
+    # ------------------------------------------------------------
     focus_ts = pd.to_datetime(selected_month_start).to_period("M").to_timestamp()
-
     cash_cliff_90d = bool(runway_num is not None and runway_num < 3.0)
 
     one_off_outflow_flag = False
@@ -9837,14 +10199,6 @@ def page_business_overview():
         forecast_runway_down_2m=False,
     )
 
-    st.markdown("### 1) Business health")
-    if health_state == "AT RISK":
-        st.error(f"🔴 **AT RISK** — {health_msg}")
-    elif health_state == "WATCH":
-        st.warning(f"🟠 **WATCH** — {health_msg}")
-    else:
-        st.success(f"🟢 **STABLE** — {health_msg}")
-
     primary_focus = _compute_primary_focus(
         health_state=health_state,
         runway_months=runway_num,
@@ -9858,35 +10212,187 @@ def page_business_overview():
         ar_collections_issue=False,
     )
 
-    st.markdown("### 2) Primary focus")
-    st.info(f"**{primary_focus}**")
+    # ------------------------------------------------------------
+    # This month in 20 sec — convert summary text into bullets
+    # ------------------------------------------------------------
+    summary_text = build_month_summary_insight(
+        client_id=selected_client_id,
+        focus_month=selected_month_start,
+        recognised_rev_this=float(this_month_rev or 0.0),
+        recognised_rev_prev=float(prev_month_rev) if prev_month_rev is not None else None,
+    )
 
-    st.markdown("### 3) Main actions (this month)")
+    # Convert paragraph to bullets (simple + robust)
+    bullets = []
+    if isinstance(summary_text, str) and summary_text.strip():
+        # split by newline OR sentence-ish
+        raw = [s.strip("•- \n\t") for s in summary_text.replace("\r", "\n").split("\n") if s.strip()]
+        if len(raw) <= 1:
+            # try sentence split
+            raw = [s.strip() for s in summary_text.split(".") if s.strip()]
+        bullets = [b for b in raw if len(b) > 3][:4]
 
+    if not bullets:
+        bullets = ["No summary available for this month yet."]
+
+    # ------------------------------------------------------------
+    # What to focus on next — needs action + why under it
+    # ------------------------------------------------------------
     actions_raw = _build_main_actions(primary_focus=primary_focus) or []
-
-    actions = []
+    focus_items = []
     for a in actions_raw:
         if not isinstance(a, dict):
             continue
-        kpi_trace = a.get("kpi_trace") or []
-        kpi_trace = [str(x).strip() for x in kpi_trace if str(x).strip()]
-        if not kpi_trace:
+        action_txt = str(a.get("action") or "").strip()
+        why_txt = str(a.get("why") or "").strip()
+        if not action_txt:
             continue
-        why = str(a.get("why") or "").strip()
-        if not why:
-            continue
-        actions.append({**a, "kpi_trace": kpi_trace})
+        focus_items.append({"action": action_txt, "why": why_txt})
 
-    actions = actions[:5]
+    focus_items = focus_items[:5]
+    if not focus_items:
+        focus_items = [{"action": "Maintain focus — no defensible CFO-grade action triggered from this page’s KPIs.", "why": ""}]
 
-    if not actions:
-        st.caption("No actions shown — no CFO-grade action could be defensibly traced to a KPI on this page.")
-    else:
-        for i, a in enumerate(actions, start=1):
-            st.markdown(f"**{i}. {a['action']}**")
-            st.caption(f"Why: {a['why']}")
-            st.caption("KPI trace: " + " • ".join(a["kpi_trace"]))
+    # ------------------------------------------------------------
+    # KPI cards for component (exact 4, in your spec order)
+    # ------------------------------------------------------------
+    kpi_cards = [
+        {
+            "id": "cash",
+            "label": f"Cash Balance ({currency_code})",
+            "value": format_money(cash_in_bank_val, currency_symbol),
+            "note": (expl.get("cash") or "").strip() or None,
+        },
+        {
+            "id": "burn",
+            "label": f"Monthly Burn ({currency_code})",
+            "value": format_money(money_out_val, currency_symbol),
+            "note": (expl.get("money_out") or "").strip() or None,
+        },
+        {
+            "id": "runway",
+            "label": "Cash Runway",
+            "value": "—" if runway_num is None else f"{runway_num:.1f} mo",
+            "note": (expl.get("runway") or "").strip() or None,
+        },
+        {
+            "id": "revenue",
+            "label": "Revenue",
+            "value": f"{currency_symbol}{float(this_month_rev or 0.0):,.0f}",
+            "note": _revenue_delta_caption(this_month_rev, prev_month_rev, currency_symbol),
+        },
+    ]
+
+    # ------------------------------------------------------------
+    # Build component data + render HTML component
+    # ------------------------------------------------------------
+    month_label = pd.to_datetime(selected_month_start).strftime("%B")
+
+    business_overview_data = {
+        "header": {
+            "title": "Business at a Glance",
+            "subtitle": f"Updated for {month_label} · "
+                        + ("All systems stable" if str(health_state).upper() == "STABLE"
+                           else "Watch items present" if str(health_state).upper() == "WATCH"
+                           else "Needs immediate attention"),
+        },
+        "exec_summary": {
+            "business_health": {
+                "label": "Business Health",
+                "state": str(health_state).upper(),
+                "message": str(health_msg),
+                "supporting_line": None,
+            },
+            "primary_focus": {
+                "label": "Primary Focus",
+                "headline": str(primary_focus) or "Maintain discipline — no action required",
+            },
+        },
+        "kpis": kpi_cards,
+        "month_summary": {
+            "title": "This month in 20 sec",
+            "bullets": bullets,
+        },
+        "focus_next": {
+            "title": "What to Focus on Next",
+            "items": focus_items,  # ✅ action + why
+        },
+    }
+        # --- Header row: title (left) + actions (right) ---
+    h_left, h_right = st.columns([0.72, 0.28], vertical_alignment="center")
+
+    with h_left:
+        # Your HTML will render the title visually, so keep this minimal or remove
+        st.markdown("")  # optional spacer
+
+    with h_right:
+        # Right aligned actions
+        a1, a2 = st.columns(2, gap="small")
+        with a1:
+            if st.button("Refresh", type="secondary", use_container_width=True):
+                st.rerun()
+
+        with a2:
+            if st.button("Rebuild Cashflow", type="primary", use_container_width=True):
+                ok = recompute_cashflow_from_ar_ap(
+                    selected_client_id,
+                    base_month=selected_month_start,
+                    n_months=12,
+                    opening_cash_hint=None,
+                )
+                if ok:
+                    st.success("Cashflow updated from AR/AP, payroll, opex and financing.")
+                    st.rerun()
+                else:
+                    st.error("Could not rebuild cashflow. Check AR/AP data and try again.")
+
+    st.caption("Quiet action — use only when inputs changed (AR/AP, payroll, opex, financing).")
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    # Render the HTML section (no charts inside)
+    render_business_overview(business_overview_data, height=1100)
+
+    # ------------------------------------------------------------
+    # REAL CHARTS BELOW (Streamlit renders these)
+    # ------------------------------------------------------------
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3, gap="large")
+
+    with c1:
+        with st.container(border=True):
+            st.markdown("**12-month cashflow outlook**")
+            if engine_df is None or engine_df.empty:
+                st.caption("No cashflow engine data yet for this focus month.")
+            else:
+                fig = fig_cashflow_outlook_12m(engine_df, selected_month_start, currency_symbol)
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG_MINIMAL)
+
+    with c2:
+        with st.container(border=True):
+            st.markdown("**Payroll vs other cost**")
+            fig = fig_payroll_vs_other_cost(
+                selected_client_id,
+                selected_month_start,
+                currency_symbol,
+                fetch_cashflow_summary_for_client=fetch_cashflow_summary_for_client,
+                fetch_ar_ap_for_client=fetch_ar_ap_for_client,
+                compute_payroll_by_month=compute_payroll_by_month,
+            )
+            if fig.data:
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG_MINIMAL)
+            else:
+                st.caption("No cashflow engine history yet. Rebuild the engine first.")
+
+    with c3:
+        with st.container(border=True):
+            st.markdown("**Revenue trend (6 months)**")
+            rev_trend_df = _build_revenue_trend_df(selected_client_id, selected_month_start)
+            if rev_trend_df is None or rev_trend_df.empty:
+                st.caption("No recognised revenue data available for this 6-month window.")
+            else:
+                fig = fig_revenue_trend(rev_trend_df, currency_symbol)
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG_MINIMAL)
 
 
 
@@ -10019,6 +10525,7 @@ def apply_monthly_scenario_to_weekly(
     w["closing_cash_scenario"] = pd.to_numeric(w["closing_cash_scenario"], errors="coerce").fillna(0.0)
 
     return w
+
 
 def run_multi_lever_scenario(
     base_df: pd.DataFrame,
@@ -10368,15 +10875,6 @@ def run_founder_scenario(
 
 
 def render_scenarios_what_if(*, selected_client_id, selected_month_start):
-    st.markdown("---")
-    st.subheader("🧪 Scenarios & What-if")
-
-    st.markdown(
-        "Answer simple questions like **“Can I hire now?”**, "
-        "**“What if revenue grows 20%?”**, or **“When do I need to raise?”** "
-        "without touching your actual data."
-    )
-
     # ✅ default return value (so caller always gets a list)
     scenario_summaries: list[dict] = []
 
@@ -10410,16 +10908,12 @@ def render_scenarios_what_if(*, selected_client_id, selected_month_start):
     month_label_map = {p.strftime("%b %Y"): p.to_timestamp() for p in month_opts}
     month_labels = list(month_label_map.keys())
 
-    st.markdown("---")
-    st.subheader("🎛 Choose your scenario")
-
     col_output, col_controls = st.columns([2, 1])
 
     # ----------------------------
     # RIGHT: CONTROLS + SAVE
     # ----------------------------
     with col_controls:
-        st.markdown("#### Scenario type")
 
         preset = st.selectbox(
             "Quick scenario preset",
@@ -10549,8 +11043,7 @@ def render_scenarios_what_if(*, selected_client_id, selected_month_start):
             final_controls["equity_raise"] = 250_000.0
             final_controls["recurring_funding"] = 10_000.0
 
-        st.markdown("—")
-        st.markdown("#### 💾 Save this scenario")
+        st.markdown("-------------------")
 
         scen_name = st.text_input(
             "Scenario name",
@@ -10596,7 +11089,6 @@ def render_scenarios_what_if(*, selected_client_id, selected_month_start):
         chosen_id = None
 
         if saved_scenarios:
-            st.markdown("#### 📂 Run a saved scenario")
 
             labels = []
             id_map = {}
@@ -10760,7 +11252,6 @@ def render_scenarios_what_if(*, selected_client_id, selected_month_start):
 
         st.caption(f"Scenario run: **{scenario_label}**")
 
-        st.subheader("📌 Base case vs Scenario (aligned to Cash & Bills)")
 
         summary_tbl = build_base_vs_scenario_summary_table(
             currency_symbol=currency_symbol,
@@ -10771,7 +11262,7 @@ def render_scenarios_what_if(*, selected_client_id, selected_month_start):
         )
         st.dataframe(summary_tbl, width="stretch")
 
-        with st.expander("View scenario 14-week cash table", expanded=False):
+        with st.expander("", expanded=False):
             if scen_week_df is None or scen_week_df.empty:
                 st.caption("Scenario weekly table not available.")
             else:
@@ -11012,12 +11503,12 @@ def build_base_vs_scenario_summary_table(
     ) if scen_week_df is not None and not scen_week_df.empty else None
 
     rows = [
-        ("Runway (to buffer breach)", f"{_months(base_runway_m)} ({_weeks(base_runway_w)})", f"{_months(scen_runway_m)} ({_weeks(scen_runway_w)})"),
-        ("Cash cliff week (buffer breach)", base_cliff, scen_cliff),
-        ("Lowest cash (next 14 weeks)", _money(base_lowest), _money(scen_lowest)),
-        ("Net burn / month (3-mo avg from weekly)", _money(base_burn), _money(scen_burn)),
+        ("Runway", f"{_months(base_runway_m)} ({_weeks(base_runway_w)})", f"{_months(scen_runway_m)} ({_weeks(scen_runway_w)})"),
+        ("Cash cliff week", base_cliff, scen_cliff),
+        ("Lowest cash", _money(base_lowest), _money(scen_lowest)),
+        ("Net Cash Change(avg 3 month)", _money(base_burn), _money(scen_burn)),
     ]
-    return pd.DataFrame(rows, columns=["Metric", "Base case", "Scenario"])
+    return pd.DataFrame(rows, columns=["Metric", "Current", "Scenario"])
 
 
 def compute_effective_burn_from_weekly(
@@ -11592,6 +12083,45 @@ def compute_team_risk_panels(
             return None
         return (curr - prev) / prev * 100.0
 
+    def _safe_float(x, default=0.0) -> float:
+        try:
+            if x is None:
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _role_loaded_monthly_costs_from_positions(df: pd.DataFrame) -> pd.Series | None:
+        """
+        CFO-grade role monthly cost using payroll_positions schema:
+          base_salary_annual at 1.0 FTE
+          super_rate_pct, payroll_tax_pct
+          fte scaling
+
+        loaded_annual = base * (1 + super% + payroll_tax%)
+        loaded_monthly = loaded_annual/12 * fte
+        """
+        if df is None or df.empty:
+            return None
+
+        tmp = df.copy()
+
+        for col in ["base_salary_annual", "super_rate_pct", "payroll_tax_pct", "fte"]:
+            if col not in tmp.columns:
+                return None
+
+        base = pd.to_numeric(tmp["base_salary_annual"], errors="coerce").fillna(0.0)
+        super_pct = pd.to_numeric(tmp["super_rate_pct"], errors="coerce").fillna(0.0) / 100.0
+        ptax_pct = pd.to_numeric(tmp["payroll_tax_pct"], errors="coerce").fillna(0.0) / 100.0
+        fte = pd.to_numeric(tmp["fte"], errors="coerce").fillna(1.0)
+
+        loaded_annual = base * (1.0 + super_pct + ptax_pct)
+        loaded_monthly = (loaded_annual / 12.0) * fte
+
+        # Floor negatives just in case of bad inputs
+        loaded_monthly = loaded_monthly.clip(lower=0.0)
+        return loaded_monthly
+
     # ---------- Prior month metrics ----------
     prev_month = (month_ts - pd.DateOffset(months=1)).to_period("M").to_timestamp()
     prev2_month = (month_ts - pd.DateOffset(months=2)).to_period("M").to_timestamp()
@@ -11661,7 +12191,7 @@ def compute_team_risk_panels(
     except Exception:
         pass
 
-        # ---------- Risk triggers ----------
+    # ---------- Risk triggers ----------
     risks = []
 
     # Risk 1: Hiring Without Revenue Cover
@@ -11731,6 +12261,83 @@ def compute_team_risk_panels(
             "Contractor cost may be hiding outside headcount."
         ))
 
+    # -----------------------------
+    # ✅ NEW Risk 5: Payroll Timing Mismatch (Cash vs Revenue)
+    # -----------------------------
+    next_total_payroll_cash = (
+        _safe_float(next_net_pay, 0.0)
+        + _safe_float(next_super_payable, 0.0)
+        + _safe_float(next_payg_payable, 0.0)
+    )
+
+    risk5 = False
+    coverage_ratio = None
+
+    if next_total_payroll_cash > 0:
+        if month_revenue <= 0:
+            risk5 = True
+        else:
+            coverage_ratio = next_total_payroll_cash / max(month_revenue, 1.0)
+            if coverage_ratio >= 0.85:
+                risk5 = True
+
+    if risk5:
+        ratio_txt = f"{coverage_ratio*100:.0f}%" if coverage_ratio is not None else "—"
+        risks.append((
+            "🔴 Risk 5: Payroll Timing Mismatch (Cash vs Revenue)",
+            f"Next month payroll cash obligations are {next_total_payroll_cash:,.0f} "
+            f"vs this month revenue {month_revenue:,.0f} (coverage={ratio_txt}). "
+            "Payroll timing can force emergency decisions even if the P&L looks stable."
+        ))
+
+    # -----------------------------
+    # ✅ NEW Risk 6: Irreversible Cost Lock-In
+    # -----------------------------
+    risk6 = False
+    if (hc_delta is not None) and (hc_delta > 0):
+        if (revenue_mom is None) or (revenue_mom <= 1.0):
+            if (runway_impact_months is not None) and (runway_impact_months >= 0.75):
+                risk6 = True
+
+    if risk6:
+        risks.append((
+            "🔴 Risk 6: Irreversible Cost Lock-In",
+            f"Headcount increased (ΔFTE={hc_delta:+.1f}) while revenue is flat/down "
+            f"(MoM={revenue_mom if revenue_mom is not None else '—'}%). "
+            f"Each hire reduces runway by ~{runway_impact_months:.2f} months, "
+            "compressing your reaction window."
+        ))
+
+    # -----------------------------
+    # ✅ NEW Risk 7: Single-Point Payroll Dependency (Top roles dominate payroll)
+    # Uses df_positions schema (base_salary_annual, super_rate_pct, payroll_tax_pct, fte)
+    # -----------------------------
+    risk7 = False
+    top1_share = None
+    top2_share = None
+
+    role_monthly_costs = _role_loaded_monthly_costs_from_positions(df_positions)
+    if role_monthly_costs is not None:
+        total_role_payroll = float(role_monthly_costs.sum())
+        if total_role_payroll > 0:
+            sorted_costs = role_monthly_costs.sort_values(ascending=False)
+            top1 = float(sorted_costs.iloc[0]) if len(sorted_costs) >= 1 else 0.0
+            top2 = float(sorted_costs.iloc[1]) if len(sorted_costs) >= 2 else 0.0
+
+            top1_share = top1 / total_role_payroll
+            top2_share = (top1 + top2) / total_role_payroll
+
+            # CFO thresholds
+            if (top1_share >= 0.20) or (top2_share >= 0.30):
+                risk7 = True
+
+    if risk7:
+        risks.append((
+            "🔴 Risk 7: Single-Point Payroll Dependency",
+            f"Payroll is concentrated: top role ≈ {top1_share*100:.0f}% "
+            f"and top 2 roles ≈ {top2_share*100:.0f}% of payroll (fully-loaded). "
+            "This increases key-person and flexibility risk."
+        ))
 
     # ---------- Obligations text ----------
     obligations = []
@@ -11749,62 +12356,113 @@ def compute_team_risk_panels(
     else:
         obligations.append("PAYG payable next month (cash): —")
 
-    # ---------- What this means (max 5 bullets) ----------
+    # ---------- What this means (structured, CFO-readable) ----------
     what = []
 
-    # a) Current payroll sustainability
+    # 1) Current payroll sustainability
     if payroll_pct_of_burn is not None:
-        what.append(f"Payroll sustainability: **Payroll % of burn = {payroll_pct_of_burn:.0f}%** → tighter margin for error if revenue dips.")
+        what.append(
+            f"Payroll sustainability: Payroll represents {payroll_pct_of_burn:.0f}% of total burn. "
+            "This leaves limited flexibility if revenue softens or collections slip."
+        )
     else:
-        what.append("Payroll sustainability: Payroll % of burn is **not available** → burn source missing, risk may be understated.")
+        what.append(
+            "Payroll sustainability: Payroll share of burn is unavailable. "
+            "Without this, the true cost pressure may be understated."
+        )
 
-    # b) Direction of payroll vs revenue
+    # 2) Direction of payroll vs revenue
     if payroll_mom is not None and revenue_mom is not None:
-        what.append(f"Direction: **Payroll MoM {payroll_mom:+.1f}% vs Revenue MoM {revenue_mom:+.1f}%** → divergence increases cash pressure.")
+        direction = "outpacing" if payroll_mom > revenue_mom else "tracking below"
+        what.append(
+            f"Payroll vs revenue direction: Payroll is {direction} revenue "
+            f"(Payroll MoM {payroll_mom:+.1f}% vs Revenue MoM {revenue_mom:+.1f}%). "
+            "This trend determines whether growth is compounding or eroding cash."
+        )
     else:
-        what.append("Direction: Payroll vs revenue trend is **partially missing** → ensure revenue KPI exists for both months.")
+        what.append(
+            "Payroll vs revenue direction: One or more trend inputs are missing. "
+            "This limits confidence in cost-to-growth alignment."
+        )
 
-    # c) Runway sensitivity
+    # 3) Runway sensitivity
     if runway_impact_months is not None:
-        what.append(f"Runway sensitivity: **1 hire reduces runway by ~{runway_impact_months:.2f} months** → hiring mistakes compress reaction time.")
+        what.append(
+            f"Runway sensitivity: Each additional hire reduces runway by approximately "
+            f"{runway_impact_months:.2f} months. Hiring decisions directly compress the reaction window."
+        )
     else:
-        what.append("Runway sensitivity: **not available** (needs valid effective burn + next-hire assumptions).")
+        what.append(
+            "Runway sensitivity: Impact of incremental hires on runway is unavailable. "
+            "Runway may be more fragile than it appears."
+        )
 
-    # d) Hiring risk
+    # 4) Hiring risk
     if risk1:
-        what.append(f"Hiring risk: **Headcount up (ΔFTE {hc_delta:+.1f})** while **revenue not growing** → risk of hiring into a flat top-line.")
+        what.append(
+            f"Hiring risk: Headcount increased (ΔFTE {hc_delta:+.1f}) while revenue is flat or declining. "
+            "This increases the risk of hiring into a non-growing top line."
+        )
     else:
-        # keep concise
-        what.append("Hiring risk: No headcount-vs-revenue mismatch triggered this month.")
+        what.append(
+            "**Hiring risk:** No headcount-versus-revenue mismatch identified this month."
+        )
 
-    # e) Immediate implication (using obligations)
-    if next_net_pay is not None:
-        what.append(f"Immediate implication: next month cash obligations include **net pay {next_net_pay:,.0f}** + statutory remittances → protect liquidity window now.")
+    # 5) Immediate implication (using obligations)
+    if next_total_payroll_cash > 0:
+        what.append(
+            f"Immediate cash implication: Next month payroll obligations total approximately "
+            f"{next_total_payroll_cash:,.0f} (net pay, Super, PAYG). "
+            "This cash requirement must be covered before discretionary spending."
+        )
     else:
-        what.append("Immediate implication: next month payroll obligations unavailable → check payroll engine inputs and role dates.")
+        what.append(
+            "Immediate cash implication: Next month payroll obligations are unavailable. "
+            "Statutory cash exposure may be understated."
+        )
 
     what_this_means = what[:5]
 
-    # ---------- Action plan (max 2 bullets; must map to risks) ----------
+        # ---------- Action plan – next 7 days (max 5, priority-ordered) ----------
     actions = []
 
-    # Priority 1: Payroll dominating burn
-    if risk3:
-        actions.append("Risk 3 → **Freeze new hires** and **review contractor spend** to pull Payroll % of Burn below 65%.")
+    # 1) Stop irreversible cost commitments
+    if risk6 or risk1 or risk2 or risk3:
+        actions.append(
+            "Freeze irreversible people costs: Pause new hires and long-term contractor commitments. "
+            "Approve exceptions only where revenue impact is explicit and near-term."
+        )
 
-    # Priority 2: Hiring without revenue cover OR payroll>revenue growth
+    # 2) Protect liquidity (payroll-first planning)
+    if risk5 or next_total_payroll_cash > 0:
+        actions.append(
+            "Secure payroll liquidity: Build a cash plan to fully fund next month payroll "
+            "(net pay, Super, PAYG) before discretionary spend. "
+            "Accelerate invoicing and collections where possible."
+        )
+
+    # 3) Realign hiring to revenue reality
     if risk1 or risk2:
-        actions.append("Risk 1/2 → **Pause hiring pipeline** and **revalidate hiring assumptions vs revenue reality** (update the next-hire assumptions + hiring plan).")
+        actions.append(
+            "Revalidate hiring plan: Re-baseline hiring assumptions against actual revenue trends. "
+            "Delay roles that do not directly support revenue or critical delivery."
+        )
 
-    # Priority 3: Runway sensitivity high (if still space)
-    if len(actions) < 2 and runway_impact_months is not None and runway_impact_months >= 0.50:
-        actions.append("Runway sensitivity → **Model a downside hiring scenario** and **extend reaction window via cost control** (stop discretionary roles).")
+    # 4) Reduce hidden or concentrated cost risk
+    if risk4 or risk7:
+        actions.append(
+            "Reduce cost concentration: Review high-cost roles and contractor arrangements. "
+            "Identify opportunities to rebalance workload, renegotiate rates, or add coverage."
+        )
 
-    # If nothing triggered, still give 1 decisive action
-    if not actions:
-        actions.append("No critical payroll risks triggered → **confirm next-month statutory payments** (Super/PAYG) are funded and scheduled.")
+    # 5) Compliance and hygiene (always last)
+    actions.append(
+        "Confirm statutory payments: Verify Super and PAYG amounts, dates, and funding. "
+        "Ensure payroll inputs (FTE, start dates, rates) are accurate for the coming month."
+    )
 
-    actions_7d = actions[:2]
+    actions_7d = actions[:5]
+
 
     return {
         "risks": risks,
@@ -11813,18 +12471,29 @@ def compute_team_risk_panels(
         "actions_7d": actions_7d,
     }
 
+
+
 def page_team_spending():
-    top_header("Team & Spending")
+
 
     if not selected_client_id:
         st.info("Select a business from the sidebar to view this page.")
         return
 
-    currency_code, currency_symbol = get_client_currency(selected_client_id)
 
-    # ------------------------------------------------------------------
+
+    # ✅ Inject Nordic CSS once per render (your existing helper)
+    # NOTE: this is still fine to keep, but Card D will now be HTML-based
+    from ui.streamlit_cards import inject_nordic_card_css
+    inject_nordic_card_css()
+
+    currency_code, currency_symbol = get_client_currency(selected_client_id)
+    month_name = pd.to_datetime(selected_month_start).strftime("%B %Y")
+    month_ts = pd.to_datetime(selected_month_start).to_period("M").to_timestamp()
+
+    # ----------------------------
     # Load data
-    # ------------------------------------------------------------------
+    # ----------------------------
     with st.spinner("Loading team and spending data..."):
         df_positions = fetch_payroll_positions_for_client(selected_client_id)
         df_ar_ap = fetch_ar_ap_for_client(selected_client_id)
@@ -11835,59 +12504,41 @@ def page_team_spending():
     else:
         df_ar, df_ap = None, None
 
-    # ------------------------------------------------------------------
-    # Month setup
-    # ------------------------------------------------------------------
-    month_ts = pd.to_datetime(selected_month_start).to_period("M").to_timestamp()
-
-    # ------------------------------------------------------------------
-    # Payroll cash engine (source of truth)
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Payroll engine + components
+    # ----------------------------
     month_index_1 = pd.date_range(start=month_ts, periods=1, freq="MS")
     payroll_by_month = compute_payroll_by_month(selected_client_id, month_index_1)
     month_payroll_cash_engine = float(payroll_by_month.get(month_ts, 0.0))
 
-    # ------------------------------------------------------------------
-    # Payroll components + economic payroll cost
-    # ------------------------------------------------------------------
     comp_df = compute_payroll_cash_components_by_month(selected_client_id, month_index_1)
     comp = comp_df.iloc[0].to_dict() if comp_df is not None and not comp_df.empty else {}
 
     headcount_fte_eom = float(comp.get("headcount_fte_eom", 0.0) or 0.0)
 
-    # Cash KPIs
     salaries_paid_cash = float(comp.get("net_salary_cash", 0.0) or 0.0)
     super_paid_cash = float(comp.get("super_cash", 0.0) or 0.0)
     tax_paid_cash = float(comp.get("payg_cash", 0.0) or 0.0)
     total_payroll_cash_components = float(comp.get("total_payroll_cash", 0.0) or 0.0)
 
-    # Economic payroll cost (work month)
     monthly_payroll_cost = float(comp.get("monthly_payroll_cost", 0.0) or 0.0)
     avg_cost_per_fte = (monthly_payroll_cost / headcount_fte_eom) if headcount_fte_eom else 0.0
 
-    # Employer on-costs
-    workers_comp_generated = float(comp.get("workers_comp_generated", 0.0) or 0.0)
-    payroll_tax_generated = float(comp.get("payroll_tax_generated", 0.0) or 0.0)
-    annualised_wages_eom = float(comp.get("annualised_wages_eom", 0.0) or 0.0)
-    payroll_tax_applicable = bool(comp.get("payroll_tax_applicable", False))
-
-    # Tie-out
     tie_diff = float(total_payroll_cash_components - month_payroll_cash_engine)
 
-    # ------------------------------------------------------------------
-    # Headcount split for the month (focus month)
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Headcount split (focus month)
+    # ----------------------------
     hc = compute_headcount_month_split(df_positions, month_ts)
     hires_fte_in_month = float(hc.get("hires_fte_in_month", 0.0))
     exits_fte_in_month = float(hc.get("exits_fte_in_month", 0.0))
     net_change_in_month = float(hc.get("net_change_fte_in_month", 0.0))
 
-    # ------------------------------------------------------------------
-    # Headcount trend (past 6 months)  ✅ NEW CHART
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Headcount trend (past 6 months) ✅ used ONLY to generate Card D chart HTML
+    # ----------------------------
     hc_trend_df = None
     try:
-        # Past 6 months incl current focus month
         month_index_6_past = pd.date_range(end=month_ts, periods=6, freq="MS")
         comp_6_df = compute_payroll_cash_components_by_month(selected_client_id, month_index_6_past)
 
@@ -11897,21 +12548,27 @@ def page_team_spending():
             hc_trend_df["headcount_fte_eom"] = pd.to_numeric(
                 hc_trend_df["headcount_fte_eom"], errors="coerce"
             ).fillna(0.0)
-            hc_trend_df = hc_trend_df.sort_values("month_date")
+            hc_trend_df = hc_trend_df[hc_trend_df["month_date"].notna()].sort_values("month_date")
     except Exception:
         hc_trend_df = None
 
-    # ------------------------------------------------------------------
-    # Payroll target (client_monthly_targets)
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Payroll target + variance
+    # ----------------------------
     targets = get_monthly_targets_for_month(selected_client_id, month_ts)
     payroll_target = float(targets.get("payroll_target", 0.0) or 0.0)
     payroll_var = monthly_payroll_cost - payroll_target
     payroll_var_pct = (payroll_var / payroll_target * 100.0) if payroll_target else None
 
-    # ------------------------------------------------------------------
-    # Revenue (from KPIs)
-    # ------------------------------------------------------------------
+    payroll_vs_budget_txt = "—"
+    if payroll_target:
+        payroll_vs_budget_txt = f"{currency_symbol}{payroll_var:,.0f}"
+        if payroll_var_pct is not None:
+            payroll_vs_budget_txt += f" ({payroll_var_pct:+.0f}%)"
+
+    # ----------------------------
+    # Revenue
+    # ----------------------------
     month_revenue = 0.0
     if kpis:
         try:
@@ -11919,165 +12576,22 @@ def page_team_spending():
         except Exception:
             month_revenue = 0.0
 
-    # ------------------------------------------------------------------
-    # 3 new KPIs: burn + next hire + sensitivity (source of truth)
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Hire / burn KPIs
+    # ----------------------------
     hire_kpis = compute_next_hire_and_burn_kpis(
         selected_client_id,
         month_ts=month_ts,
         monthly_payroll_cost=monthly_payroll_cost,
     )
-    effective_burn_monthly = float(hire_kpis.get("effective_burn_monthly", 0.0) or 0.0)
     payroll_pct_of_burn = hire_kpis.get("payroll_pct_of_burn", None)
     payroll_burn_band = hire_kpis.get("payroll_burn_band", None)
     next_hire_monthly_cost = float(hire_kpis.get("next_hire_monthly_cost", 0.0) or 0.0)
-    next_hire_annual_cost = float(hire_kpis.get("next_hire_annual_cost", 0.0) or 0.0)
     runway_impact_months = hire_kpis.get("runway_impact_months", None)
 
-    # ------------------------------------------------------------------
-    # KPI HEADER (row-style sections)
-    # ------------------------------------------------------------------
-    st.subheader("👥 Team & Payroll KPIs (focus month)")
-
-    # -------------------- Headcount (ROW) --------------------
-    st.markdown("### 👥 Headcount")
-    c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.2])
-    with c1:
-        st.metric("Total HC (FTE)", f"{headcount_fte_eom:,.1f}")
-    with c2:
-        st.metric("New hires", f"+{hires_fte_in_month:,.1f}")
-    with c3:
-        st.metric("Exits", f"-{exits_fte_in_month:,.1f}")
-    with c4:
-        st.metric("Net change", f"{net_change_in_month:+.1f} FTE")
-
-    # ✅ NEW: headcount trend line (past 6 months) under headcount KPIs
-    if hc_trend_df is not None and not hc_trend_df.empty:
-        st.markdown("#### Headcount trend (past 6 months)")
-        try:
-            import altair as alt
-
-            hc_chart = (
-                alt.Chart(hc_trend_df)
-                .mark_line()
-                .encode(
-                    x=alt.X("month_date:T", title="Month", axis=alt.Axis(format="%b %Y")),
-                    y=alt.Y("headcount_fte_eom:Q", title="FTE (EOM)"),
-                    tooltip=[
-                        alt.Tooltip("month_date:T", title="Month", format="%b %Y"),
-                        alt.Tooltip("headcount_fte_eom:Q", title="Headcount (FTE)", format=",.1f"),
-                    ],
-                )
-            )
-            st.altair_chart(hc_chart, width="stretch")
-        except Exception:
-            # fallback to Streamlit line_chart if Altair fails
-            tmp = hc_trend_df.set_index("month_date")[["headcount_fte_eom"]]
-            st.line_chart(tmp)
-    else:
-        st.caption("Headcount trend unavailable (no payroll roles / insufficient history).")
-
-    st.markdown("---")
-
-    # -------------------- Payroll (work month) (ROW) --------------------
-    st.markdown("### 💰 Payroll (work month)")
-    p1, p2, p3, p4 = st.columns([1.3, 1.0, 1.1, 1.4])
-    with p1:
-        st.metric("Monthly payroll cost", f"{currency_symbol}{monthly_payroll_cost:,.0f}")
-    with p2:
-        st.metric("Avg cost per FTE", f"{currency_symbol}{avg_cost_per_fte:,.0f}")
-    with p3:
-        st.metric("Workers comp (gen.)", f"{currency_symbol}{workers_comp_generated:,.0f}")
-    with p4:
-        st.metric("Payroll tax (gen.)", f"{currency_symbol}{payroll_tax_generated:,.0f}")
-
-    st.caption(
-        f"Payroll tax applicable: **{'Yes' if payroll_tax_applicable else 'No'}** · "
-        f"Annualised wages (EOM): **{currency_symbol}{annualised_wages_eom:,.0f}**"
-    )
-
-    st.markdown("#### 🎯 Payroll vs target")
-
-    t1, t2, t3 = st.columns([1.2, 1.2, 1.6])
-
-    with t1:
-        # ✅ Payroll target KPI removed intentionally
-        st.caption("Payroll target is used only to calculate variance (not displayed as a KPI).")
-
-    with t2:
-        if payroll_target:
-            delta_txt = f"{currency_symbol}{payroll_var:,.0f}"
-            if payroll_var_pct is not None:
-                delta_txt += f" ({payroll_var_pct:+.0f}%)"
-            st.metric("Variance vs target", delta_txt)
-        else:
-            st.metric("Variance vs target", "—")
-
-    with t3:
-        if payroll_target:
-            st.caption("Variance is compared to **work-month payroll cost** (economic), not cash timing.")
-        else:
-            st.caption("No payroll target set for this month in client_monthly_targets — variance cannot be computed.")
-
-
-    st.markdown("#### 🧪 Hiring sensitivity & burn mix")
-    h2, h3, h4 = st.columns([ 1.6, 1.2, 1.2])
-    with h2:
-        st.metric(
-            "Fully loaded cost of next hire",
-            f"{currency_symbol}{next_hire_monthly_cost:,.0f} / month",
-            help="Incremental cost: salary + super + workers comp + payroll tax (if applicable) + benefits + onboarding (if recurring).",
-        )
-        st.caption(f"Annualised: **{currency_symbol}{next_hire_annual_cost:,.0f} / year**")
-    with h3:
-        st.metric(
-            "Runway sensitivity (1 hire)",
-            f"-{float(runway_impact_months):.2f} months" if runway_impact_months is not None else "—",
-        )
-    with h4:
-        st.metric(
-            "Payroll % of burn",
-            f"{float(payroll_pct_of_burn):.0f}%" if payroll_pct_of_burn is not None else "—",
-        )
-
-    if payroll_pct_of_burn is not None:
-        if payroll_burn_band == "High risk":
-            st.error("Payroll % of burn: **High risk** (>65%)")
-        elif payroll_burn_band == "Watch":
-            st.warning("Payroll % of burn: **Watch** (50–65%)")
-        else:
-            st.success("Payroll % of burn: **Healthy** (<50%)")
-
-    st.markdown("---")
-
-    # -------------------- Payroll (cash paid) (ROW) --------------------
-    st.markdown("### 💳 Payroll (cash paid)")
-    cc1, cc2, cc3, cc4 = st.columns([1.2, 1.2, 1.2, 1.4])
-    with cc1:
-        st.metric("Base salaries (net)", f"{currency_symbol}{salaries_paid_cash:,.0f}")
-    with cc2:
-        st.metric("Super paid (lagged)", f"{currency_symbol}{super_paid_cash:,.0f}")
-    with cc3:
-        st.metric("PAYG paid (lagged)", f"{currency_symbol}{tax_paid_cash:,.0f}")
-    with cc4:
-        st.metric(
-            "Total payroll cash",
-            f"{currency_symbol}{month_payroll_cash_engine:,.0f}",
-            delta=f"{currency_symbol}{tie_diff:,.0f}",
-        )
-
-    if abs(tie_diff) > 0.01:
-        st.warning(
-            f"Payroll engine tie-out mismatch: components={currency_symbol}{total_payroll_cash_components:,.2f} "
-            f"vs engine={currency_symbol}{month_payroll_cash_engine:,.2f} "
-            f"(diff={currency_symbol}{tie_diff:,.2f})."
-        )
-
-    st.markdown("---")
-
-    # ------------------------------------------------------------------
-    # ROW-STYLE PANELS (no 3 columns)
-    # ------------------------------------------------------------------
+    # ----------------------------
+    # Risk panels (Card E/F/G)
+    # ----------------------------
     panel = compute_team_risk_panels(
         selected_client_id,
         month_ts,
@@ -12089,476 +12603,679 @@ def page_team_spending():
         month_revenue=month_revenue,
     )
 
-    st.markdown("## 🧾 Payroll risk & compliance")
-
     risk_items = panel.get("risks", []) or []
 
-    if not risk_items:
-        st.success("✅ No payroll risk signals triggered for this month.")
-    else:
-        for title, msg in risk_items:
-            st.error(f"**{title}**\n\n{msg}")
+    def _risk_rank(title: str) -> int:
+        # board order
+        if "Risk 5" in title: return 1
+        if "Risk 6" in title: return 2
+        if "Risk 7" in title: return 3
+        if "Risk 3" in title: return 4
+        if "Risk 2" in title: return 5
+        if "Risk 1" in title: return 6
+        if "Risk 4" in title: return 7
+        return 99
+
+    sorted_risks = sorted(risk_items, key=lambda x: _risk_rank(x[0]))
+
+    # ✅ Risk 5/6/7 are normal callouts (same as Risk 1/2/3)
+    callouts = []
+    for title, msg in sorted_risks:
+        kind = "risk" if payroll_burn_band == "High risk" else "warning"
+        callouts.append({"title": title, "message": msg, "kind": kind})
+
+    for ob in (panel.get("obligations", []) or [])[:3]:
+        callouts.append({"title": "Upcoming obligation", "message": str(ob), "kind": "warning"})
+
+    # ----------------------------
+    # Card D: build Plotly HTML so it inherits Inter + component styling
+    # ----------------------------
+    plotly_html = ""
+    if hc_trend_df is not None and not hc_trend_df.empty:
+        from ui.plotly_charts import apply_nordic_plotly_theme, PLOTLY_CONFIG_MINIMAL
+
+        df = hc_trend_df.copy()
+        df["label"] = pd.to_datetime(df["month_date"], errors="coerce").dt.strftime("%b %y")
+        df["headcount_fte_eom"] = pd.to_numeric(df["headcount_fte_eom"], errors="coerce").fillna(0.0)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                name="FTE (EOM)",
+                x=df["label"],
+                y=df["headcount_fte_eom"],
+                mode="lines+markers",
+                hovertemplate="Headcount (FTE)<br>%{x}<br>%{y:,.1f}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            height=210,  # ✅ slightly shorter so it fits the card without clipping
+            margin=dict(l=20, r=10, t=10, b=20),  # ✅ let automargin do the real work
+            showlegend=False,
+        )
+
+        # ✅ Let Plotly expand margins automatically for labels/titles
+        fig.update_xaxes(
+            title=dict(
+                text="Month",
+                font=dict(size=11, color="#64748B"),
+                standoff=10,
+            ),
+            automargin=True,
+            tickfont=dict(size=10, color="#64748B"),
+            showgrid=False,
+            zeroline=False,
+            showline=True,
+            linecolor="#E5E7EB",
+            ticks="outside",
+            ticklen=5,
+            tickcolor="#CBD5E1",
+        )
 
 
-    st.markdown("## 📅 Upcoming payroll obligations (next month)")
-    for ob in panel.get("obligations", [])[:3]:
-        st.markdown(f"- {ob}")
-
-    if df_positions is not None and not df_positions.empty:
-        if ("worker_type" not in df_positions.columns) and ("employment_type" not in df_positions.columns):
-            st.caption("Silent hiring detection note: add `worker_type` or `employment_type` to classify contractors.")
-
-    st.markdown("---")
-
-    st.markdown("## 🧠 What this means")
-    for b in panel.get("what_this_means", [])[:5]:
-        st.markdown(f"- {b}")
-
-    st.markdown("---")
-
-    st.markdown("## ✅ Next 7 days action plan")
-    for a in panel.get("actions_7d", [])[:2]:
-        st.markdown(f"- {a}")
-
-    # Manage roles section intentionally removed.
+        fig.update_yaxes(
+            title=dict(
+                text="FTE (EOM)",
+                font=dict(size=11, color="#64748B"),
+                standoff=10,
+            ),
+            automargin=True,
+            tickfont=dict(size=10, color="#64748B"),
+            showgrid=True,
+            gridcolor="#EEF2F7",
+            zeroline=False,
+            showline=True,
+            linecolor="#E5E7EB",
+            ticks="outside",
+            ticklen=5,
+            tickcolor="#CBD5E1",
+            rangemode="tozero",
+        )
 
 
+        fig = apply_nordic_plotly_theme(fig)
 
+        # ✅ Convert to HTML so Card D can be rendered inside the SAME HTML component system
+        plotly_html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn",
+            full_html=False,
+            config=PLOTLY_CONFIG_MINIMAL,
+        )
+
+    # ----------------------------
+    # Build team_spending_data (A–D + E–G in HTML component)
+    # ----------------------------
+    team_spending_data = {
+        "header": {
+            "title": "Team & Payroll",
+            "subtitle": f"Updated for {month_name}",
+            "icon": "users",
+        },
+
+        # ---- A ----
+        "card_a_team_cost_health": {
+            "title": "Team Cost Health",
+            "subtitle": "Monthly payroll and headcount versus budget",
+            "icon": "heart-pulse",
+            "kpis": [
+                {"label": "Monthly payroll cost", "value": f"{currency_symbol}{monthly_payroll_cost:,.0f}"},
+                {"label": "Payroll vs budget", "value": payroll_vs_budget_txt},
+                {"label": "Headcount FTE (EOM)", "value": f"{headcount_fte_eom:,.1f}"},
+                {"label": "Average cost per employee", "value": f"{currency_symbol}{avg_cost_per_fte:,.0f}"},
+            ],
+        },
+
+        # ---- B ----
+        "card_b_payroll_snapshot": {
+            "title": "Current Payroll Snapshot",
+            "subtitle": "Fully loaded monthly people cost",
+            "icon": "wallet",
+            "footnote_helper": "Includes superannuation and PAYG timing differences where applicable.",
+            "kpis": [
+                {"label": "Base salaries (monthly)", "value": f"{currency_symbol}{salaries_paid_cash:,.0f}"},
+                {"label": "Super payable (this month)", "value": f"{currency_symbol}{super_paid_cash:,.0f}"},
+                {"label": "Tax payable (this month)", "value": f"{currency_symbol}{tax_paid_cash:,.0f}"},
+                {"label": "Total payroll cost", "value": f"{currency_symbol}{month_payroll_cash_engine:,.0f}"},
+            ],
+        },
+
+        # ---- C ----
+        "card_c_hiring_sensitivity": {
+            "title": "Hiring Sensitivity & Burn",
+            "subtitle": "Incremental cost and runway sensitivity",
+            "icon": "target",
+            "kpis": [
+                {"label": "Fully loaded cost next hire", "value": f"{currency_symbol}{next_hire_monthly_cost:,.0f} / month"},
+                {"label": "Runway sensitivity", "value": f"-{float(runway_impact_months):.2f} months" if runway_impact_months is not None else "—"},
+                {"label": "Payroll % of burn", "value": f"{float(payroll_pct_of_burn):.0f}%" if payroll_pct_of_burn is not None else "—"},
+            ],
+        },
+
+        # ---- D (NEW: HTML-based, consistent typography + KPI cells) ----
+        "card_d_headcount_cost_drivers": {
+            "title": "Headcount & cost drivers",
+            "subtitle": "What’s driving changes in team size and payroll",
+            "icon": "line-chart",
+            "kpis": [
+                {"label": "Headcount change (last 30 days)", "value": f"{net_change_in_month:+.1f} FTE"},
+                {"label": "New hires – 30 days", "value": f"{hires_fte_in_month:,.1f}"},
+                {"label": "Exits – 30 days", "value": f"{exits_fte_in_month:,.1f}"},
+            ],
+            "plotly_html": plotly_html,  # "" if no data
+            "empty_text": "Headcount trend unavailable (no payroll roles / insufficient history).",
+        },
+
+        # ---- E ----
+        "card_e_risk_compliance": {
+            "title": "Payroll risk & compliance",
+            "subtitle": "Potential risks and upcoming payroll obligations",
+            "icon": "shield-alert",
+            "callouts": callouts,
+        },
+
+        # ---- F ----
+        "card_f_what_this_means": {
+            "title": "What this means",
+            "icon": "sparkles",
+            "bullets": (panel.get("what_this_means", []) or [])[:5],
+        },
+
+        # ---- G ----
+        "card_g_action_plan": {
+            "title": "Action plan – next 7 days",
+            "icon": "circle-check-big",
+            "items": (panel.get("actions_7d", []) or [])[:5],
+        },
+    }
+
+    # ----------------------------
+    # Render: A–C
+    # ----------------------------
+    from component.team_spending_component import (
+        render_team_spending_top,
+        render_team_spending_bottom,
+        render_team_spending_card_d,  # ✅ you must add this new function in the component file
+    )
+
+    # ✅ Fix huge blank spaces: heights must match real content
+    render_team_spending_top(team_spending_data, height=820)
+
+    # ----------------------------
+    # Render: D (HTML component, consistent font + KPI cells)
+    # ----------------------------
+    render_team_spending_card_d(team_spending_data, height=520)
+
+    # ----------------------------
+    # Render: E–G
+    # ----------------------------
+    render_team_spending_bottom(team_spending_data, height=1400)
 
 
 # ============================================================
 # UPDATED: page_client_settings (adds Next Hire assumptions UI)
 # ============================================================
 
-
 def page_client_settings():
-    st.title("⚙️ Client Settings")
-
+    # -------------------------------
+    # Guards
+    # -------------------------------
     if not selected_client_id:
         st.info("Select a client from the sidebar to configure settings.")
         return
 
-    client_id_str = str(selected_client_id)
+    if not selected_month_start:
+        st.info("Pick a focus month in the navbar to configure month-based settings (opening cash).")
+        return
 
-    # Always load settings once at top
+    client_id_str = str(selected_client_id)
     settings = get_client_settings(selected_client_id) or {}
 
-    # ----------------- Currency -----------------
-    st.subheader("💱 Currency Settings")
-    render_currency_settings_section(selected_client_id)
-
-    st.markdown("---")
-
-# ----------------- NEW: Pipeline ageing thresholds -----------------
-    st.subheader("⏳ Pipeline ageing thresholds (locked defaults)")
-
-    st.caption(
-        "Used for the **Pipeline ageing warning** on Sales & Deals.\n\n"
-        "Hard defaults: Proposal 30d, Demo 45d, Contract 60d. "
-        "Idea is excluded. Closed_Won/Lost excluded."
+    # -------------------------------
+    # Nordic header + CSS
+    # -------------------------------
+    from component.client_settings_component import (
+        inject_client_settings_css,
+        render_client_settings_header,
     )
 
-    cA, cB, cC = st.columns(3)
-    with cA:
-        stage_max_days_proposal = st.number_input(
-            "Proposal max healthy days",
-            min_value=1,
-            max_value=365,
-            value=int(settings.get("stage_max_days_proposal", 30) or 30),
+    inject_client_settings_css()
+    render_client_settings_header(
+        {
+            "title": "Client Settings",
+            "subtitle": "Configure baseline financial rules and assumptions for this business",
+        },
+    )
+
+    # -------------------------------
+    # CARD A — Currency settings
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Currency settings</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Base currency used across dashboards and reports</div>", unsafe_allow_html=True)
+
+        # Keep your existing function (interactive)
+        render_currency_settings_section(selected_client_id)
+
+    # -------------------------------
+    # CARD B — Pipeline ageing thresholds
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Pipeline ageing thresholds</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='nordic-card-sub'>Used for Pipeline ageing warning on Sales & Deals. Defaults: Proposal 30d, Demo 45d, Contract 60d.</div>",
+            unsafe_allow_html=True,
         )
-    with cB:
-        stage_max_days_demo = st.number_input(
-            "Demo max healthy days",
-            min_value=1,
-            max_value=365,
-            value=int(settings.get("stage_max_days_demo", 45) or 45),
-        )
-    with cC:
-        stage_max_days_contract = st.number_input(
-            "Contract max healthy days",
-            min_value=1,
-            max_value=365,
-            value=int(settings.get("stage_max_days_contract", 60) or 60),
-        )
 
-    
+        cA, cB, cC = st.columns(3)
+        with cA:
+            stage_max_days_proposal = st.number_input(
+                "Proposal max healthy days",
+                min_value=1,
+                max_value=365,
+                value=int(settings.get("stage_max_days_proposal", 30) or 30),
+            )
+        with cB:
+            stage_max_days_demo = st.number_input(
+                "Demo max healthy days",
+                min_value=1,
+                max_value=365,
+                value=int(settings.get("stage_max_days_demo", 45) or 45),
+            )
+        with cC:
+            stage_max_days_contract = st.number_input(
+                "Contract max healthy days",
+                min_value=1,
+                max_value=365,
+                value=int(settings.get("stage_max_days_contract", 60) or 60),
+            )
 
-    if st.button("Save pipeline ageing thresholds", key="save_stage_ageing"):
-        payload = {
-            "client_id": client_id_str,
-            "stage_max_days_proposal": int(stage_max_days_proposal),
-            "stage_max_days_demo": int(stage_max_days_demo),
-            "stage_max_days_contract": int(stage_max_days_contract),
-        }
-
-        try:
-            supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
-
+        if st.button("Save pipeline ageing thresholds", key="save_stage_ageing"):
+            payload = {
+                "client_id": client_id_str,
+                "stage_max_days_proposal": int(stage_max_days_proposal),
+                "stage_max_days_demo": int(stage_max_days_demo),
+                "stage_max_days_contract": int(stage_max_days_contract),
+            }
             try:
-                st.cache_data.clear()
-            except Exception:
-                pass
+                supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success("Pipeline ageing thresholds saved.")
+                st.rerun()
 
-            st.success("Pipeline ageing thresholds saved.")
-            st.rerun()
+            except APIError as e:
+                msg = str(e)
+                if "PGRST204" in msg and "stage_max_days_contract" in msg:
+                    st.error(
+                        "Your Supabase schema is missing the pipeline ageing columns on `client_settings` "
+                        "(or PostgREST schema cache hasn’t reloaded)."
+                    )
+                    st.markdown("### Run this SQL in Supabase, then reload schema:")
+                    st.code(
+                        """alter table public.client_settings
+add column if not exists stage_max_days_proposal integer,
+add column if not exists stage_max_days_demo integer,
+add column if not exists stage_max_days_contract integer;""",
+                        language="sql",
+                    )
+                else:
+                    st.error("Could not save pipeline ageing thresholds.")
+                    st.code(msg, language="text")
 
-        except APIError as e:
-            msg = str(e)
-            if "PGRST204" in msg and "stage_max_days_contract" in msg:
+    # -------------------------------
+    # CARD C — Opening cash
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Opening cash</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Month-anchored opening cash used by the cashflow engine</div>", unsafe_allow_html=True)
+
+        # ✅ Per your instruction: display uses settings.opening_cash_start
+        opening_cash = st.number_input(
+            "Opening cash balance at start of focus month",
+            min_value=0.0,
+            value=float(settings.get("opening_cash_start", 0.0) or 0.0),
+            step=1000.0,
+            help="Saves a month-specific opening cash anchor and rebuilds the cashflow engine for the focus month.",
+        )
+
+        if st.button("Save opening cash", key="save_opening_cash"):
+            try:
+                focus_month = pd.to_datetime(selected_month_start).replace(day=1).date()
+
+                supabase.table("cash_opening_balance").upsert(
+                    {
+                        "client_id": client_id_str,
+                        "as_of_month": focus_month.isoformat(),
+                        "opening_cash": float(opening_cash),
+                        "source": "client_settings_manual",
+                        "notes": "Saved from Client Settings",
+                    },
+                    on_conflict="client_id,as_of_month",
+                ).execute()
+
+                # keep legacy mirror updated
+                supabase.table("client_settings").upsert(
+                    {"client_id": client_id_str, "opening_cash_start": float(opening_cash)},
+                    on_conflict="client_id",
+                ).execute()
+
+                try:
+                    recompute_cashflow_from_ar_ap(
+                        client_id=client_id_str,
+                        base_month=focus_month,
+                        opening_cash_hint=float(opening_cash),
+                    )
+                except Exception as e:
+                    st.error(f"Opening cash saved, but cashflow recompute failed: {e}")
+                    st.stop()
+
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+
+                st.success("Opening cash saved and cashflow recomputed for the focus month.")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Could not save opening cash: {e}")
+
+    # -------------------------------
+    # CARD D — Cash safety buffer
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Cash safety buffer</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Safety cushion used in Cash & Bills risk warnings</div>", unsafe_allow_html=True)
+
+        min_cash_buffer = st.number_input(
+            "Minimum cash buffer (safety cushion)",
+            min_value=0.0,
+            value=float(settings.get("min_cash_buffer", 0.0) or 0.0),
+            step=5000.0,
+        )
+
+        if st.button("Save cash safety buffer", key="save_min_cash_buffer"):
+            try:
+                supabase.table("client_settings").upsert(
+                    {"client_id": client_id_str, "min_cash_buffer": float(min_cash_buffer)},
+                    on_conflict="client_id",
+                ).execute()
+                st.success("Cash safety buffer saved.")
+                st.rerun()
+            except APIError as e:
                 st.error(
-                    "Your Supabase schema is missing the pipeline ageing columns on `client_settings` "
-                    "(or PostgREST schema cache hasn’t reloaded)."
+                    "Supabase schema is missing `min_cash_buffer` on `client_settings`.\n\n"
+                    "Add the column, then refresh PostgREST schema."
                 )
-                st.markdown("### Run this SQL in Supabase, then reload schema:")
-                st.code(
-                    """alter table public.client_settings
-    add column if not exists stage_max_days_proposal integer,
-    add column if not exists stage_max_days_demo integer,
-    add column if not exists stage_max_days_contract integer;""",
-                    language="sql",
-                )
-            else:
-                st.error("Could not save pipeline ageing thresholds.")
-                st.code(msg, language="text")
+                st.code(str(e), language="text")
 
-    st.markdown("---")
+    # -------------------------------
+    # CARD E — Payroll cash timing
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Payroll cash timing (Super & PAYG)</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Controls cash timing lags for payroll obligations</div>", unsafe_allow_html=True)
 
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            super_lag = st.number_input(
+                "Superannuation payment lag (months)",
+                min_value=0,
+                max_value=12,
+                value=int(settings.get("super_lag_months", 1) or 1),
+            )
+        with col_s2:
+            payroll_tax_lag = st.number_input(
+                "PAYG payment lag (months)",
+                min_value=0,
+                max_value=12,
+                value=int(settings.get("payroll_tax_lag_months", 1) or 1),
+            )
 
-    # ----------------- Opening cash -----------------
-    st.subheader("💰 Opening cash")
-
-    # NOTE: Option A = month-anchored opening cash lives in cash_opening_balance.
-    # We keep displaying settings.get("opening_cash_start") for backward compatibility,
-    # but on Save we write to cash_opening_balance for the CURRENT focus month and recompute.
-
-    opening_cash = st.number_input(
-        "Opening cash balance at start of focus month",
-        min_value=0.0,
-        value=float(settings.get("opening_cash_start", 0.0) or 0.0),
-        step=1000.0,
-        help="Saves a month-specific opening cash anchor and rebuilds the cashflow engine for the focus month.",
-    )
-
-    if st.button("Save opening cash", key="save_opening_cash"):
-        try:
-            # Focus month = selected_month_start month bucket
-            focus_month = pd.to_datetime(selected_month_start).replace(day=1).date()
-
-            # 1) Persist month-specific anchor into cash_opening_balance (engine source-of-truth)
-            supabase.table("cash_opening_balance").upsert(
+        if st.button("Save payroll cash timing", key="save_payroll_cash_timing"):
+            supabase.table("client_settings").upsert(
                 {
                     "client_id": client_id_str,
-                    "as_of_month": focus_month.isoformat(),
-                    "opening_cash": float(opening_cash),
-                    "source": "client_settings_manual",
-                    "notes": "Saved from Client Settings",
+                    "super_lag_months": int(super_lag),
+                    "payroll_tax_lag_months": int(payroll_tax_lag),
                 },
-                on_conflict="client_id,as_of_month",
-            ).execute()
-
-            # (Optional but harmless) Keep legacy field updated so UI shows latest even if caches/joins rely on it
-            supabase.table("client_settings").upsert(
-                {"client_id": client_id_str, "opening_cash_start": float(opening_cash)},
                 on_conflict="client_id",
             ).execute()
-
-            # 2) Recompute plan so downstream months update immediately
-            try:
-                recompute_cashflow_from_ar_ap(
-                    client_id=client_id_str,
-                    base_month=focus_month,
-                    opening_cash_hint=float(opening_cash),  # force anchor for this recompute
-                )
-            except Exception as e:
-                # Don’t fail the save if recompute fails; show the error clearly
-                st.error(f"Opening cash saved, but cashflow recompute failed: {e}")
-                st.stop()
-
-            # 3) Clear caches
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-
-            st.success("Opening cash saved and cashflow recomputed for the focus month.")
+            st.success("Payroll cash timing saved.")
             st.rerun()
 
-        except Exception as e:
-            st.error(f"Could not save opening cash: {e}")
+    # -------------------------------
+    # CARD F — Employer on-costs
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Employer on-costs (Payroll tax + Workers comp)</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>On-cost assumptions used in payroll modelling</div>", unsafe_allow_html=True)
 
-    st.markdown("---")
-
-
-    # ----------------- NEW: Cash safety buffer -----------------
-    st.subheader("🛟 Cash safety buffer")
-
-    min_cash_buffer = st.number_input(
-        "Minimum cash buffer (safety cushion)",
-        min_value=0.0,
-        value=float(settings.get("min_cash_buffer", 0.0) or 0.0),
-        step=5000.0,
-        help=(
-            "Used in Cash & Bills → 'Cash danger summary'.\n\n"
-            "If your lowest projected cash drops below this number, the dashboard warns you "
-            "even if cash never goes negative."
-        ),
-    )
-
-    if st.button("Save cash safety buffer", key="save_min_cash_buffer"):
-        try:
-            supabase.table("client_settings").upsert(
-                {"client_id": client_id_str, "min_cash_buffer": float(min_cash_buffer)},
-                on_conflict="client_id",
-            ).execute()
-            st.success("Cash safety buffer saved.")
-            st.rerun()
-        except APIError as e:
-            st.error(
-                "Supabase schema is missing `min_cash_buffer` on `client_settings`.\n\n"
-                "Run the SQL migration below to add the column, then refresh PostgREST schema."
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            payroll_tax_threshold_annual = st.number_input(
+                "Payroll tax threshold (annual wages)",
+                min_value=0.0,
+                step=50000.0,
+                value=float(settings.get("payroll_tax_threshold_annual", 1_300_000) or 1_300_000),
             )
-            st.code(str(e), language="text")
+        with col2:
+            payroll_tax_rate_pct = st.number_input(
+                "Payroll tax rate (%)",
+                min_value=0.0,
+                max_value=20.0,
+                step=0.1,
+                value=float(settings.get("payroll_tax_rate_pct", 0.0) or 0.0),
+            )
+        with col3:
+            workers_comp_rate_pct = st.number_input(
+                "Workers comp rate (%)",
+                min_value=0.0,
+                max_value=10.0,
+                step=0.1,
+                value=float(settings.get("workers_comp_rate_pct", 0.0) or 0.0),
+            )
 
-    st.markdown("---")
-
-    # ----------------- Payroll cash timing (super + PAYG cash lag) -----------------
-    st.subheader("🕒 Payroll cash timing (Super & PAYG)")
-
-    col_s1, col_s2 = st.columns(2)
-
-    with col_s1:
-        super_lag = st.number_input(
-            "Superannuation payment lag (months)",
-            min_value=0,
-            max_value=12,
-            value=int(settings.get("super_lag_months", 1) or 1),
-            help="How many months after salary month you actually pay super.",
-        )
-
-    with col_s2:
-        payroll_tax_lag = st.number_input(
-            "PAYG payment lag (months)",
-            min_value=0,
-            max_value=12,
-            value=int(settings.get("payroll_tax_lag_months", 1) or 1),
-            help="How many months after salary month you remit PAYG withholding.",
-        )
-
-    if st.button("Save payroll cash timing", key="save_payroll_cash_timing"):
-        supabase.table("client_settings").upsert(
-            {
-                "client_id": client_id_str,
-                "super_lag_months": int(super_lag),
-                "payroll_tax_lag_months": int(payroll_tax_lag),
-            },
-            on_conflict="client_id",
-        ).execute()
-        st.success("Payroll cash timing saved.")
-        st.rerun()
-
-    st.markdown("---")
-
-    # ----------------- Employer on-costs -----------------
-    st.subheader("🏛️ Employer on-costs (Payroll tax + Workers comp)")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        payroll_tax_threshold_annual = st.number_input(
-            "Payroll tax threshold (annual wages)",
-            min_value=0.0,
-            step=50000.0,
-            value=float(settings.get("payroll_tax_threshold_annual", 1_300_000) or 1_300_000),
-        )
-    with col2:
-        payroll_tax_rate_pct = st.number_input(
-            "Payroll tax rate (%)",
-            min_value=0.0,
-            max_value=20.0,
-            step=0.1,
-            value=float(settings.get("payroll_tax_rate_pct", 0.0) or 0.0),
-        )
-    with col3:
-        workers_comp_rate_pct = st.number_input(
-            "Workers comp rate (%)",
-            min_value=0.0,
-            max_value=10.0,
-            step=0.1,
-            value=float(settings.get("workers_comp_rate_pct", 0.0) or 0.0),
-        )
-
-    if st.button("Save employer on-costs", key="save_employer_on_costs"):
-        supabase.table("client_settings").upsert(
-            {
-                "client_id": client_id_str,
-                "payroll_tax_threshold_annual": float(payroll_tax_threshold_annual),
-                "payroll_tax_rate_pct": float(payroll_tax_rate_pct),
-                "workers_comp_rate_pct": float(workers_comp_rate_pct),
-            },
-            on_conflict="client_id",
-        ).execute()
-        st.success("Employer on-costs saved.")
-        st.rerun()
-
-    st.markdown("---")
-
-    # ----------------- Next hire assumptions -----------------
-    st.subheader("🧑‍💼 Next hire assumptions (used for hiring sensitivity KPIs)")
-
-    nh1, nh2, nh3 = st.columns(3)
-
-    with nh1:
-        next_hire_salary_annual = st.number_input(
-            "Next hire base salary (annual)",
-            min_value=0.0,
-            step=5000.0,
-            value=float(settings.get("next_hire_salary_annual", 0.0) or 0.0),
-        )
-        next_hire_fte = st.number_input(
-            "Next hire FTE",
-            min_value=0.1,
-            max_value=2.0,
-            step=0.1,
-            value=float(settings.get("next_hire_fte", 1.0) or 1.0),
-        )
-
-    with nh2:
-        next_hire_super_rate_pct = st.number_input(
-            "Next hire super rate (%)",
-            min_value=0.0,
-            max_value=30.0,
-            step=0.5,
-            value=float(settings.get("next_hire_super_rate_pct", 11.0) or 11.0),
-        )
-        next_hire_benefits_rate_pct = st.number_input(
-            "Next hire benefits rate (%)",
-            min_value=0.0,
-            max_value=30.0,
-            step=0.5,
-            value=float(settings.get("next_hire_benefits_rate_pct", 0.0) or 0.0),
-            help="Incremental benefits as % of base salary (allowances, tools, health, etc.).",
-        )
-
-    with nh3:
-        next_hire_onboarding_monthly = st.number_input(
-            "Onboarding cost (monthly, if recurring)",
-            min_value=0.0,
-            step=250.0,
-            value=float(settings.get("next_hire_onboarding_monthly", 0.0) or 0.0),
-            help="If it’s a one-off cost, model it elsewhere; this field is for recurring onboarding/enablement cost.",
-        )
-
-    st.caption(
-        "If you see an error like **PGRST204 could not find column in schema cache**, "
-        "it means the column does not exist yet OR PostgREST needs a schema reload."
-    )
-
-    if st.button("Save next hire assumptions", key="save_next_hire"):
-        payload = {
-            "client_id": client_id_str,
-            "next_hire_salary_annual": float(next_hire_salary_annual),
-            "next_hire_fte": float(next_hire_fte),
-            "next_hire_super_rate_pct": float(next_hire_super_rate_pct),
-            "next_hire_benefits_rate_pct": float(next_hire_benefits_rate_pct),
-            "next_hire_onboarding_monthly": float(next_hire_onboarding_monthly),
-        }
-
-        try:
-            supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
-            st.success("Next hire assumptions saved.")
+        if st.button("Save employer on-costs", key="save_employer_on_costs"):
+            supabase.table("client_settings").upsert(
+                {
+                    "client_id": client_id_str,
+                    "payroll_tax_threshold_annual": float(payroll_tax_threshold_annual),
+                    "payroll_tax_rate_pct": float(payroll_tax_rate_pct),
+                    "workers_comp_rate_pct": float(workers_comp_rate_pct),
+                },
+                on_conflict="client_id",
+            ).execute()
+            st.success("Employer on-costs saved.")
             st.rerun()
 
-        except APIError as e:
-            # Your exact failure was: PGRST204 missing column in schema cache
-            msg = str(e)
-            if "PGRST204" in msg:
-                st.error(
-                    "Supabase says one or more next-hire columns are missing from `client_settings` "
-                    "(or PostgREST schema cache hasn’t reloaded).\n\n"
-                    "Run the SQL migration below, then reload PostgREST schema."
-                )
-            else:
-                st.error("Failed to save next hire assumptions.")
-            st.code(msg, language="text")
+    # -------------------------------
+    # CARD G — Next hire assumptions
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Next hire assumptions</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Used for hiring sensitivity KPIs</div>", unsafe_allow_html=True)
 
-    st.markdown("---")
+        nh1, nh2, nh3 = st.columns(3)
+        with nh1:
+            next_hire_salary_annual = st.number_input(
+                "Next hire base salary (annual)",
+                min_value=0.0,
+                step=5000.0,
+                value=float(settings.get("next_hire_salary_annual", 0.0) or 0.0),
+            )
+            next_hire_fte = st.number_input(
+                "Next hire FTE",
+                min_value=0.1,
+                max_value=2.0,
+                step=0.1,
+                value=float(settings.get("next_hire_fte", 1.0) or 1.0),
+            )
 
-    # ----------------- AR / AP defaults -----------------
-    st.subheader("📌 AR / AP Default Rules")
-    col1, col2 = st.columns(2)
+        with nh2:
+            next_hire_super_rate_pct = st.number_input(
+                "Next hire super rate (%)",
+                min_value=0.0,
+                max_value=30.0,
+                step=0.5,
+                value=float(settings.get("next_hire_super_rate_pct", 11.0) or 11.0),
+            )
+            next_hire_benefits_rate_pct = st.number_input(
+                "Next hire benefits rate (%)",
+                min_value=0.0,
+                max_value=30.0,
+                step=0.5,
+                value=float(settings.get("next_hire_benefits_rate_pct", 0.0) or 0.0),
+            )
 
-    with col1:
-        ar_days = st.number_input(
-            "Default AR collection days",
-            min_value=0,
-            max_value=180,
-            value=int(settings.get("ar_default_days", 0) or 0),
-        )
-    with col2:
-        ap_days = st.number_input(
-            "Default AP payment days",
-            min_value=0,
-            max_value=180,
-            value=int(settings.get("ap_default_days", 0) or 0),
-        )
+        with nh3:
+            next_hire_onboarding_monthly = st.number_input(
+                "Onboarding cost (monthly, if recurring)",
+                min_value=0.0,
+                step=250.0,
+                value=float(settings.get("next_hire_onboarding_monthly", 0.0) or 0.0),
+            )
 
-    if st.button("Save AR/AP defaults", key="save_ar_ap_defaults"):
-        supabase.table("client_settings").upsert(
-            {"client_id": client_id_str, "ar_default_days": int(ar_days), "ap_default_days": int(ap_days)},
-            on_conflict="client_id",
-        ).execute()
-        st.success("AR/AP defaults saved.")
-        st.rerun()
-
-    st.markdown("---")
-
-    # ----------------- Runway / overspend thresholds -----------------
-    st.subheader("🚨 Runway & Overspend Thresholds")
-    col1, = st.columns(1)
-
-    with col1:
-        runway_min = st.number_input(
-            "Minimum runway months",
-            min_value=0.0,
-            max_value=24.0,
-            value=float(settings.get("runway_min_months", 4.0) or 4.0),
-            step=0.5,
-        )
-    
-
-    if st.button("Save runway thresholds", key="save_r_thresholds"):
-        supabase.table("client_settings").upsert(
-            {
+        if st.button("Save next hire assumptions", key="save_next_hire"):
+            payload = {
                 "client_id": client_id_str,
-                "runway_min_months": float(runway_min),
-                "overspend_warn_pct": float(warn_pct),
-                "overspend_high_pct": float(danger_pct),
-            },
-            on_conflict="client_id",
-        ).execute()
-        st.success("Risk thresholds saved.")
-        st.rerun()
+                "next_hire_salary_annual": float(next_hire_salary_annual),
+                "next_hire_fte": float(next_hire_fte),
+                "next_hire_super_rate_pct": float(next_hire_super_rate_pct),
+                "next_hire_benefits_rate_pct": float(next_hire_benefits_rate_pct),
+                "next_hire_onboarding_monthly": float(next_hire_onboarding_monthly),
+            }
+            try:
+                supabase.table("client_settings").upsert(payload, on_conflict="client_id").execute()
+                st.success("Next hire assumptions saved.")
+                st.rerun()
+            except APIError as e:
+                msg = str(e)
+                if "PGRST204" in msg:
+                    st.error(
+                        "Supabase says one or more next-hire columns are missing from `client_settings` "
+                        "(or PostgREST schema cache hasn’t reloaded)."
+                    )
+                else:
+                    st.error("Failed to save next hire assumptions.")
+                st.code(msg, language="text")
 
-    st.markdown("---")
+    # -------------------------------
+    # CARD H — AR / AP default rules
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>AR / AP default rules</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Default working capital timing assumptions</div>", unsafe_allow_html=True)
 
-    # ----------------- Revenue recognition -----------------
-    st.subheader("📊 Revenue Recognition Method")
+        col1, col2 = st.columns(2)
+        with col1:
+            ar_days = st.number_input(
+                "Default AR collection days",
+                min_value=0,
+                max_value=180,
+                value=int(settings.get("ar_default_days", 0) or 0),
+            )
+        with col2:
+            ap_days = st.number_input(
+                "Default AP payment days",
+                min_value=0,
+                max_value=180,
+                value=int(settings.get("ap_default_days", 0) or 0),
+            )
 
-    method = st.selectbox(
-        "Select default revenue recognition method",
-        ["saas", "milestone", "straight_line", "instant", "deferred"],
-        index=["saas", "milestone", "straight_line", "instant", "deferred"]
-        .index(settings.get("revenue_recognition_method", "saas")),
-    )
+        if st.button("Save AR/AP defaults", key="save_ar_ap_defaults"):
+            supabase.table("client_settings").upsert(
+                {"client_id": client_id_str, "ar_default_days": int(ar_days), "ap_default_days": int(ap_days)},
+                on_conflict="client_id",
+            ).execute()
+            st.success("AR/AP defaults saved.")
+            st.rerun()
 
-    if st.button("Save revenue recognition method", key="save_revrec"):
-        supabase.table("client_settings").upsert(
-            {"client_id": client_id_str, "revenue_recognition_method": method},
-            on_conflict="client_id",
-        ).execute()
-        st.success("Revenue recognition method updated.")
-        st.rerun()
+    # -------------------------------
+    # CARD I — Runway & overspend thresholds
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Runway & overspend thresholds</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Controls risk triggers across the dashboard</div>", unsafe_allow_html=True)
 
-    
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            runway_min = st.number_input(
+                "Minimum runway months",
+                min_value=0.0,
+                max_value=24.0,
+                value=float(settings.get("runway_min_months", 4.0) or 4.0),
+                step=0.5,
+            )
+        with c2:
+            warn_pct = st.number_input(
+                "Overspend warn (%)",
+                min_value=0.0,
+                max_value=200.0,
+                value=float(settings.get("overspend_warn_pct", 10.0) or 10.0),
+                step=0.5,
+            )
+        with c3:
+            danger_pct = st.number_input(
+                "Overspend high (%)",
+                min_value=0.0,
+                max_value=200.0,
+                value=float(settings.get("overspend_high_pct", 20.0) or 20.0),
+                step=0.5,
+            )
+
+        if st.button("Save runway thresholds", key="save_r_thresholds"):
+            supabase.table("client_settings").upsert(
+                {
+                    "client_id": client_id_str,
+                    "runway_min_months": float(runway_min),
+                    "overspend_warn_pct": float(warn_pct),
+                    "overspend_high_pct": float(danger_pct),
+                },
+                on_conflict="client_id",
+            ).execute()
+            st.success("Risk thresholds saved.")
+            st.rerun()
+
+    # -------------------------------
+    # CARD J — Revenue recognition method
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Revenue recognition method</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Default recognition logic used across revenue dashboards</div>", unsafe_allow_html=True)
+
+        options = ["saas", "milestone", "straight_line", "instant", "deferred"]
+        current = settings.get("revenue_recognition_method", "saas") or "saas"
+        if current not in options:
+            current = "saas"
+
+        method = st.selectbox(
+            "Select default revenue recognition method",
+            options,
+            index=options.index(current),
+        )
+
+        if st.button("Save revenue recognition method", key="save_revrec"):
+            supabase.table("client_settings").upsert(
+                {"client_id": client_id_str, "revenue_recognition_method": method},
+                on_conflict="client_id",
+            ).execute()
+            st.success("Revenue recognition method updated.")
+            st.rerun()
+   
 
 
 
@@ -13617,19 +14334,249 @@ def get_client_cache_buster(client_id: str) -> str:
 
 
 
+# -------------------------------------------------------------------
+# ADD THESE TWO FUNCTIONS ABOVE page_cash_bills() (same file)
+# (Pure builders: no Streamlit calls, no side effects)
+# -------------------------------------------------------------------
+
+
+# ============================================================
+# CFO-GRADE NARRATIVE BUILDERS (drop-in)
+# - Clear structure
+# - Driver-based prioritisation (AR vs AP vs runway/buffer)
+# - No Streamlit calls / pure functions
+# ============================================================
+
+import pandas as pd
+
+def build_cash_bills_what_this_means(
+    *,
+    currency_symbol: str,
+    opening_first: float | None,
+    cash_buffer: float,
+    min_cash: float | None,
+    gap_label: str,
+    gap_value: float,
+    runway_weeks: int | None,
+    reaction_weeks: int | None,
+    stress_week,
+    worst_week,
+    stress_date_exact=None,
+    ar_next_4w: float = 0.0,
+    ap_next_4w: float = 0.0,
+    net_4w: float = 0.0,
+) -> list[str]:
+    """
+    CFO structure (max 4 bullets):
+      1) Position vs buffer (now + lowest point)
+      2) Runway / reaction window
+      3) Timing (stress date / lowest week)
+      4) Driver (next 4 weeks: net + AR/AP timing)
+    Returns bullets with • prefix.
+    """
+    bullets: list[str] = []
+
+    # 1) Position vs buffer
+    if opening_first is None:
+        bullets.append("• Current cash position cannot be inferred because the 14-week projection is unavailable.")
+    else:
+        if cash_buffer > 0 and min_cash is not None:
+            if min_cash <= 0:
+                bullets.append(
+                    f"• Opening cash is {currency_symbol}{opening_first:,.0f}; the 14-week projection goes negative (min {currency_symbol}{min_cash:,.0f})."
+                )
+            elif min_cash < cash_buffer:
+                bullets.append(
+                    f"• Opening cash is {currency_symbol}{opening_first:,.0f}; projected cash dips below the safety buffer of {currency_symbol}{cash_buffer:,.0f} "
+                    f"({gap_label}: {currency_symbol}{gap_value:,.0f})."
+                )
+            else:
+                bullets.append(
+                    f"• Opening cash is {currency_symbol}{opening_first:,.0f}; projected cash remains above the safety buffer of {currency_symbol}{cash_buffer:,.0f}."
+                )
+        else:
+            bullets.append(
+                f"• Opening cash is {currency_symbol}{opening_first:,.0f}, derived from week 1 of the 14-week model (not a live bank feed)."
+            )
+
+    # 2) Runway / reaction window
+    if runway_weeks is None:
+        bullets.append("• Runway is not quantified because the stress buffer or 14-week projection inputs are incomplete.")
+    else:
+        # classify runway tightness + reaction window (if available)
+        runway_tight = runway_weeks <= 8
+        rx_txt = ""
+        if reaction_weeks is not None:
+            rx_txt = f" Reaction window is {reaction_weeks} weeks."
+        if runway_tight:
+            bullets.append(f"• Runway is {runway_weeks} weeks under current assumptions.{rx_txt} Liquidity protection needs immediate focus.")
+        else:
+            bullets.append(f"• Runway is {runway_weeks} weeks under current assumptions.{rx_txt} This will tighten if outflows exceed collections timing.")
+
+    # 3) Timing
+    dt = stress_date_exact if stress_date_exact is not None else stress_week
+    if dt is not None:
+        try:
+            bullets.append(f"• Earliest cash-stress point is around {pd.to_datetime(dt).strftime('%d %b %Y')} assuming receipt/payment timing holds.")
+        except Exception:
+            bullets.append("• Earliest cash-stress point falls within the 14-week window assuming receipt/payment timing holds.")
+    else:
+        if worst_week is not None and min_cash is not None and cash_buffer > 0 and min_cash < cash_buffer:
+            try:
+                bullets.append(f"• Buffer pressure concentrates around {pd.to_datetime(worst_week).strftime('%d %b %Y')} based on the lowest projected cash point.")
+            except Exception:
+                bullets.append("• Buffer pressure concentrates around the lowest projected cash point in the 14-week window.")
+        else:
+            bullets.append("• No cash-stress point is identified within the 14-week window using the current buffer and available data.")
+
+    # 4) Driver (next 4 weeks)
+    # Keep it diagnostic (no actions); show net + what must land
+    if (ar_next_4w or ap_next_4w) and (opening_first is not None):
+        if net_4w < 0:
+            bullets.append(
+                f"• Next 4 weeks are net {currency_symbol}{net_4w:,.0f}: {currency_symbol}{ar_next_4w:,.0f} expected in, "
+                f"{currency_symbol}{ap_next_4w:,.0f} committed out — timing risk is skewed to outflows if collections slip."
+            )
+        else:
+            bullets.append(
+                f"• Next 4 weeks are net +{currency_symbol}{net_4w:,.0f}: {currency_symbol}{ar_next_4w:,.0f} expected in, "
+                f"{currency_symbol}{ap_next_4w:,.0f} committed out — maintaining collections cadence is key to staying above buffer."
+            )
+    else:
+        # fall back to the original logic style but still CFO-toned
+        if ar_next_4w > 0:
+            bullets.append("• Near-term flexibility is constrained by collections timing: the next-4-week AR must land to avoid tightening the buffer.")
+        else:
+            bullets.append("• Near-term flexibility is constrained by committed outflows because forward receipts are not visible in the next 4 weeks.")
+
+    return bullets[:4]
+
+
+def build_cash_bills_action_plan(
+    *,
+    currency_symbol: str,
+    cash_buffer: float,
+    gap_value: float,
+    runway_weeks: int | None,
+    reaction_weeks: int | None,
+    immediate: bool,
+    stress_date_exact=None,
+    stress_week=None,
+    net_4w: float = 0.0,
+    ar_overdue_amt: float = 0.0,
+    ap_overdue_amt: float = 0.0,
+    ar_next_4w: float = 0.0,
+    ap_next_4w: float = 0.0,
+    commitments=None,
+) -> list[str]:
+    """
+    CFO structure (max 5 bullets, prioritised):
+      1) Controls (spend discipline)
+      2) Collections (AR driver)
+      3) Payables/commitments (AP driver)
+      4) Downside plan (extend runway)
+      5) Cadence (monitoring rhythm)
+    Returns bullets with • prefix.
+    """
+    actions: list[str] = []
+
+    # Signals
+    reaction_is_critical = (reaction_weeks is not None and reaction_weeks < 8) or immediate or (runway_weeks is not None and runway_weeks <= 8)
+    buffer_at_risk = (cash_buffer > 0 and gap_value > 0)
+    commitments_drive = bool(commitments is not None and not getattr(commitments, "empty", True))
+
+    # Determine dominant driver
+    # AR driver if overdue exists or AR is material vs buffer OR net_4w negative and AR is meaningful
+    ar_driver = (ar_overdue_amt > 0) or (cash_buffer > 0 and ar_next_4w >= 0.5 * cash_buffer)
+    # AP driver if AP next 4w is material or commitments exist or AP overdue exists
+    ap_driver = (ap_overdue_amt > 0) or (cash_buffer > 0 and ap_next_4w >= 0.5 * cash_buffer) or commitments_drive
+
+    # Useful date text (for urgency)
+    dt = stress_date_exact if stress_date_exact is not None else stress_week
+    dt_txt = ""
+    if dt is not None:
+        try:
+            dt_txt = pd.to_datetime(dt).strftime("%d %b %Y")
+        except Exception:
+            dt_txt = ""
+
+    # 1) Controls
+    if reaction_is_critical or buffer_at_risk:
+        if dt_txt:
+            actions.append(f"• Tighten cash controls today: freeze discretionary spend for 14 days and require founder sign-off for any non-essential outflow (ahead of {dt_txt}).")
+        else:
+            actions.append("• Tighten cash controls today: freeze discretionary spend for 14 days and require founder sign-off for any non-essential outflow.")
+    else:
+        actions.append("• Maintain spend discipline: require approval for non-essential outflows and avoid new commitments until buffer position is stable.")
+
+    # 2) Collections (AR)
+    if ar_driver or (net_4w < 0 and ar_next_4w > 0):
+        actions.append(
+            f"• Pull forward cash-in: chase the 3 largest overdue invoices (up to {currency_symbol}{ar_overdue_amt:,.0f}) and secure written payment dates within 7 days."
+        )
+        actions.append(
+            f"• Lock the next-4-week collections: confirm payment dates for customers representing {currency_symbol}{ar_next_4w:,.0f} due in the next 4 weeks within 7 days."
+        )
+
+    # 3) Payables / commitments (AP)
+    if ap_driver or (net_4w < 0 and ap_next_4w > 0):
+        actions.append(
+            f"• Push out cash-out: renegotiate supplier terms and defer non-critical payments; target moving 30–45% of near-term payables beyond the next 14 days (next-4-week AP: {currency_symbol}{ap_next_4w:,.0f})."
+        )
+    if commitments_drive:
+        actions.append("• Rework near-term commitments: confirm revised dates for any large outflows in the next 30 days and defer discretionary commitments by 14–30 days.")
+
+    # 4) Downside plan (runway extension)
+    if reaction_is_critical or buffer_at_risk:
+        actions.append("• Build a downside cash plan within 7 days: identify immediate cost cuts/deferrals that extend runway by at least 4 weeks and implement the top 2 levers.")
+
+    # 5) Cadence (monitoring)
+    if reaction_is_critical or buffer_at_risk:
+        actions.append("• Run a daily cash cadence for 14 days: opening cash, next-14-day inflows, next-14-day outflows, and update the 14-week view weekly.")
+    else:
+        actions.append("• Set a weekly liquidity rhythm: refresh the 14-week view, review AR/AP timing, and keep the buffer policy current.")
+
+    # Dedup while preserving order
+    seen = set()
+    dedup: list[str] = []
+    for a in actions:
+        if a not in seen:
+            dedup.append(a)
+            seen.add(a)
+
+    # Keep max 5, but ensure at least 3
+    dedup = dedup[:5]
+    if len(dedup) < 3:
+        # CFO-safe minimal fillers (should rarely trigger)
+        dedup += [
+            "• Confirm top customer payment dates and remove blockers to collection this week.",
+            "• Review top supplier payment timing and negotiate extensions where possible.",
+            "• Refresh the 14-week cash view and track buffer position weekly.",
+        ]
+        # re-dedup
+        seen = set()
+        tmp = []
+        for a in dedup:
+            if a not in seen:
+                tmp.append(a)
+                seen.add(a)
+        dedup = tmp[:5]
+
+    return dedup
+
+
+
+# -------------------------------------------------------------------
+# UPDATED page_cash_bills() — same features, same flow
+# Only change: "what_means" and "actions_dedup" are built via functions
+# -------------------------------------------------------------------
+
 def page_cash_bills():
-    """
-    Cash & Bills — tracker removed
-    (No logic changes; only removes perf_start_page / perf_step / perf_end_page wrappers)
-    """
-    top_header("Cash & Bills")
 
     if not selected_client_id:
         st.info("Select a business from the sidebar to view this page.")
         return
 
-    from datetime import timedelta
-    import math
 
     # ✅ Ensure these ALWAYS exist (prevents UnboundLocalError forever)
     week_df = pd.DataFrame()
@@ -13724,77 +14671,36 @@ def page_cash_bills():
             pass
 
     # ==========================
-    # KPI STRIP: Runway / Stress Date / Reaction Window (Base-case)
+    # Stress KPIs (keep your logic)
     # ==========================
-    st.markdown("### 🧭 Cash stress & runway (base-case)")
     as_of_month = get_active_as_of_month(selected_client_id, selected_month_start)
 
-    if cash_buffer <= 0:
-        st.warning("Cash Stress Buffer is not set (or is 0). Set it in Client Settings → Cash safety buffer.")
-    elif week_df is None or week_df.empty:
-        st.info("14-week cashflow not available yet — cannot calculate runway/stress date.")
-    else:
-        # ✅ UPDATED: pass focus-month plan version + fetcher so we can compute exact stress date > 14 weeks
-        as_of_month = get_active_as_of_month(selected_client_id, selected_month_start)
+    if cash_buffer > 0 and week_df is not None and not week_df.empty:
+        try:
+            stress_kpis = _cached_compute_cash_stress_kpis(
+                client_id=selected_client_id,
+                focus_month=selected_month_start,
+                as_of_month=as_of_month,
+                cash_buffer=cash_buffer,
+                cache_buster=cache_buster,
+            )
 
-        stress_kpis = _cached_compute_cash_stress_kpis(
-            client_id=selected_client_id,
-            focus_month=selected_month_start,
-            as_of_month=as_of_month,
-            cash_buffer=cash_buffer,
-            cache_buster=cache_buster,
-        )
+            stress_week = stress_kpis.get("stress_week")
+            runway_weeks = stress_kpis.get("runway_weeks")
+            runway_months = stress_kpis.get("runway_months")
+            reaction_weeks = stress_kpis.get("reaction_window_weeks")
+            band = stress_kpis.get("reaction_band")
+            immediate = bool(stress_kpis.get("immediate_attention", False))
 
-        # Backward-compatible fields
-        stress_week = stress_kpis.get("stress_week")  # week-start (Monday) even if estimated from monthly
-        runway_weeks = stress_kpis.get("runway_weeks")
-        runway_months = stress_kpis.get("runway_months")
-        reaction_weeks = stress_kpis.get("reaction_window_weeks")
-        band = stress_kpis.get("reaction_band")
-        immediate = bool(stress_kpis.get("immediate_attention", False))
-
-        # NEW fields
-        stress_date_exact = stress_kpis.get("stress_date_exact")
-        stress_source = stress_kpis.get("stress_source")
-        stress_week_label = stress_kpis.get("stress_week_label")
-
-        c2, c3 = st.columns([1.3, 1.2])
-
-        with c2:
-            # ✅ UPDATED: show exact date if available (even >14 weeks)
-            if stress_date_exact is not None:
-                st.metric("Cash stress date", stress_date_exact.strftime("%d %b %Y"))
-                extra = []
-                if stress_week_label:
-                    extra.append(stress_week_label)
-                if stress_source:
-                    extra.append(f"source: {stress_source}")
-                if extra:
-                    st.caption(" • ".join(extra))
-            else:
-                st.metric("Cash stress date", "Not in next 14 weeks")
-                st.caption("No buffer breach found in weekly view or plan data.")
-
-        with c3:
-            st.metric("Reaction window (weeks)", f"{reaction_weeks} w" if reaction_weeks is not None else "—")
-
-        # Status messages
-        if stress_week is not None and immediate:
-            st.error("Immediate Attention: cash stress is ≤ 8 weeks away under base-case.")
-        elif stress_week is not None and band == "Tight":
-            st.warning("Tight: reaction window 4–8 weeks (base-case).")
-        elif stress_week is not None and band == "Watch":
-            st.warning("Watch: reaction window 8–12 weeks (base-case).")
-        elif stress_week is not None:
-            st.info("Base-case shows cash remains above the buffer for now, but the runway metrics should be used for decisions.")
-        else:
-            st.info("Base-case shows no buffer breach in the next 14 weeks. Maintain discipline on collections and commitments.")
+            stress_date_exact = stress_kpis.get("stress_date_exact")
+            stress_source = stress_kpis.get("stress_source")
+            stress_week_label = stress_kpis.get("stress_week_label")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
-    # 1) Top KPIs – Cash + AR/AP next 4 weeks
+    # Overdue + next 4w totals (keep your logic)
     # ------------------------------------------------------------------
-    st.subheader("📌 Cash & working capital snapshot")
-
     ar_overdue_amt = 0.0
     ar_overdue_count = 0
     ap_overdue_amt = 0.0
@@ -13803,33 +14709,29 @@ def page_cash_bills():
     def _not_paid_status(s):
         return str(s or "").lower() not in ["paid", "closed", "settled"]
 
-    if df_ar is not None and not df_ar.empty:
+    if df_ar is not None and not df_ar.empty and "days_past_expected" in df_ar.columns:
         ar_tmp = df_ar.copy()
-        if "days_past_expected" in ar_tmp.columns:
-            mask_overdue = (ar_tmp["days_past_expected"] > 0) & ar_tmp["status"].apply(_not_paid_status)
-            overdue_rows = ar_tmp[mask_overdue]
-            amt_col_overdue_ar = "effective_amount" if "effective_amount" in overdue_rows.columns else "amount"
-            ar_overdue_amt = float(overdue_rows[amt_col_overdue_ar].fillna(0.0).sum())
-            ar_overdue_count = int(len(overdue_rows))
+        mask_overdue = (ar_tmp["days_past_expected"] > 0) & ar_tmp["status"].apply(_not_paid_status)
+        overdue_rows = ar_tmp[mask_overdue]
+        amt_col_overdue_ar = "effective_amount" if "effective_amount" in overdue_rows.columns else "amount"
+        ar_overdue_amt = float(overdue_rows[amt_col_overdue_ar].fillna(0.0).sum())
+        ar_overdue_count = int(len(overdue_rows))
 
-    if df_ap is not None and not df_ap.empty:
+    if df_ap is not None and not df_ap.empty and "days_past_expected" in df_ap.columns:
         ap_tmp = df_ap.copy()
-        if "days_past_expected" in ap_tmp.columns:
-            mask_overdue_ap = (ap_tmp["days_past_expected"] > 0) & ap_tmp["status"].apply(_not_paid_status)
-            overdue_rows_ap = ap_tmp[mask_overdue_ap]
-            amt_col_overdue_ap = "effective_amount" if "effective_amount" in overdue_rows_ap.columns else "amount"
-            ap_overdue_amt = float(overdue_rows_ap[amt_col_overdue_ap].fillna(0.0).sum())
-            ap_overdue_count = int(len(overdue_rows_ap))
+        mask_overdue_ap = (ap_tmp["days_past_expected"] > 0) & ap_tmp["status"].apply(_not_paid_status)
+        overdue_rows_ap = ap_tmp[mask_overdue_ap]
+        amt_col_overdue_ap = "effective_amount" if "effective_amount" in overdue_rows_ap.columns else "amount"
+        ap_overdue_amt = float(overdue_rows_ap[amt_col_overdue_ap].fillna(0.0).sum())
+        ap_overdue_count = int(len(overdue_rows_ap))
 
     ar_next_4w = 0.0
     ap_next_4w = 0.0
-
     if week_df is not None and not week_df.empty:
         w4 = week_df.head(4).copy()
         for c in ["cash_in_ar", "cash_out_ap"]:
             if c in w4.columns:
                 w4[c] = pd.to_numeric(w4[c], errors="coerce").fillna(0.0)
-
         ar_next_4w = float(w4["cash_in_ar"].sum()) if "cash_in_ar" in w4.columns else 0.0
         ap_next_4w = float(w4["cash_out_ap"].sum()) if "cash_out_ap" in w4.columns else 0.0
 
@@ -13844,589 +14746,39 @@ def page_cash_bills():
 
     net_4w = ar_next_4w - ap_next_4w
 
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("Projected opening cash (week 1)", cash_now_label)
-    with k2:
-        st.metric("Invoices to collect (next 4 weeks)", f"{currency_symbol}{ar_next_4w:,.0f}")
-    with k3:
-        st.metric("Bills to pay (next 4 weeks)", f"{currency_symbol}{ap_next_4w:,.0f}")
-    with k4:
-        st.metric("Net position (next 4 weeks)", f"{currency_symbol}{net_4w:,.0f}")
-
-    # ==========================
-    # Governance: Runway change > ±10% MoM
-    # ==========================
-    try:
-        if cash_buffer > 0 and runway_weeks is not None:
-            prev_month_start = (pd.to_datetime(selected_month_start).to_period("M") - 1).to_timestamp().date()
-            prev_as_of = get_active_as_of_month(selected_client_id, prev_month_start)
-
-            prev_kpis = _cached_compute_cash_stress_kpis(
-                client_id=selected_client_id,
-                focus_month=prev_month_start,
-                as_of_month=prev_as_of,
-                cash_buffer=cash_buffer,
-                cache_buster=cache_buster,
-            )
-
-            prev_runway = prev_kpis.get("runway_weeks")
-
-            if prev_runway is not None and prev_runway > 0:
-                pct_change = (runway_weeks - prev_runway) / prev_runway * 100.0
-                if abs(pct_change) > 10:
-                    st.warning(
-                        f"Governance flag: runway changed {pct_change:+.0f}% vs last month (>{10}% threshold)."
-                    )
-    except Exception:
-        pass
-
     # ------------------------------------------------------------------
-    # Cash danger summary strip (from 14-week view)
+    # Cash danger summary (min_cash, worst_week, gap)
     # ------------------------------------------------------------------
-    st.markdown("### 🚨 Cash danger summary (next 14 weeks)")
-
     min_cash = None
     worst_week = None
+    gap_label = "Gap to buffer"
+    gap_value = 0.0
 
-    if week_df is None or week_df.empty or "closing_cash" not in week_df.columns:
-        st.info("14-week cashflow not available yet to assess cash risk.")
-    else:
+    if week_df is not None and (not week_df.empty) and "closing_cash" in week_df.columns:
         w = week_df.copy()
         if "week_start" in w.columns:
             w["week_start"] = pd.to_datetime(w["week_start"], errors="coerce")
 
-        min_cash = float(w["closing_cash"].min())
-        idx_min = int(w["closing_cash"].idxmin())
+        min_cash = float(pd.to_numeric(w["closing_cash"], errors="coerce").fillna(0.0).min())
+        idx_min = int(pd.to_numeric(w["closing_cash"], errors="coerce").fillna(0.0).idxmin())
         worst_week = w.loc[idx_min, "week_start"] if "week_start" in w.columns else None
 
         buffer_shortfall = max(0.0, cash_buffer - min_cash)
         cash_deficit = max(0.0, -min_cash)
 
         if min_cash <= 0:
-            headline = "Cash goes negative in the next 14 weeks."
             gap_label = "Cash deficit (to reach $0)"
             gap_value = cash_deficit
-            st.error(f"• {headline}")
         elif min_cash < cash_buffer:
-            headline = "Cash stays positive, but falls below your safety buffer."
             gap_label = "Gap to safety buffer"
             gap_value = buffer_shortfall
-            st.warning(f"• {headline}")
         else:
-            headline = "Cash stays above your safety buffer."
             gap_label = "Gap to safety buffer"
             gap_value = 0.0
-            st.info(f"• {headline}")
-
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Lowest projected cash", f"{currency_symbol}{min_cash:,.0f}")
-        cB.metric("Week of lowest cash", worst_week.strftime("%d %b %Y") if worst_week is not None else "—")
-        cC.metric("Safety buffer", f"{currency_symbol}{cash_buffer:,.0f}")
-        cD.metric(gap_label, f"{currency_symbol}{gap_value:,.0f}")
-
-    overdue_bits = []
-    if ar_overdue_amt > 0:
-        overdue_bits.append(
-            f"{ar_overdue_count} invoice(s) overdue from customers "
-            f"≈ {currency_symbol}{ar_overdue_amt:,.0f}"
-        )
-    if ap_overdue_amt > 0:
-        overdue_bits.append(
-            f"{ap_overdue_count} bill(s) overdue to suppliers "
-            f"≈ {currency_symbol}{ap_overdue_amt:,.0f}"
-        )
-    if overdue_bits:
-        st.caption("Overdue snapshot: " + " · ".join(overdue_bits))
-
-    st.markdown("---")
-
-    # ==========================
-    # WHAT THIS MEANS
-    # ==========================
-    st.subheader("What this means")
-
-    what_means = []
-
-    if opening_first is None:
-        what_means.append("• Current cash position cannot be inferred because the 14-week projection is unavailable.")
-    else:
-        if cash_buffer > 0 and min_cash is not None and min_cash < cash_buffer:
-            what_means.append(
-                f"• Current cash position is {currency_symbol}{opening_first:,.0f}, "
-                f"with projected cash falling below the safety buffer of {currency_symbol}{cash_buffer:,.0f}."
-            )
-        else:
-            what_means.append(
-                f"• Current cash position is {currency_symbol}{opening_first:,.0f}, "
-                "based on week 1 of the projection (not a live bank feed)."
-            )
-
-    if runway_weeks is None:
-        what_means.append("• Runway is not quantified because the stress buffer or 14-week projection is missing.")
-    else:
-        if runway_weeks <= 8:
-            what_means.append(
-                f"• Base-case runway is {runway_weeks} weeks, indicating limited time to protect the buffer under current trajectory."
-            )
-        else:
-            what_means.append(
-                f"• Base-case runway is {runway_weeks} weeks under current assumptions and will shorten if operating outflows exceed customer collections."
-            )
-
-    if stress_week is not None:
-        what_means.append(
-            f"• Cash stress is expected around {stress_week.strftime('%d %b %Y')} if current timing of receipts and payments holds."
-        )
-    else:
-        if worst_week is not None and min_cash is not None and cash_buffer > 0 and min_cash < cash_buffer:
-            what_means.append(
-                f"• Buffer breach risk concentrates around {worst_week.strftime('%d %b %Y')} based on the lowest projected cash point."
-            )
-        else:
-            what_means.append(
-                "• No stress date is identified within the 14-week window using the current buffer and data available."
-            )
-
-    if cash_buffer > 0 and runway_weeks is not None and runway_weeks < 8:
-        what_means.append(
-            "• Near-term decisions must prioritise cash preservation: defer discretionary outflows and accelerate collections to extend runway."
-        )
-    else:
-        if ar_next_4w > 0:
-            what_means.append(
-                "• Near-term decisions should be constrained by collections timing: AR due in the next 4 weeks must land to avoid tightening the buffer."
-            )
-        else:
-            what_means.append(
-                "• Near-term decisions must be gated by committed cash outflows because forward receipts are not visible in the next 4 weeks."
-            )
-
-    what_means = what_means[:4]
-    st.markdown("\n".join(what_means))
-
-    st.markdown("---")
-
-    # ==========================
-    # ACTION PLAN — NEXT 7–14 DAYS
-    # ==========================
-    st.subheader("Action Plan – Next 7–14 days")
-
-    actions = []
-    reaction_is_critical = (reaction_weeks is not None and reaction_weeks < 8) or (immediate is True)
-
-    commitments_drive = False
-    try:
-        commitments_df = build_cash_commitments(df_ar, df_ap, as_of=as_of, horizon_days=60, limit=20)
-        commitments_drive = (commitments_df is not None and not commitments_df.empty)
-    except Exception:
-        commitments_drive = False
-
-    if reaction_is_critical:
-        actions.append("• Freeze discretionary spend approvals for the next 14 days and require founder sign-off for any non-essential cash outflow.")
-        actions.append("• Accelerate invoicing and collections: issue all outstanding invoices within 48 hours and confirm payment dates with top customers within 7 days.")
-        actions.append("• Delay non-critical cash outflows: renegotiate supplier payment dates to push at least 30–45% of near-term payables beyond the next 14 days.")
-        actions.append("• Build a downside cash plan within 7 days: identify immediate cost cuts and payment deferrals that extend runway by at least 4 weeks.")
-
-    ar_is_critical_driver = (ar_overdue_amt > 0) or (cash_buffer > 0 and ar_next_4w >= 0.5 * cash_buffer)
-    if ar_is_critical_driver:
-        actions.append(
-            f"• Chase top overdue invoices: escalate the 3 largest overdue balances totaling up to {currency_symbol}{ar_overdue_amt:,.0f} and secure confirmed settlement dates within 7 days."
-        )
-        actions.append(
-            f"• Lock collections timing: contact customers representing {currency_symbol}{ar_next_4w:,.0f} due in the next 4 weeks and obtain written payment commitments within 7 days."
-        )
-
-    if commitments_drive:
-        actions.append("• Renegotiate near-term commitments: secure revised dates for any large outflows in the next 30 days and defer discretionary commitments by 14–30 days.")
-
-    seen = set()
-    actions_dedup = []
-    for a in actions:
-        if a not in seen:
-            actions_dedup.append(a)
-            seen.add(a)
-
-    if len(actions_dedup) < 3:
-        actions_dedup.append("• Cut cash burn in 14 days: stop or pause at least 2 discretionary expense categories and implement immediately.")
-        actions_dedup.append("• Pull forward cash-in: offer a small early-payment incentive (or remove holds) for priority customers to bring receipts into the next 14 days.")
-        actions_dedup.append("• Push out cash-out: request extended terms from top suppliers and confirm updated due dates in writing within 7 days.")
-
-        seen = set()
-        tmp = []
-        for a in actions_dedup:
-            if a not in seen:
-                tmp.append(a)
-                seen.add(a)
-        actions_dedup = tmp
-
-    actions_dedup = actions_dedup[:5]
-    if len(actions_dedup) < 3:
-        actions_dedup = actions_dedup + ["• Freeze discretionary spend approvals for the next 14 days."] * (3 - len(actions_dedup))
-        actions_dedup = actions_dedup[:3]
-
-    st.markdown("\n".join(actions_dedup))
-
-    st.markdown("---")
 
     # ------------------------------------------------------------------
-    # 2) AR & AP ageing – side by side + drilldown
+    # Commitments (keep logic but we’ll render inside component)
     # ------------------------------------------------------------------
-    st.subheader("📊 AR & AP ageing – who pays late, who you pay")
-
-    col_ar, col_ap = st.columns(2)
-
-    with col_ar:
-        st.markdown("#### 📥 Invoices coming in (AR)")
-
-        if df_ar is None or df_ar.empty:
-            st.info("No AR records yet for this client.")
-        else:
-            if "aging_bucket" in df_ar.columns:
-
-                def _is_cash_row(row):
-                    if not bool(row.get("is_cash_relevant", True)):
-                        return False
-                    return float(row.get("effective_amount", 0.0)) > 0
-
-                df_age = df_ar[df_ar.apply(_is_cash_row, axis=1)].copy()
-
-                if "days_past_expected" in df_age.columns:
-                    df_age = df_age[df_age["days_past_expected"] >= 0]
-
-                if df_age.empty:
-                    st.caption("No open customer invoices due as of this month-end.")
-                else:
-                    amt_col = "effective_amount" if "effective_amount" in df_age.columns else "amount"
-
-                    ageing_summary = (
-                        df_age.groupby("aging_bucket", as_index=False)[amt_col]
-                        .sum()
-                        .rename(columns={"aging_bucket": "Bucket", amt_col: "Total amount"})
-                    )
-
-                    st.dataframe(ageing_summary, width="stretch")
-                    st.caption(
-                        "Open customer invoices due on or before this month-end, "
-                        "grouped by ageing bucket using **balance due** (after partial payments)."
-                    )
-
-            with st.expander("View AR invoice details (drilldown)", expanded=False):
-                ar_view = df_ar.copy()
-                cols = []
-                if "counterparty" in ar_view.columns:
-                    cols.append("counterparty")
-                if "issued_date" in ar_view.columns:
-                    cols.append("issued_date")
-                if "expected_date" in ar_view.columns:
-                    cols.append("expected_date")
-                if "amount" in ar_view.columns:
-                    cols.append("amount")
-                if "amount_paid" in ar_view.columns:
-                    cols.append("amount_paid")
-                if "effective_amount" in ar_view.columns:
-                    cols.append("effective_amount")
-                if "due_date" in ar_view.columns:
-                    cols.append("due_date")
-                if "status" in ar_view.columns:
-                    cols.append("status")
-                if "days_past_expected" in ar_view.columns:
-                    cols.append("days_past_expected")
-                if "aging_bucket" in ar_view.columns:
-                    cols.append("aging_bucket")
-                if "is_over_default" in ar_view.columns:
-                    cols.append("is_over_default")
-
-                if cols:
-                    ar_view = ar_view[cols].rename(
-                        columns={
-                            "counterparty": "Customer",
-                            "issued_date": "Issued",
-                            "expected_date": "Expected",
-                            "amount": "Original amount",
-                            "amount_paid": "Amount paid",
-                            "effective_amount": "Balance due",
-                            "due_date": "Original due",
-                            "status": "Status",
-                            "days_past_expected": "Days overdue",
-                            "aging_bucket": "Aging bucket",
-                            "is_over_default": "Over default terms?",
-                        }
-                    )
-
-                    filter_text = st.text_input("Filter AR by customer or status", value="", key="ar_filter")
-                    if filter_text:
-                        ft = filter_text.lower()
-                        mask = (
-                            ar_view["Customer"].astype(str).str.lower().str.contains(ft)
-                            | ar_view["Status"].astype(str).str.lower().str.contains(ft)
-                        )
-                        ar_view = ar_view[mask]
-
-                    st.dataframe(ar_view, width="stretch")
-                else:
-                    st.caption("AR table missing expected columns for detailed view.")
-
-    with col_ap:
-        st.markdown("#### 📤 Bills to pay (AP)")
-
-        if df_ap is None or df_ap.empty:
-            st.info("No AP records yet for this client.")
-        else:
-            if "aging_bucket" in df_ap.columns:
-
-                def _is_cash_row_ap(row):
-                    if not bool(row.get("is_cash_relevant", True)):
-                        return False
-                    return float(row.get("effective_amount", 0.0)) > 0
-
-                df_age_ap = df_ap[df_ap.apply(_is_cash_row_ap, axis=1)].copy()
-
-                if "days_past_expected" in df_age_ap.columns:
-                    df_age_ap = df_age_ap[df_age_ap["days_past_expected"] >= 0]
-
-                if df_age_ap.empty:
-                    st.caption("No open supplier bills due as of this month-end.")
-                else:
-                    amt_col_ap = "effective_amount" if "effective_amount" in df_age_ap.columns else "amount"
-
-                    ap_ageing_summary = (
-                        df_age_ap.groupby("aging_bucket", as_index=False)[amt_col_ap]
-                        .sum()
-                        .rename(columns={"aging_bucket": "Bucket", amt_col_ap: "Total amount"})
-                    )
-
-                    st.dataframe(ap_ageing_summary, width="stretch")
-                    st.caption(
-                        "Open supplier bills due on or before this month-end, "
-                        "grouped by ageing bucket using **balance due**."
-                    )
-
-            with st.expander("View AP bill details (drilldown)", expanded=False):
-                ap_view = df_ap.copy()
-                cols = []
-                if "counterparty" in ap_view.columns:
-                    cols.append("counterparty")
-                if "amount" in ap_view.columns:
-                    cols.append("amount")
-                if "amount_paid" in ap_view.columns:
-                    cols.append("amount_paid")
-                if "effective_amount" in ap_view.columns:
-                    cols.append("effective_amount")
-                if "due_date" in ap_view.columns:
-                    cols.append("due_date")
-                if "pay_expected_date" in ap_view.columns:
-                    cols.append("pay_expected_date")
-                elif "expected_payment_date" in ap_view.columns:
-                    cols.append("expected_payment_date")
-                if "status" in ap_view.columns:
-                    cols.append("status")
-                if "days_past_expected" in ap_view.columns:
-                    cols.append("days_past_expected")
-                if "aging_bucket" in ap_view.columns:
-                    cols.append("aging_bucket")
-                if "is_over_default" in ap_view.columns:
-                    cols.append("is_over_default")
-
-                if cols:
-                    ap_view = ap_view[cols].rename(
-                        columns={
-                            "counterparty": "Supplier",
-                            "amount": "Original amount",
-                            "amount_paid": "Amount paid",
-                            "effective_amount": "Balance due",
-                            "due_date": "Original due",
-                            "pay_expected_date": "Expected to pay",
-                            "expected_payment_date": "Expected to pay",
-                            "status": "Status",
-                            "days_past_expected": "Days overdue",
-                            "aging_bucket": "Aging bucket",
-                            "is_over_default": "Over default terms?",
-                        }
-                    )
-
-                    filter_text_ap = st.text_input("Filter AP by supplier or status", value="", key="ap_filter")
-                    if filter_text_ap:
-                        ft = filter_text_ap.lower()
-                        mask_ap = (
-                            ap_view["Supplier"].astype(str).str.lower().str.contains(ft)
-                            | ap_view["Status"].astype(str).str.lower().str.contains(ft)
-                        )
-                        ap_view = ap_view[mask_ap]
-
-                    st.dataframe(ap_view, width="stretch")
-                else:
-                    st.caption("AP table missing expected columns for detailed view.")
-
-    # ------------------------------------------------------------------
-    # Payments (AR/AP)
-    # ------------------------------------------------------------------
-    with st.expander("💳 Record a payment on an AR invoice", expanded=False):
-        ar_open = df_ar[df_ar["is_cash_relevant"] & (df_ar["effective_amount"] > 0)].copy() if df_ar is not None else pd.DataFrame()
-
-        if ar_open.empty:
-            st.caption("No open customer invoices to record payments against.")
-        else:
-            AR_TABLE_NAME = "ar_ap_tracker"
-
-            label_map = {}
-            for _, r in ar_open.iterrows():
-                inv_id = r.get("id")
-                inv_no = r.get("invoice_number", inv_id)
-                cust = r.get("counterparty", "")
-                due = r.get("due_date", "")
-                bal = float(r.get("effective_amount") or 0.0)
-
-                try:
-                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
-                except Exception:
-                    due_txt = str(due)
-
-                label_map[inv_id] = f"{inv_no} – {cust} – due {due_txt} – bal {currency_symbol}{bal:,.0f}"
-
-            selected_id = st.selectbox(
-                "Select invoice to update",
-                options=list(label_map.keys()),
-                format_func=lambda x: label_map.get(x, str(x)),
-                key="ar_payment_invoice",
-            )
-
-            payment_type = st.radio(
-                "Payment type",
-                ["Full payment", "Partial payment"],
-                horizontal=True,
-                key="ar_payment_type",
-            )
-
-            current_row = ar_open[ar_open["id"] == selected_id].iloc[0]
-            current_balance = float(current_row.get("effective_amount") or 0.0)
-            default_amount = current_balance if payment_type == "Full payment" else 0.0
-
-            payment_amount = st.number_input(
-                "Amount paid",
-                min_value=0.0,
-                value=default_amount,
-                step=100.0,
-                key="ar_payment_amount",
-            )
-
-            payment_date = st.date_input("Payment date", value=as_of, key="ar_payment_date")
-
-            if st.button("Record AR payment", key="ar_payment_button"):
-                try:
-                    sb = get_supabase_client() or get_supabase_client()
-
-                    prev_paid = float(current_row.get("amount_paid") or 0.0)
-                    new_paid_total = prev_paid + float(payment_amount)
-
-                    if new_paid_total >= float(current_row.get("amount") or 0.0) - 0.01:
-                        new_status = "paid"
-                        partially_paid_flag = False
-                    else:
-                        new_status = "open"
-                        partially_paid_flag = True
-
-                    update_data = {
-                        "amount_paid": new_paid_total,
-                        "partially_paid": partially_paid_flag,
-                        "status": new_status,
-                        "payment_date": payment_date.isoformat(),
-                        "updated_at": pd.Timestamp.utcnow().isoformat(),
-                    }
-
-                    sb.table(AR_TABLE_NAME).update(update_data).eq("id", selected_id).execute()
-
-                    st.success("Payment recorded. Rerun the page to refresh ageing & cash.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to record payment: {e}")
-
-    with st.expander("💳 Record a payment on an AP bill", expanded=False):
-        ap_open = df_ap[df_ap["is_cash_relevant"] & (df_ap["effective_amount"] > 0)].copy() if df_ap is not None else pd.DataFrame()
-
-        if ap_open.empty:
-            st.caption("No open supplier bills to record payments against.")
-        else:
-            AP_TABLE_NAME = "ar_ap_tracker"
-
-            label_map_ap = {}
-            for _, r in ap_open.iterrows():
-                bill_id = r.get("id")
-                bill_no = r.get("invoice_number", bill_id)
-                supp = r.get("counterparty", "")
-                due = r.get("due_date", "")
-                bal = float(r.get("effective_amount") or 0.0)
-
-                try:
-                    due_txt = pd.to_datetime(due).strftime("%d %b %Y")
-                except Exception:
-                    due_txt = str(due)
-
-                label_map_ap[bill_id] = f"{bill_no} – {supp} – due {due_txt} – bal {currency_symbol}{bal:,.0f}"
-
-            selected_bill_id = st.selectbox(
-                "Select bill to update",
-                options=list(label_map_ap.keys()),
-                format_func=lambda x: label_map_ap.get(x, str(x)),
-                key="ap_payment_bill",
-            )
-
-            payment_type_ap = st.radio(
-                "Payment type",
-                ["Full payment", "Partial payment"],
-                horizontal=True,
-                key="ap_payment_type",
-            )
-
-            current_ap_row = ap_open[ap_open["id"] == selected_bill_id].iloc[0]
-            current_balance_ap = float(current_ap_row.get("effective_amount") or 0.0)
-            default_amount_ap = current_balance_ap if payment_type_ap == "Full payment" else 0.0
-
-            payment_amount_ap = st.number_input(
-                "Amount paid",
-                min_value=0.0,
-                value=default_amount_ap,
-                step=100.0,
-                key="ap_payment_amount",
-            )
-
-            payment_date_ap = st.date_input("Payment date", value=as_of, key="ap_payment_date")
-
-            if st.button("Record AP payment", key="ap_payment_button"):
-                try:
-                    sb = get_supabase_client() or get_supabase_client()
-
-                    prev_paid_ap = float(current_ap_row.get("amount_paid") or 0.0)
-                    new_paid_total_ap = prev_paid_ap + float(payment_amount_ap)
-
-                    if new_paid_total_ap >= float(current_ap_row.get("amount") or 0.0) - 0.01:
-                        new_status_ap = "paid"
-                        partially_paid_flag_ap = False
-                    else:
-                        new_status_ap = "open"
-                        partially_paid_flag_ap = True
-
-                    update_data_ap = {
-                        "amount_paid": new_paid_total_ap,
-                        "partially_paid": partially_paid_flag_ap,
-                        "status": new_status_ap,
-                        "payment_date": payment_date_ap.isoformat(),
-                        "updated_at": pd.Timestamp.utcnow().isoformat(),
-                    }
-
-                    sb.table(AP_TABLE_NAME).update(update_data_ap).eq("id", selected_bill_id).execute()
-
-                    st.success("Payment recorded. Rerun the page to refresh ageing & cash.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to record payment: {e}")
-
-    # ------------------------------------------------------------------
-    # 3) Cash commitments (near-term list)
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("🔍 Cash commitments coming up")
-
     commitments = build_cash_commitments(
         df_ar,
         df_ap,
@@ -14435,126 +14787,323 @@ def page_cash_bills():
         limit=7,
     )
 
-    if commitments.empty:
-        st.info("No upcoming cash movements found yet.")
-    else:
-        display_commitments = commitments.rename(
-            columns={
-                "direction": "Direction",
-                "who": "Customer / Supplier",
-                "amount": "Amount",
-                "date": "Planned date",
-                "original_due": "Original due",
-                "overdue": "Overdue?",
-            }
-        )
-
-        st.dataframe(display_commitments, width="stretch")
-        st.caption(
-            "Top upcoming customer receipts and supplier payments. "
-            "`Overdue? = Yes` means the original due date was before this Focus Month and is still unpaid."
-        )
-
     # ------------------------------------------------------------------
-    # 4) 14-week cashflow – chart + table
+    # What this means + Action plan (NOW via extracted functions)
     # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📆 14-week cashflow – can we sleep at night?")
+    what_means = build_cash_bills_what_this_means(
+        currency_symbol=currency_symbol,
+        opening_first=opening_first,
+        cash_buffer=cash_buffer,
+        min_cash=min_cash,
+        gap_label=gap_label,
+        gap_value=gap_value,
+        runway_weeks=runway_weeks,
+        reaction_weeks=reaction_weeks,
+        stress_week=stress_week,
+        worst_week=worst_week,
+        stress_date_exact=stress_date_exact,
+        ar_next_4w=ar_next_4w,
+        ap_next_4w=ap_next_4w,
+        net_4w=net_4w,
+    )
 
-    if week_df is None or week_df.empty:
-        st.caption(
-            "Not enough AR/AP + payroll data to build a 14-week view yet. "
-            "Add invoices and team data to see near-term cash pressure."
-        )
+    actions_dedup = build_cash_bills_action_plan(
+        currency_symbol=currency_symbol,
+        cash_buffer=cash_buffer,
+        gap_value=gap_value,
+        runway_weeks=runway_weeks,
+        reaction_weeks=reaction_weeks,
+        immediate=immediate,
+        stress_date_exact=stress_date_exact,
+        stress_week=stress_week,
+        net_4w=net_4w,
+        ar_overdue_amt=ar_overdue_amt,
+        ap_overdue_amt=ap_overdue_amt,
+        ar_next_4w=ar_next_4w,
+        ap_next_4w=ap_next_4w,
+        commitments=commitments,
+    )
+
+
+    # ==========================
+    # BUILD COMPONENT MAPPING + RENDER
+    # ==========================
+    from component.cash_bills_component import render_cash_bills
+    from ui.plotly_charts import apply_nordic_plotly_theme, PLOTLY_CONFIG_MINIMAL
+
+    def _money(x: float | None) -> str:
+        if x is None:
+            return "—"
+        try:
+            return f"{currency_symbol}{float(x):,.0f}"
+        except Exception:
+            return "—"
+
+    def _strip_bullets(xs):
+        out = []
+        for s in (xs or []):
+            t = str(s).strip()
+            if t.startswith("•"):
+                t = t[1:].strip()
+            out.append(t)
+        return out
+
+    # Card A status
+    if min_cash is None or cash_buffer <= 0:
+        danger_state = "warning"
+        danger_msg = "Set a safety buffer to assess cash risk over the next 14 weeks."
     else:
-        view = week_df.copy()
+        if min_cash <= 0:
+            danger_state = "risk"
+            danger_msg = "Immediate risk: cash goes negative within the next 14 weeks."
+        elif min_cash < cash_buffer:
+            danger_state = "warning"
+            danger_msg = "Warning: cash falls below the safety buffer within the next 14 weeks."
+        else:
+            danger_state = "success"
+            danger_msg = "Stable: cash remains above the safety buffer over the next 14 weeks."
 
-        if "week_start" in view.columns:
-            view["week_start"] = pd.to_datetime(view["week_start"], errors="coerce")
+    worst_week_txt = worst_week.strftime("%d %b %Y") if worst_week is not None else "—"
+    buffer_txt = _money(cash_buffer) if cash_buffer > 0 else "Not set"
 
-        view["Week"] = view["week_start"].dt.strftime("%d %b %Y")
+    # 6 KPIs (match blueprint)
+    stress_date_txt = stress_date_exact.strftime("%d %b %Y") if stress_date_exact is not None else "Not in 14 weeks"
+    runway_txt = f"{runway_weeks} w" if runway_weeks is not None else "—"
 
-        cols = [
-            "Week",
-            "cash_in_ar",
-            "cash_in_other_income",
-            "cash_out_ap",
-            "cash_out_payroll",
-            "cash_out_opex",
-            "operating_cf",
-            "investing_cf",
-            "financing_cf",
-            "net_cash",
-            "closing_cash",
-        ]
-        cols = [c for c in cols if c in view.columns]
-
-        view = view[cols].rename(
-            columns={
-                "cash_in_ar": "Cash in (customers)",
-                "cash_in_other_income": "Cash in (other income)",
-                "cash_out_ap": "Cash out (bills/AP)",
-                "cash_out_payroll": "Cash out (payroll)",
-                "cash_out_opex": "Cash out (opex)",
-                "operating_cf": "Operating CF",
-                "investing_cf": "Investing CF",
-                "financing_cf": "Financing CF",
-                "net_cash": "Net cash",
-                "closing_cash": "Closing cash",
-            }
+    # Card C ageing summaries (compact rows)
+    def _age_rows(df):
+        if df is None or df.empty or "aging_bucket" not in df.columns:
+            return []
+        tmp = df.copy()
+        amt_col = "effective_amount" if "effective_amount" in tmp.columns else ("amount" if "amount" in tmp.columns else None)
+        if amt_col is None:
+            return []
+        tmp[amt_col] = pd.to_numeric(tmp[amt_col], errors="coerce").fillna(0.0)
+        s = (
+            tmp.groupby("aging_bucket", as_index=False)[amt_col]
+            .sum()
+            .rename(columns={"aging_bucket": "Bucket", amt_col: "Total amount"})
         )
+        rows = []
+        for _, r in s.iterrows():
+            rows.append({"Bucket": str(r["Bucket"]), "Total amount": _money(float(r["Total amount"]))})
+        return rows
 
-        st.dataframe(view, width="stretch")
-        st.caption(
-            "Expected cash in/out by week for the next ~3 months, "
-            "split by operating, investing and financing activity."
-        )
+    ar_age_rows = _age_rows(df_ar)
+    ap_age_rows = _age_rows(df_ap)
 
-        if "closing_cash" in week_df.columns:
-            danger_weeks = week_df[week_df["closing_cash"] <= 0]
-            if not danger_weeks.empty:
-                first_danger = danger_weeks.iloc[0]
+    # Card D commitments rows
+    comm_rows = []
+    if commitments is not None and not commitments.empty:
+        for _, r in commitments.iterrows():
+            dt = r.get("date")
+            try:
+                dt_txt = pd.to_datetime(dt).strftime("%d %b %Y")
+            except Exception:
+                dt_txt = str(dt) if dt is not None else "—"
+            comm_rows.append({
+                "Direction": str(r.get("direction") or ""),
+                "Who/What": str(r.get("who") or ""),
+                "Amount": _money(float(r.get("amount") or 0.0)),
+                "Expected date": dt_txt,
+            })
 
-                wk = pd.to_datetime(first_danger.get("week_start"), errors="coerce")
-                wk_label = wk.strftime("%d %b %Y") if pd.notna(wk) else str(first_danger.get("week_start"))
+    # Card E Plotly chart + table rows (uses week_df)
+    plotly_html = ""
+    table_cols = []
+    table_rows = []
 
-                st.error(
-                    f"⚠️ Cash cliff around **week of {wk_label}** – "
-                    f"closing cash projected at {currency_symbol}{float(first_danger['closing_cash'] or 0):,.0f}."
-                )
+    if week_df is not None and (not week_df.empty) and "week_start" in week_df.columns:
+        wv = week_df.copy()
+        wv["week_start"] = pd.to_datetime(wv["week_start"], errors="coerce")
+        wv["closing_cash"] = pd.to_numeric(wv.get("closing_cash"), errors="coerce").fillna(0.0)
 
-        base_line = (
-            alt.Chart(week_df)
-            .mark_line()
-            .encode(
-                x=alt.X("week_start:T", title="Week starting", axis=alt.Axis(format="%d %b")),
-                y=alt.Y("closing_cash:Q", title=f"Projected closing cash ({currency_code})"),
-                tooltip=[
-                    alt.Tooltip("week_start:T", title="Week of", format="%d %b %Y"),
-                    alt.Tooltip("closing_cash:Q", title="Closing cash", format=",.0f"),
-                    alt.Tooltip("operating_cf:Q", title="Operating CF", format=",.0f"),
-                    alt.Tooltip("investing_cf:Q", title="Investing CF", format=",.0f"),
-                    alt.Tooltip("financing_cf:Q", title="Financing CF", format=",.0f"),
-                ],
-            )
-        )
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=wv["week_start"],
+            y=wv["closing_cash"],
+            mode="lines+markers",
+            hovertemplate="%{x|%d %b %Y}<br>Closing: " + currency_symbol + "%{y:,.0f}<extra></extra>",
+            name="Closing cash",
+        ))
 
         if cash_buffer and cash_buffer > 0:
-            buffer_rule = (
-                alt.Chart(pd.DataFrame({"y": [cash_buffer]}))
-                .mark_rule(strokeDash=[6, 6])
-                .encode(y="y:Q")
+            fig.add_hline(
+                y=float(cash_buffer),
+                line_dash="dash",
+                annotation_text="Safety buffer",
+                annotation_position="top left",
             )
-            chart = base_line + buffer_rule
-            st.caption(f"Dashed line = safety buffer ({currency_symbol}{cash_buffer:,.0f}).")
-        else:
-            chart = base_line
+                # --- "Zoom out" padding so last point + axes are fully visible ---
+        x_min = wv["week_start"].min()
+        x_max = wv["week_start"].max()
+        x_pad = timedelta(days=20)  # increase to 7 if you want more space
 
-        st.altair_chart(chart.interactive(), width="stretch")
+        y_min = float(wv["closing_cash"].min())
+        y_max = float(wv["closing_cash"].max())
+        y_pad = max(1.0, (y_max - y_min) * 0.08)  # 8% headroom/footroom
+
+        fig.update_xaxes(
+            range=[x_min - x_pad, x_max + x_pad],
+            automargin=True,
+            title_standoff=10,
+            tickformat="%d %b",
+        )
+
+        fig.update_yaxes(
+            range=[y_min - y_pad, y_max + y_pad],
+            automargin=True,
+            title_standoff=10,
+            tickformat=",.0f",
+            separatethousands=True,
+        )
+        fig.update_layout(
+            height=280,
+            margin=dict(l=80, r=24, t=16, b=72),
+            showlegend=False,
+            xaxis=dict(
+                title="Week starting",
+                automargin=True,
+                title_standoff=10,
+                tickformat="%d %b",
+                tickangle=0,
+            ),
+            yaxis=dict(
+                title=f"Closing cash ({currency_code})",
+                automargin=True,
+                title_standoff=10,
+                tickformat=",.0f",
+            ),
+        )
+
+        fig = apply_nordic_plotly_theme(fig)
 
 
 
-# -----------------------------------------------------------------------------
+        plotly_html = pio.to_html(
+            fig,
+            include_plotlyjs="cdn",
+            full_html=False,
+            config=PLOTLY_CONFIG_MINIMAL,
+        )
+
+        # 14w table (locked labels)
+        wv2 = wv.copy()
+        wv2["Week"] = wv2["week_start"].dt.strftime("%d %b %Y")
+
+        table_cols = [
+            "Week",
+            "Cash in (customers)",
+            "Cash out (bills/AP)",
+            "Operating CF",
+            "Investing CF",
+            "Financing CF",
+            "Net cash",
+            "Closing cash",
+        ]
+
+        def _col(name):
+            return pd.to_numeric(wv2.get(name), errors="coerce").fillna(0.0)
+
+        cash_in_ar = _col("cash_in_ar")
+        cash_out_ap = _col("cash_out_ap")
+        operating_cf = _col("operating_cf")
+        investing_cf = _col("investing_cf")
+        financing_cf = _col("financing_cf")
+        net_cash = _col("net_cash")
+        closing_cash = _col("closing_cash")
+
+        for i in range(min(len(wv2), 14)):
+            table_rows.append([
+                str(wv2.loc[i, "Week"]),
+                _money(float(cash_in_ar.iloc[i])),
+                _money(float(cash_out_ap.iloc[i])),
+                _money(float(operating_cf.iloc[i])),
+                _money(float(investing_cf.iloc[i])),
+                _money(float(financing_cf.iloc[i])),
+                _money(float(net_cash.iloc[i])),
+                _money(float(closing_cash.iloc[i])),
+            ])
+
+    cash_bills_data = {
+        "header": {
+            "title": "Cash & Bills",
+            "subtitle": "Short-term liquidity, commitments and cash safety",
+        },
+        "cards": {
+            "cash_danger_14w": {
+                "title": "Cash danger summary (next 14 weeks)",
+                "kpis": [
+                    {"label": "Lowest projected cash", "value": _money(min_cash)},
+                    {"label": "Week of lowest cash", "value": worst_week_txt},
+                    {"label": "Safety buffer", "value": buffer_txt},
+                    {"label": gap_label, "value": _money(gap_value)},
+                    {"label": "Cash stress date", "value": stress_date_txt},
+                    {"label": "Runway (weeks)", "value": runway_txt},
+                ],
+                "status_strip": {"state": danger_state, "message": danger_msg},
+            },
+            "short_term_liquidity_4w": {
+                "title": "Short-term liquidity (next 4 weeks)",
+                "kpis": [
+                    {"label": "Projected opening cash (week 1)", "value": cash_now_label},
+                    {"label": "Invoices to collect (next 4 weeks)", "value": _money(ar_next_4w)},
+                    {"label": "Bills to pay (next 4 weeks)", "value": _money(ap_next_4w)},
+                    {"label": "Net position (next 4 weeks)", "value": _money(net_4w)},
+                ],
+                "helper_text": f"Next 4 weeks depend on collecting {_money(ar_next_4w)} and funding {_money(ap_next_4w)} of committed outflows.",
+            },
+            "ar_ap_ageing": {
+                "title": "AR & AP ageing",
+                "ar": {
+                    "subtitle": "Invoices coming in (AR)",
+                    "columns": ["Bucket", "Total amount"],
+                    "rows": ar_age_rows,
+                    "hint": "Open customer invoices grouped by ageing bucket using balance due.",
+                },
+                "ap": {
+                    "subtitle": "Bills to pay (AP)",
+                    "columns": ["Bucket", "Total amount"],
+                    "rows": ap_age_rows,
+                    "hint": "Open supplier bills grouped by ageing bucket using balance due.",
+                },
+            },
+            "commitments": {
+                "title": "Cash commitments coming up",
+                "columns": ["Direction", "Who/What", "Amount", "Expected date"],
+                "rows": comm_rows[:7],
+                "caption": "Top upcoming customer receipts and supplier payments over the next 60 days.",
+            },
+            "cashflow_14w": {
+                "title": "14-week cashflow (early warning)",
+                "chart": {
+                    "title": "Weekly projected closing cash balance",
+                    "plotly_html": plotly_html,
+                    "empty_text": "Not enough AR/AP + payroll data to build a 14-week view yet.",
+                },
+                "table_columns": table_cols,
+                "table_rows": table_rows,
+                "caption": "Expected cash in/out by week for the next ~3 months, split by operating, investing and financing activity.",
+            },
+            "what_this_means": {
+                "title": "What this means",
+                "bullets": _strip_bullets(what_means),
+                "fallback": "No narrative insights available yet.",
+            },
+            "action_plan": {
+                "title": "Action plan – next 7–14 days",
+                "items": _strip_bullets(actions_dedup),
+                "fallback": "Maintain discipline on collections and commitments; no immediate cash action required.",
+            },
+        },
+    }
+
+    # ✅ NEW UI (single call)
+    render_cash_bills(cash_bills_data, height=3000)
+
+
+
+
 
 
 def resolve_opening_cash(
@@ -15487,7 +16036,12 @@ def generate_board_pack_pptx(client_id: str, focus_month: datetime.date) -> str:
         month_ref=focus_month,
     )
 
-    month_summary = build_month_summary_insight(client_id, focus_month)
+    month_summary = build_month_summary_insight(
+        client_id=selected_client_id,
+        focus_month=selected_month_start,
+        recognised_rev_this=float(this_month_rev or 0.0),
+        recognised_rev_prev=float(prev_month_rev) if prev_month_rev is not None else None,
+    )
 
     prs = Presentation()
 
@@ -15945,14 +16499,9 @@ def upsert_board_commentary(
         print("Error saving board commentary:", e)
         return False
 
-from datetime import datetime, timezone
 
 def render_final_commentary_box(client_id: str, month_start: date, df_tasks: pd.DataFrame):
-    st.markdown("---")
-    st.subheader("🧾 Final commentary for board report")
-    st.caption(
-        "Finalise commentary in KPI → Task order. This is what goes into the board pack."
-    )
+    
 
     # Load saved final commentary (existing)
     saved = fetch_board_commentary(client_id, month_start)
@@ -15989,7 +16538,7 @@ def render_final_commentary_box(client_id: str, month_start: date, df_tasks: pd.
         page_label = PAGE_KPI_MAP.get(page_name, {}).get("label", page_name)
         kpi_label = PAGE_KPI_MAP.get(page_name, {}).get("kpis", {}).get(kpi_key, kpi_key)
 
-        st.markdown(f"### {page_label} → **{kpi_label}**")
+        st.markdown(f"{page_label} → {kpi_label}")
 
         # Show tasks under this KPI
         subset = df[(df["page_name"] == page_name) & (df["kpi_key"] == kpi_key)].copy()
@@ -16006,7 +16555,7 @@ def render_final_commentary_box(client_id: str, month_start: date, df_tasks: pd.
         key_txt = f"final_commentary_{page_name}_{kpi_key}_{month_start.isoformat()}"
 
         final_text = st.text_area(
-            "Final board commentary (what will appear in the board pack)",
+            "Final Commentary",
             value=default_text,
             height=120,
             key=key_txt,
@@ -16040,17 +16589,7 @@ def render_final_commentary_box(client_id: str, month_start: date, df_tasks: pd.
 # ---------- Page: Alerts & To-Dos ----------
 
 def page_alerts_todos():
-    """
-    Collaboration Hub for the founder & team:
-    - Snapshot of key alerts (runway, cash danger, overdue AR, overspend, etc)
-    - One central task board (collaboration_hub) for cross-page work, with filters
-    - Tabs to collaborate on each main page (comments + tasks together)
-    """
-    top_header("Collaboration hub")
-
-    # -------------------------------
-    # Basic guards
-    # -------------------------------
+    
     if not selected_client_id:
         st.info("Select a business from the sidebar to see collaboration items.")
         return
@@ -16059,255 +16598,297 @@ def page_alerts_todos():
         st.info("Pick a focus month in the navbar to see alerts and tasks for that period.")
         return
 
-    # --- Board pack download block (top of the page) ---
-    if selected_client_id:
-        if st.button("Download board pack (PowerPoint)", key="btn_board_pack"):
-            file_path = generate_board_pack_pptx(selected_client_id, selected_month_start)
-            with open(file_path, "rb") as f:
-                st.download_button(
-                    label="Click to download board pack",
-                    data=f,
-                    file_name=os.path.basename(file_path),
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    key="dl_board_pack",
-                )
 
 
-    st.markdown("---")
-    st.subheader("➕ Create a task (Page → KPI → Issue)")
+    from component.collaboration_hub_component import (
+        inject_collaboration_hub_css,
+        render_collaboration_hub_header,
+    )
 
-    page_keys = list(PAGE_KPI_MAP.keys())
-    page_labels = [PAGE_KPI_MAP[k]["label"] for k in page_keys]
+    inject_collaboration_hub_css()
 
-    sel_page_label = st.selectbox("Page", options=page_labels, key="task_new_page")
-    sel_page_key = page_keys[page_labels.index(sel_page_label)]
+    from ui.styles import inject_global_nordic_styles
 
-    kpi_map = PAGE_KPI_MAP[sel_page_key]["kpis"]
-    kpi_keys = list(kpi_map.keys())
-    kpi_labels = [kpi_map[k] for k in kpi_keys]
+    inject_global_nordic_styles()
 
-    sel_kpi_label = st.selectbox("KPI / area", options=kpi_labels, key="task_new_kpi")
-    sel_kpi_key = kpi_keys[kpi_labels.index(sel_kpi_label)]
 
-    tcol1, tcol2 = st.columns(2)
-    with tcol1:
-        task_title = st.text_input("Task title", key="task_new_title")
-    with tcol2:
-        task_owner = st.text_input("Owner", value="", key="task_new_owner")
+    # Resolve client name for subtitle (safe fallback)
+    client_name = "Client"
+    try:
+        clients_data = load_clients()
+        for c in clients_data:
+            if c.get("id") == selected_client_id:
+                client_name = c.get("name") or "Client"
+                break
+    except Exception:
+        pass
 
-    task_desc = st.text_area("Describe the issue", key="task_new_desc")
+    month_name = pd.to_datetime(selected_month_start).strftime("%b %Y")
+   
+    # -------------------------------
+    # ONE CSS BLOCK ONLY (single source of truth)
+    # -------------------------------
+    
+    st.markdown(
+        f"""
+        <div class="nm-page-header">
+        <div class="nm-h1">Collaboration hub</div>
+        <div class="nm-sub">{client_name} · Focus month {month_name}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    tcol3, tcol4 = st.columns(2)
-    with tcol3:
-        task_priority = st.selectbox(
-            "Priority",
-            ["normal", "high", "critical", "low"],
-            index=0,
-            key="task_new_priority",
-        )
-    with tcol4:
-        task_due = st.date_input("Due date (optional)", value=None, key="task_new_due")
+    
+    
+    # -------------------------------
+    # CARD A — Create a task
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Create a task</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Page → KPI → Issue</div>", unsafe_allow_html=True)
 
-    if st.button("Create task", key="task_new_create_btn"):
-        ok = save_task(
+        page_keys = list(PAGE_KPI_MAP.keys())
+        page_labels = [PAGE_KPI_MAP[k]["label"] for k in page_keys]
+
+        sel_page_label = st.selectbox("Page", options=page_labels, key="task_new_page")
+        sel_page_key = page_keys[page_labels.index(sel_page_label)]
+
+        kpi_map = PAGE_KPI_MAP[sel_page_key]["kpis"]
+        kpi_keys = list(kpi_map.keys())
+        kpi_labels = [kpi_map[k] for k in kpi_keys]
+
+        sel_kpi_label = st.selectbox("KPI / area", options=kpi_labels, key="task_new_kpi")
+        sel_kpi_key = kpi_keys[kpi_labels.index(sel_kpi_label)]
+
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            task_title = st.text_input("Task title", key="task_new_title")
+        with tcol2:
+            task_owner = st.text_input("Owner", value="", key="task_new_owner")
+
+        task_desc = st.text_area("Describe the issue", key="task_new_desc")
+
+        tcol3, tcol4 = st.columns(2)
+        with tcol3:
+            task_priority = st.selectbox(
+                "Priority",
+                ["normal", "high", "critical", "low"],
+                index=0,
+                key="task_new_priority",
+            )
+        with tcol4:
+            task_due = st.date_input("Due date (optional)", value=None, key="task_new_due")
+
+        if st.button("Create task", key="task_new_create_btn"):
+            ok = save_task(
+                client_id=selected_client_id,
+                page_name=sel_page_key,
+                title=task_title,
+                month_date=selected_month_start,
+                kpi_key=sel_kpi_key,
+                description=task_desc,
+                owner_name=task_owner,
+                priority=task_priority,
+                due_date=task_due,
+            )
+            if ok:
+                st.success("Task created.")
+                st.rerun()
+            else:
+                st.error("Could not create task. Check required fields and try again.")
+
+    # -------------------------------
+    # CARD B — My workboard (filters + kanban)
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>My workboard</div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-sub'>Tasks from all pages. Filter to focus your week.</div>", unsafe_allow_html=True)
+
+        # Filters row
+        col_f1, col_f2, col_f3, col_f4 = st.columns([1.2, 1.2, 1.2, 1.6])
+
+        with col_f1:
+            status_filter = st.multiselect(
+                "Status",
+                options=["open", "in_progress", "done", "cancelled"],
+                default=["open", "in_progress"],
+                key="collab_status_filter",
+            )
+        with col_f2:
+            page_options = get_task_page_options(selected_client_id)
+            page_filter = st.multiselect(
+                "Page",
+                options=page_options,
+                default=[],
+                help="Limit to tasks from specific pages (or leave blank for all).",
+                key="collab_page_filter",
+            )
+        with col_f3:
+            owner_options = get_task_owner_options(selected_client_id)
+            owner_filter = st.multiselect(
+                "Owner",
+                options=owner_options,
+                default=[],
+                help="Focus on tasks assigned to specific people.",
+                key="collab_owner_filter",
+            )
+        with col_f4:
+            search_text = st.text_input(
+                "Search in titles / descriptions",
+                value="",
+                key="collab_search_text",
+            )
+
+        # Fetch tasks
+        df_tasks = fetch_tasks_for_collab_hub(
             client_id=selected_client_id,
-            page_name=sel_page_key,
-            title=task_title,
-            month_date=selected_month_start,     # ✅ still fine (new save_task accepts it)
-            kpi_key=sel_kpi_key,
-            description=task_desc,
-            owner_name=task_owner,
-            priority=task_priority,
-            due_date=task_due,                   # ✅ NEW: pass due date through
+            status_filter=status_filter or None,
+            page_filter=page_filter or None,
+            owner_filter=owner_filter or None,
+            search_text=search_text,
         )
-        if ok:
-            st.success("Task created.")
-            st.rerun()
+
+        if df_tasks.empty:
+            st.info("No tasks match the current filters.")
         else:
-            st.error("Could not create task. Check required fields and try again.")
+            page_label_map = {
+                "business_overview": "Business overview",
+                "sales_deals": "Sales & deals",
+                "team_spending": "Team & spending",
+                "cash_bills": "Cash & bills",
+                "investing_financing": "Funding Strategy",
+                "configuration": "Configuration",
+            }
 
-    # -------------------------------
-    # 🧩 Central workboard (Kanban-style)
-    # -------------------------------
-    st.subheader("✅ My workboard (cross-page tasks)")
+            df_tasks = df_tasks.copy()
+            df_tasks["page_label"] = df_tasks["page_name"].map(page_label_map).fillna("Other")
 
-    st.caption(
-        "See tasks from all pages in one place. "
-        "Filter by status, page or owner to focus your week."
-    )
-
-    # ----- Filters row -----
-    col_f1, col_f2, col_f3 = st.columns([1.2, 1.2, 1.6])
-
-    with col_f1:
-        status_filter = st.multiselect(
-            "Status",
-            options=["open", "in_progress", "done", "cancelled"],
-            default=["open", "in_progress"],
-            key="collab_status_filter",
-        )
-
-    with col_f2:
-        page_options = get_task_page_options(selected_client_id)
-        page_filter = st.multiselect(
-            "Page",
-            options=page_options,
-            default=[],
-            help="Limit to tasks from specific pages (or leave blank for all).",
-            key="collab_page_filter",
-        )
-
-    with col_f3:
-        owner_options = get_task_owner_options(selected_client_id)
-        owner_filter = st.multiselect(
-            "Owner",
-            options=owner_options,
-            default=[],
-            help="Focus on tasks assigned to specific people.",
-            key="collab_owner_filter",
-        )
-
-    search_text = st.text_input(
-        "Search in titles / descriptions",
-        value="",
-        key="collab_search_text",
-    )
-
-    # ----- Fetch tasks from Supabase -----
-    df_tasks = fetch_tasks_for_collab_hub(
-        client_id=selected_client_id,
-        status_filter=status_filter or None,
-        page_filter=page_filter or None,
-        owner_filter=owner_filter or None,
-        search_text=search_text,
-    )
-
-    if df_tasks.empty:
-        st.info("No tasks match the current filters.")
-    else:
-        page_label_map = {
-            "business_overview": "Business overview",
-            "sales_deals": "Sales & deals",
-            "team_spending": "Team & spending",
-            "cash_bills": "Cash & bills",
-            "alerts_todos": "Alerts & to-dos",
-            "collaboration_hub": "Collaboration Hub",
-        }
-        df_tasks = df_tasks.copy()
-        df_tasks["page_label"] = df_tasks["page_name"].map(page_label_map).fillna("Other")
-
-        def _prio_label(p: str) -> str:
-            p = (p or "").lower()
-            if p == "low":
-                return "Low"
-            if p == "normal":
+            def _prio_label(p: str) -> str:
+                p = (p or "").lower()
+                if p == "low":
+                    return "Low"
+                if p == "normal":
+                    return "Normal"
+                if p == "high":
+                    return "High"
+                if p == "critical":
+                    return "Critical"
                 return "Normal"
-            if p == "high":
-                return "High"
-            if p == "critical":
-                return "Critical"
-            return "Normal"
 
-        df_tasks["priority_label"] = df_tasks["priority"].apply(_prio_label)
+            df_tasks["priority_label"] = df_tasks["priority"].apply(_prio_label)
 
-        statuses_order = ["open", "in_progress", "done", "cancelled"]
-        status_headers = {
-            "open": "📝 To-do",
-            "in_progress": "🚧 In progress",
-            "done": "✅ Done",
-            "cancelled": "🗑️ Cancelled",
-        }
+            statuses_order = ["open", "in_progress", "done", "cancelled"]
+            status_headers = {
+                "open": "📝 To-do",
+                "in_progress": "🚧 In progress",
+                "done": "✅ Done",
+                "cancelled": "🗑️ Cancelled",
+            }
 
-        cols = st.columns(4)
+            cols = st.columns(4)
 
-        for idx, status in enumerate(statuses_order):
-            col = cols[idx]
-            subset = df_tasks[df_tasks["status"] == status]
+            for idx, status in enumerate(statuses_order):
+                col = cols[idx]
+                subset = df_tasks[df_tasks["status"] == status]
 
-            with col:
-                col.markdown(f"**{status_headers.get(status, status.title())}**")
+                with col:
+                    col.markdown(f"**{status_headers.get(status, status.title())}**")
 
-                if subset.empty:
-                    col.caption("No tasks.")
-                    continue
+                    if subset.empty:
+                        col.caption("No tasks.")
+                        continue
 
-                subset = subset.sort_values(
-                    by=["due_date", "priority", "created_at"],
-                    ascending=[True, False, True],
-                )
+                    subset = subset.sort_values(
+                        by=["due_date", "priority", "created_at"],
+                        ascending=[True, False, True],
+                    )
 
-                for _, row in subset.iterrows():
-                    title = row.get("title", "Untitled task")
-                    page_label = row.get("page_label", "Unknown")
-                    owner = row.get("owner_name") or "Unassigned"
-                    due = row.get("due_date")
-                    priority = row.get("priority_label", "Normal")
+                    for _, row in subset.iterrows():
+                        title = row.get("title", "Untitled task")
+                        page_label = row.get("page_label", "Unknown")
+                        owner = row.get("owner_name") or "Unassigned"
+                        due = row.get("due_date")
+                        priority = row.get("priority_label", "Normal")
 
-                    task_id = row.get("id")
-                    kpi_key = row.get("kpi_key") or ""
-                    kpi_label = None
-                    try:
-                        pkey = row.get("page_name")
-                        if pkey in PAGE_KPI_MAP:
-                            kpi_label = PAGE_KPI_MAP[pkey]["kpis"].get(kpi_key)
-                    except Exception:
-                        pass
+                        task_id = row.get("id")
+                        kpi_key = row.get("kpi_key") or ""
+                        kpi_label = None
+                        try:
+                            pkey = row.get("page_name")
+                            if pkey in PAGE_KPI_MAP:
+                                kpi_label = PAGE_KPI_MAP[pkey]["kpis"].get(kpi_key)
+                        except Exception:
+                            pass
 
-                    with st.container(border=True):
-                        st.markdown(f"**{title}**")
-                        if kpi_label:
-                            st.caption(f"KPI: {kpi_label}")
-                        elif kpi_key:
-                            st.caption(f"KPI: {kpi_key}")
+                        with st.container(border=True):
+                            st.markdown(f"**{title}**")
+                            if kpi_label:
+                                st.caption(f"KPI: {kpi_label}")
+                            elif kpi_key:
+                                st.caption(f"KPI: {kpi_key}")
 
-                        meta_parts = [page_label, owner, f"Priority: {priority}"]
-                        if due:
-                            meta_parts.append(f"Due: {due}")
-                        st.caption(" · ".join(meta_parts))
+                            meta_parts = [page_label, owner, f"Priority: {priority}"]
+                            if due:
+                                try:
+                                    meta_parts.append(f"Due: {pd.to_datetime(due).strftime('%d %b %Y')}")
+                                except Exception:
+                                    meta_parts.append(f"Due: {due}")
+                            st.caption(" · ".join(meta_parts))
 
-                        a1, a2, a3 = st.columns(3)
-                        with a1:
-                            if st.button("✅ Done", key=f"task_done_{task_id}"):
-                                update_task_status(task_id, "done")
-                                st.rerun()
-                        with a2:
-                            if st.button("🚧 In progress", key=f"task_prog_{task_id}"):
-                                update_task_status(task_id, "in_progress")
-                                st.rerun()
-                        with a3:
-                            if st.button("🗑 Cancel", key=f"task_cancel_{task_id}"):
-                                update_task_status(task_id, "cancelled")
-                                st.rerun()
-
-                        with st.expander("💬 Replies", expanded=False):
-                            replies = fetch_task_replies(task_id)
-                            if not replies:
-                                st.caption("No replies yet.")
-                            else:
-                                for r in replies:
-                                    who = r.get("author_name") or "Someone"
-                                    ts = r.get("created_at") or ""
-                                    msg = r.get("message") or ""
-                                    st.markdown(f"**{who}** · {ts}")
-                                    st.write(msg)
-                                    st.markdown("---")
-
-                            reply_author = st.text_input("Your name", key=f"reply_author_{task_id}")
-                            reply_msg = st.text_area("Reply", key=f"reply_msg_{task_id}")
-
-                            if st.button("Send reply", key=f"reply_send_{task_id}"):
-                                ok_r = add_task_reply(selected_client_id, task_id, reply_author, reply_msg)
-                                if ok_r:
-                                    st.success("Reply added.")
+                            a1, a2, a3 = st.columns(3)
+                            with a1:
+                                if st.button("✅ Done", key=f"task_done_{task_id}"):
+                                    update_task_status(task_id, "done")
                                     st.rerun()
+                            with a2:
+                                if st.button("🚧 In progress", key=f"task_prog_{task_id}"):
+                                    update_task_status(task_id, "in_progress")
+                                    st.rerun()
+                            with a3:
+                                if st.button("🗑 Cancel", key=f"task_cancel_{task_id}"):
+                                    update_task_status(task_id, "cancelled")
+                                    st.rerun()
+
+                            with st.expander("💬 Replies", expanded=False):
+                                replies = fetch_task_replies(task_id)
+                                if not replies:
+                                    st.caption("No replies yet.")
                                 else:
-                                    st.warning("Reply cannot be empty.")
+                                    for r in replies:
+                                        who = r.get("author_name") or "Someone"
+                                        ts = r.get("created_at") or ""
+                                        msg = r.get("message") or ""
+                                        st.markdown(f"**{who}** · {ts}")
+                                        st.write(msg)
+                                        st.markdown("---")
 
-    st.markdown("---")
+                                reply_author = st.text_input("Your name", key=f"reply_author_{task_id}")
+                                reply_msg = st.text_area("Reply", key=f"reply_msg_{task_id}")
 
-    #...  For commentary....#
-    render_final_commentary_box(selected_client_id, selected_month_start, df_tasks)
+                                if st.button("Send reply", key=f"reply_send_{task_id}"):
+                                    ok_r = add_task_reply(selected_client_id, task_id, reply_author, reply_msg)
+                                    if ok_r:
+                                        st.success("Reply added.")
+                                        st.rerun()
+                                    else:
+                                        st.warning("Reply cannot be empty.")
 
+    # -------------------------------
+    # CARD C — Final commentary for board report
+    # -------------------------------
+    with st.container(border=True):
+        st.markdown("<div class='nordic_anchor commentary_anchor'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='nordic-card-title'>Final commentary for board report</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='nordic-card-sub'>Finalised commentary generated from completed tasks. Appears in board pack.</div>",
+            unsafe_allow_html=True,
+        )
+        
+        # Uses your existing function (kept)
+        render_final_commentary_box(selected_client_id, selected_month_start, df_tasks if 'df_tasks' in locals() else None)
 
 
 # --------------------------------------------------
@@ -16316,13 +16897,12 @@ def page_alerts_todos():
 
 
 
-
 def run_app():
 
 
     page_names = [
         "Business at a Glance",
-        "Investing & Financing Strategy",
+        "Funding Strategy",
         "Sales & Deals",
         "Team & Spending",
         "Cash & Bills",
@@ -16335,7 +16915,7 @@ def run_app():
 
     if page_choice == "Business at a Glance":
         page_business_overview()
-    elif page_choice == "Investing & Financing Strategy":
+    elif page_choice == "Funding Strategy":
         page_investing_financing()
     elif page_choice == "Sales & Deals":
         page_sales_deals()
@@ -16349,6 +16929,8 @@ def run_app():
         page_configuration()
     elif page_choice == "Client Settings":
         page_client_settings()
+
+
 
 
 if __name__ == "__main__":
@@ -16426,7 +17008,6 @@ def _safe_pct(numerator, denominator):
         return float(numerator) / float(denominator) * 100.0
     except Exception:
         return None
-
 
 
 
